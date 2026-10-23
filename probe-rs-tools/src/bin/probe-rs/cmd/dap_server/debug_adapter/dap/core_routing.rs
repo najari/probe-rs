@@ -228,7 +228,13 @@ impl CoreRouting {
         };
         match event_type {
             "stopped" => {
-                if let Some(thread) = body.get("threadId").and_then(Value::as_i64) {
+                // A core that the halt group stopped (`external`) did not stop on its own: the
+                // client keeps its focus on the core that did (VS Code focuses the thread of each
+                // stop otherwise, and a step would go to the last core the group stopped).
+                let by_group = body.get("reason").and_then(Value::as_str) == Some("external");
+                if by_group {
+                    body.insert("preserveFocusHint".to_string(), Value::Bool(true));
+                } else if let Some(thread) = body.get("threadId").and_then(Value::as_i64) {
                     self.focus = usize::try_from(thread).ok().or(self.focus);
                 }
                 body.insert("allThreadsStopped".to_string(), Value::Bool(false));
@@ -593,6 +599,19 @@ mod tests {
         assert_eq!(stopped.unwrap()["allThreadsStopped"], false);
         let (core, _) = routing.route(&request("evaluate", json!({ "expression": "g_result" })));
         assert_eq!(core, Some(1));
+    }
+
+    #[test]
+    fn a_core_the_group_stopped_keeps_the_focus_on_the_core_that_stopped() {
+        let mut routing = routing(&[0, 1, 2]);
+        let mut hit = Some(json!({ "reason": "breakpoint", "threadId": 0 }));
+        routing.observe_event("stopped", &mut hit);
+        let mut external = Some(json!({ "reason": "external", "threadId": 2 }));
+        routing.observe_event("stopped", &mut external);
+        assert_eq!(external.unwrap()["preserveFocusHint"], true);
+        assert!(hit.unwrap().get("preserveFocusHint").is_none());
+        let (core, _) = routing.route(&request("evaluate", json!({ "expression": "g_result" })));
+        assert_eq!(core, Some(0));
     }
 
     #[test]
