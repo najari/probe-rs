@@ -18,6 +18,7 @@ mcd = ["dep:libloading"]
 probe-rs.workspace = true
 probe-rs-target.workspace = true
 
+base64 = "0.22"
 bincode = { version = "2", features = ["serde"] }
 docsplay.workspace = true
 libloading = { version = "0.8", optional = true }
@@ -28,8 +29,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 probe-rs-debug = { version = "0.32.0", path = "../probe-rs-debug" }
-base64 = "0.22"
-serde_json = "1"
 typed-path = "0.12.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

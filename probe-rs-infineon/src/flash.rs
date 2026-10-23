@@ -19,9 +19,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
     sync::Mutex,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
+
+use base64::Engine as _;
 
 use probe_rs::{
     Error, MemoryInterface, RegisterId, Session,
@@ -351,6 +354,13 @@ impl FlashMap {
     }
 }
 
+/// The environment variable that turns sector backups on: the directory to keep them in.
+///
+/// Each flash download then saves every sector it erases, as it was before, in
+/// `<dir>/<UTC time of the download>/sector_<base>.json`: `{ base, size, blank, b64 }`, with
+/// `blank` 1 for the erased pages (the format the `pflash_check` example compares with).
+pub const BACKUP_ENV: &str = "PROBE_RS_TRICORE_FLASH_BACKUP";
+
 /// Programs the TC27x PFLASH through the RAM loader.
 #[derive(Debug, Default)]
 pub struct Tc27xFlash {
@@ -359,6 +369,51 @@ pub struct Tc27xFlash {
     programmed: Mutex<BTreeSet<u32>>,
     /// The sector map of the connected device, found when the loader starts.
     map: Mutex<Option<FlashMap>>,
+    /// Where the sectors of this download are backed up ([`BACKUP_ENV`]).
+    backup: Mutex<Option<PathBuf>>,
+}
+
+/// The JSON backup of a sector: its pages as read before the erase (`None`: erased).
+pub fn sector_backup(sector: Sector, pages: &[PageImage]) -> String {
+    let blank = pages
+        .iter()
+        .map(|page| u8::from(page.is_none()))
+        .collect::<Vec<_>>();
+    let data = pages
+        .iter()
+        .flat_map(|page| page.unwrap_or([0; PAGE]))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "base": sector.base,
+        "size": sector.size,
+        "blank": blank,
+        "b64": base64::engine::general_purpose::STANDARD.encode(data),
+    })
+    .to_string()
+}
+
+/// `YYYY-MM-DD_HHMMSSZ` of a time (UTC), for the backup directory of a download.
+pub fn utc_stamp(time: SystemTime) -> String {
+    let seconds = time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    // The civil date of a day number (H. Hinnant, days from civil).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}_{:02}{:02}{:02}Z",
+        rest / 3600,
+        rest / 60 % 60,
+        rest % 60
+    )
 }
 
 fn other(message: impl Into<String>) -> Error {
@@ -366,6 +421,36 @@ fn other(message: impl Into<String>) -> Error {
 }
 
 impl Tc27xFlash {
+    /// Saves `pages`, the content of `sector` before its erase, when backups are on
+    /// ([`BACKUP_ENV`]). A backup that cannot be written stops the download before the erase.
+    fn save_backup(&self, sector: Sector, pages: &[PageImage]) -> Result<(), Error> {
+        let Some(dir) = self
+            .backup
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            return Ok(());
+        };
+        let path = dir.join(format!("sector_{:08x}.json", sector.base));
+        std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&path, sector_backup(sector, pages)))
+            .map_err(|error| {
+                other(format!(
+                    "the backup of sector {:#010x} to {} failed ({error}); the sector was not \
+                     erased",
+                    sector.base,
+                    path.display()
+                ))
+            })?;
+        tracing::info!(
+            "Sector {:#010x} backed up to {}",
+            sector.base,
+            path.display()
+        );
+        Ok(())
+    }
+
     /// Checks that the loader can program the device and takes its sector map.
     fn check_device(&self, session: &mut Session) -> Result<(), Error> {
         let jtag_id = session.get_tricore_bus()?.jtag_id()?;
@@ -588,6 +673,9 @@ impl DebugFlashSequence for Tc27xFlash {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        *self.backup.lock().unwrap_or_else(|e| e.into_inner()) = std::env::var_os(BACKUP_ENV)
+            .filter(|dir| !dir.is_empty())
+            .map(|dir| PathBuf::from(dir).join(utc_stamp(SystemTime::now())));
         self.start_loader(session)
     }
 
@@ -658,6 +746,7 @@ impl DebugFlashSequence for Tc27xFlash {
                 tracing::info!("Sector {:#010x} already holds the image", sector.base);
                 continue;
             }
+            self.save_backup(sector, &backup)?;
             Self::erase(session, sector)?;
             self.program_pages(session, sector.base, &image)?;
             tracing::info!(
@@ -696,6 +785,33 @@ impl DebugFlashSequence for Tc27xFlash {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_directories_are_named_by_the_utc_time() {
+        let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+        assert_eq!(utc_stamp(at(0)), "1970-01-01_000000Z");
+        assert_eq!(utc_stamp(at(951_868_800)), "2000-03-01_000000Z");
+        assert_eq!(utc_stamp(at(1_709_251_199)), "2024-02-29_235959Z");
+        assert_eq!(utc_stamp(at(1_792_755_296)), "2026-10-23_113456Z");
+    }
+
+    #[test]
+    fn a_sector_backup_keeps_data_and_erased_pages() {
+        let sector = Sector {
+            base: 0xA021_C000,
+            size: 3 * PAGE as u32,
+        };
+        let pages = [Some([0x11; PAGE]), None, Some([0x22; PAGE])];
+        let json: serde_json::Value = serde_json::from_str(&sector_backup(sector, &pages)).unwrap();
+        assert_eq!(json["base"], 0xA021_C000u32);
+        assert_eq!(json["size"], 96);
+        assert_eq!(json["blank"], serde_json::json!([0, 1, 0]));
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(json["b64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(data.len(), 96);
+        assert!(data[..32].iter().all(|b| *b == 0x11) && data[64..].iter().all(|b| *b == 0x22));
+    }
 
     #[test]
     fn the_sector_map_has_54_sectors_and_covers_4_mib() {
