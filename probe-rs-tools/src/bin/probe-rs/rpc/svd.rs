@@ -427,6 +427,7 @@ pub fn parse_svd_file(path: &Path) -> Result<SvdVariableCache, DebugError> {
     } else {
         std::io::BufReader::new(file).read_to_string(&mut svd_xml)?;
     }
+    let svd_xml = without_empty_access(svd_xml);
 
     let device = svd_parser::parse_with_config(
         &svd_xml,
@@ -446,6 +447,19 @@ pub fn parse_svd_file(path: &Path) -> Result<SvdVariableCache, DebugError> {
     })?;
 
     build_svd_cache(&device)
+}
+
+/// Removes empty `<access>` elements, which `svd_parser` refuses. The Infineon TC3xx SVD files
+/// have hundreds of them on fields; an absent `access` means the same (the field takes the
+/// access of its register).
+fn without_empty_access(svd_xml: String) -> String {
+    const EMPTY: [&str; 3] = ["<access />", "<access/>", "<access></access>"];
+    if !EMPTY.iter().any(|empty| svd_xml.contains(empty)) {
+        return svd_xml;
+    }
+    EMPTY
+        .iter()
+        .fold(svd_xml, |xml, empty| xml.replace(empty, ""))
 }
 
 /// Build an [`SvdVariableCache`] from a parsed SVD `Device`.
@@ -571,6 +585,15 @@ fn build_svd_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_access_elements_are_removed() {
+        let xml = "<field><access /><name>PS0</name><access/></field><access>read-only</access>";
+        assert_eq!(
+            without_empty_access(xml.to_string()),
+            "<field><name>PS0</name></field><access>read-only</access>"
+        );
+    }
 
     #[test]
     fn values_are_parsed_and_checked_against_the_width() {
