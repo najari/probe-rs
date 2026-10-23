@@ -777,6 +777,36 @@ impl Debugger {
 
         self.config.validate_config_files()?;
 
+        // Program binaries of a launch that write the same flash sector: writing the second would
+        // erase the first. Refused before the session touches the target.
+        if requested_target_session_type == TargetSessionType::LaunchRequest
+            && self.config.flashing_config.flashing_enabled
+        {
+            let mut paths = Vec::new();
+            for path in self
+                .config
+                .core_configs
+                .iter()
+                .filter_map(|c| c.program_binary.clone())
+            {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+            if paths.len() > 1 {
+                let binaries = paths
+                    .into_iter()
+                    .filter_map(|path| {
+                        let data = std::fs::read(&path).ok()?;
+                        let ranges = super::program_overlap::load_ranges(&data).ok()?;
+                        Some((path, ranges))
+                    })
+                    .collect::<Vec<_>>();
+                super::program_overlap::check(self.config.chip.as_deref(), &binaries)
+                    .map_err(|message| DebuggerError::Other(anyhow!(message)))?;
+            }
+        }
+
         let mut session_data = SessionData::new_rpc_backed(
             client,
             &mut self.config,
