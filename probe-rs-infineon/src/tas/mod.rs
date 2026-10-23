@@ -462,6 +462,8 @@ impl DebugProbe for TasProbe {
     }
 
     fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
+        // The connect that took the reset is done: a later attach does not reset again.
+        self.connect_under_reset = false;
         Ok(())
     }
 

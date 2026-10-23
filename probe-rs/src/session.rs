@@ -215,7 +215,7 @@ impl Session {
         // Use ARM DAP path when the target connects via SWD/DAP: either ARM cores or RISC-V cores
         // over mem-AP (e.g. RP235x_riscv).
         let mut session = if target.architecture() == Architecture::TriCore {
-            Self::attach_tricore(probe, target, cores)?
+            Self::attach_tricore(probe, target, attach_method, cores)?
         } else if target.uses_arm_debug_interface() {
             Self::attach_arm_debug_interface(probe, target, attach_method, permissions, cores)?
         } else {
@@ -581,9 +581,17 @@ impl Session {
     fn attach_tricore(
         mut probe: Probe,
         target: Target,
+        attach_method: AttachMethod,
         cores: Vec<CombinedCoreState>,
     ) -> Result<Self, Error> {
+        // The TAS probe connects with a device reset while the reset is asserted.
+        if attach_method == AttachMethod::UnderReset {
+            probe.target_reset_assert()?;
+        }
         probe.attach_to_unspecified()?;
+        if attach_method == AttachMethod::UnderReset {
+            probe.target_reset_deassert()?;
+        }
         if !probe.has_tricore_interface() {
             return Err(Error::Probe(DebugProbeError::InterfaceNotAvailable {
                 interface_name: "TriCore",

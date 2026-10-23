@@ -6,8 +6,12 @@
 //! `--arm` first puts debug settings on CPU0 through a session: a breakpoint at
 //! `0x8021C008`, a data watchpoint on `0x7000A004`, the halt group routing and `SWEVT`.
 //!
+//! `--group N` first puts CPU0..CPU(N-1) in the halt group. With two or more members the device
+//! is not accessible after the reset: the routing survives it, and CPU1 (in boot halt) halts
+//! CPU0 in its start-up software. `probe-rs reset --connect-under-reset` brings it back.
+//!
 //! ```text
-//! cargo run -p probe-rs-infineon --example sw_reset -- [--arm]
+//! cargo run -p probe-rs-infineon --example sw_reset -- [--arm] [--group N]
 //! ```
 
 use std::time::Duration;
@@ -72,12 +76,23 @@ fn safety_endinit(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let arm = std::env::args().any(|a| a == "--arm");
+    let args = std::env::args().collect::<Vec<_>>();
+    let arm = args.iter().any(|a| a == "--arm");
+    let group = match args.iter().position(|a| a == "--group") {
+        Some(i) => args
+            .get(i + 1)
+            .ok_or("--group needs a core count")?
+            .parse()?,
+        None => 0,
+    };
     probe_rs_infineon::register_plugin();
     let selector = std::env::var("PROBE_RS_PROBE").unwrap_or_else(|_| "058b:0000".to_string());
     let mut session = Lister::new()
         .open(selector.parse::<DebugProbeSelector>()?)?
         .attach("TC275", Permissions::default())?;
+    for core in 0..group {
+        session.set_tricore_halt_group(core, true)?;
+    }
     if arm {
         session.set_tricore_halt_group(0, true)?;
         let mut core = session.core(0)?;
