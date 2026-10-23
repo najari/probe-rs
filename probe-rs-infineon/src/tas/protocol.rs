@@ -435,7 +435,10 @@ pub fn decode_frame(
                 });
             }
             TransferKind::Read { .. } => {
-                let data_len = if cmd == PL0_RDBLK1KB || (cmd == PL0_RDBLK && wl_rw == 0) {
+                // A full 1 KiB block counts 256 words, 0 in the byte fields. A failed read
+                // carries only the words it read (none, for an ECC error in erased flash).
+                let full_block = cmd == PL0_RDBLK1KB || (cmd == PL0_RDBLK && wl_rw == 0 && wl == 0);
+                let data_len = if error == PL0_OK && full_block {
                     1024
                 } else {
                     wl as usize * 4
@@ -775,6 +778,19 @@ mod tests {
         assert_eq!(transfers[0].status, Some(TransferStatus::Failed(0x8D)));
         assert_eq!(transfers[1].status, Some(TransferStatus::Failed(0x98)));
         assert!(transfers[0].check().is_err());
+    }
+
+    #[test]
+    fn a_failed_block_read_carries_no_data() {
+        // A block read of erased TC36x PFLASH (ECC error 0x8D), as TasServer V2.0 answers it.
+        let mut transfers = [BusTransfer::read(AddressMap::Target, 0xA04F_C000, 64)];
+        decode_frame(
+            &hex("00 B0 83 08 00 2C 00 8D 00 B1 C1 FF"),
+            &mut transfers,
+            0xFFC1,
+        )
+        .unwrap();
+        assert_eq!(transfers[0].status, Some(TransferStatus::Failed(0x8D)));
     }
 
     #[test]
