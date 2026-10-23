@@ -1,4 +1,5 @@
 use super::{
+    core_routing::{CoreRouting, RoutingAdapter},
     core_status::DapStatus,
     dap_types,
     repl_commands_helpers::{build_expanded_commands, command_completions},
@@ -91,11 +92,14 @@ pub struct DebugAdapter {
     /// Flag to indicate that workarounds for VSCode-specific spec deviations etc. should be
     /// enabled.
     pub(crate) vscode_quirks: bool,
+    /// Which core each request is for, when the session debugs several cores.
+    routing: std::sync::Arc<std::sync::Mutex<CoreRouting>>,
     adapter: BoxedAdapter,
 }
 
 impl DebugAdapter {
     pub fn new(adapter: impl ProtocolAdapter + Send + 'static) -> DebugAdapter {
+        let routing = std::sync::Arc::new(std::sync::Mutex::new(CoreRouting::default()));
         DebugAdapter {
             vscode_quirks: false,
             halt_after_reset: false,
@@ -106,8 +110,25 @@ impl DebugAdapter {
             supports_ansi_styling: false,
             lines_start_at_1: true,
             columns_start_at_1: true,
-            adapter: Box::new(adapter),
+            routing: routing.clone(),
+            adapter: Box::new(RoutingAdapter {
+                inner: Box::new(adapter),
+                routing,
+            }),
         }
+    }
+
+    /// The routing state of the requests to the cores.
+    pub(crate) fn routing(&self) -> std::sync::MutexGuard<'_, CoreRouting> {
+        self.routing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sends the response that merges the responses of a request that went to several cores.
+    pub(crate) fn send_merged_response(&mut self, response: Response) -> Result<()> {
+        self.adapter.remove_pending_request(response.request_seq);
+        self.adapter.send_raw_response(response)
     }
 
     pub(crate) fn configuration_is_done(&self) -> bool {
@@ -1329,13 +1350,25 @@ impl DebugAdapter {
                 );
         }
 
-        let threads = vec![Thread {
-            id: core_index as i64,
-            name: session_data
-                .core_data_opt(core_index)
-                .map(|cd| cd.target_name.clone())
-                .unwrap_or_default(),
-        }];
+        // One thread per core: with several cores in the session, every core is a thread.
+        let threads = if self.routing().is_multi_core() {
+            session_data
+                .core_data
+                .iter()
+                .map(|cd| Thread {
+                    id: cd.core_index as i64,
+                    name: cd.target_name.clone(),
+                })
+                .collect()
+        } else {
+            vec![Thread {
+                id: core_index as i64,
+                name: session_data
+                    .core_data_opt(core_index)
+                    .map(|cd| cd.target_name.clone())
+                    .unwrap_or_default(),
+            }]
+        };
         self.send_response(request, Ok(Some(ThreadsResponseBody { threads })))
     }
 

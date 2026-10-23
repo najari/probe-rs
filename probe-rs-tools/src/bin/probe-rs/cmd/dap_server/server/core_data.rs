@@ -29,6 +29,9 @@ pub struct CoreData {
     /// target's registers or execution state, and replaced only after a
     /// complete server unwind succeeds.
     pub stack_frames: Vec<probe_rs_debug::stack_frame::StackFrame>,
+    /// Whether `stack_frames` is the unwind of the current halt (set by
+    /// [`Self::replace_stack_frame_cache`], cleared by [`Self::invalidate_stack_frame_cache`]).
+    pub stack_frames_valid: bool,
     pub breakpoints: Vec<session_data::ActiveBreakpoint>,
     /// The addresses of the data breakpoints set with `setDataBreakpoints`.
     pub data_breakpoints: Vec<u64>,
@@ -82,6 +85,7 @@ pub(crate) fn function_address(elf: &[u8], name: &str) -> Result<u64, String> {
 impl CoreData {
     pub(crate) fn invalidate_stack_frame_cache(&mut self) {
         self.stack_frames.clear();
+        self.stack_frames_valid = false;
     }
 
     pub(crate) fn replace_stack_frame_cache(
@@ -89,6 +93,7 @@ impl CoreData {
         frames: Vec<probe_rs_debug::stack_frame::StackFrame>,
     ) {
         self.stack_frames = frames;
+        self.stack_frames_valid = true;
     }
 }
 
@@ -116,6 +121,7 @@ fn stack_frame_display_cache_is_invalidated_before_replacement() {
         last_known_status: CoreStatus::Unknown,
         target_name: String::new(),
         stack_frames: vec![frame(1)],
+        stack_frames_valid: true,
         breakpoints: vec![],
         data_breakpoints: vec![],
         rtt_scan_ranges: WireScanRegion::Ranges(vec![]),

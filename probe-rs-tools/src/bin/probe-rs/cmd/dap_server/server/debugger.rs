@@ -10,6 +10,9 @@ use crate::cmd::dap_server::{
     DebuggerError,
     debug_adapter::dap::{
         adapter::{DebugAdapter, get_arguments},
+        core_routing::{
+            FAN_OUT, data_breakpoints_of_core, merge_data_breakpoints, merge_responses,
+        },
         dap_types::{
             Capabilities, DisconnectResponse, Event, ExitedEventBody, InitializeRequestArguments,
             MessageSeverity, Request, TerminatedEventBody,
@@ -237,17 +240,96 @@ impl Debugger {
             return Ok(DebugSessionStatus::Continue(Duration::ZERO));
         }
 
-        // TODO: Currently, we only use `poll_cores()` results from the first core and need to expand
-        // to a multi-core implementation that understands which MS DAP requests are core specific.
-        let core_id = 0;
-
-        let Some(target_core_config) = self.config.core_configs.get(core_id) else {
+        // The core of the request. With one core in the session, every request goes to it. With
+        // several, the request names its core (`CoreRouting::route`), and the requests that go
+        // to every core are handled by each core and answered once.
+        if !debug_adapter.routing().is_multi_core() {
+            let Some(target_core_config) = self.config.core_configs.first() else {
+                return Err(RequestFailure::Session(DebuggerError::Other(anyhow!(
+                    "No core configuration found"
+                ))));
+            };
+            let core_index = target_core_config.core_index;
+            return self
+                .dispatch(session_data, debug_adapter, core_index, request)
+                .await;
+        }
+        if FAN_OUT.contains(&request.command.as_str()) {
+            return self.fan_out(session_data, debug_adapter, request).await;
+        }
+        let (core, routed) = debug_adapter.routing().route(request);
+        let Some(core_index) = core else {
             return Err(RequestFailure::Session(DebuggerError::Other(anyhow!(
-                "No core configuration found for core id {core_id}"
+                "No core configuration found"
             ))));
         };
-        let core_index = target_core_config.core_index;
+        debug_adapter.routing().set_current(Some(core_index));
+        self.dispatch(session_data, debug_adapter, core_index, &routed)
+            .await
+    }
 
+    /// A request that goes to every core of the session: each core handles it, and the client
+    /// gets one response, merged from the response of each core.
+    async fn fan_out(
+        &mut self,
+        session_data: &mut SessionData,
+        debug_adapter: &mut DebugAdapter,
+        request: &Request,
+    ) -> Result<DebugSessionStatus, RequestFailure> {
+        let (cores, focus) = {
+            let routing = debug_adapter.routing();
+            (routing.cores().to_vec(), routing.focus_core())
+        };
+        let mut status = DebugSessionStatus::Continue(Duration::ZERO);
+        let mut responses = Vec::new();
+        // The data breakpoints of each core, and where they stand in the request.
+        let mut data_breakpoint_slots = HashMap::new();
+        for core in cores {
+            let core_request = if request.command == "setDataBreakpoints" {
+                let (core_request, slots) = data_breakpoints_of_core(request, core, focus);
+                data_breakpoint_slots.insert(core, slots);
+                core_request
+            } else {
+                request.clone()
+            };
+            {
+                let mut routing = debug_adapter.routing();
+                routing.set_current(Some(core));
+                routing.start_capture(&request.command);
+            }
+            let result = self
+                .dispatch(session_data, debug_adapter, core, &core_request)
+                .await;
+            let captured = debug_adapter.routing().take_captured();
+            match result {
+                Ok(DebugSessionStatus::Continue(_)) => {}
+                Ok(other) => status = other,
+                Err(failure) => return Err(failure),
+            }
+            responses.extend(captured.into_iter().map(|response| (core, response)));
+        }
+
+        let merged = if request.command == "setDataBreakpoints" {
+            merge_data_breakpoints(request, responses, &data_breakpoint_slots)
+        } else {
+            merge_responses(&request.command, responses)
+        };
+        if let Some(response) = merged {
+            debug_adapter
+                .send_merged_response(response)
+                .map_err(|error| RequestFailure::Session(DebuggerError::Other(error)))?;
+        }
+        Ok(status)
+    }
+
+    /// Handles a request on one core.
+    async fn dispatch(
+        &mut self,
+        session_data: &mut SessionData,
+        debug_adapter: &mut DebugAdapter,
+        core_index: usize,
+        request: &Request,
+    ) -> Result<DebugSessionStatus, RequestFailure> {
         // Some operations require a sleeping core to be halted through the
         // RPC backend. Track that temporary halt so the backend can resume it
         // after the request.
@@ -699,41 +781,54 @@ impl Debugger {
 
         debug_adapter.halt_after_reset = self.config.flashing_config.halt_after_reset;
 
-        let Some(target_core_config) = self.config.core_configs.first() else {
+        // Each configured core is a thread of the session.
+        debug_adapter.routing().set_cores(
+            session_data
+                .core_data
+                .iter()
+                .map(|cd| cd.core_index)
+                .collect(),
+        );
+        let core_configs = self.config.core_configs.clone();
+        let Some(target_core_config) = core_configs.first() else {
             return Err(DebuggerError::Other(anyhow!(
                 "Cannot continue unless one target core configuration is defined."
             )));
         };
 
-        // The entry function is looked up before anything is written to the target.
-        let entry_breakpoint = match &target_core_config.entry_function {
-            Some(function) if requested_target_session_type == TargetSessionType::LaunchRequest => {
-                let Some(path) = target_core_config.program_binary.as_deref() else {
-                    return Err(DebuggerError::Other(anyhow!(
-                        "`entryFunction` needs the `programBinary` that holds it"
-                    )));
-                };
-                let elf = std::fs::read(path)
-                    .with_context(|| format!("Cannot read {}", path.display()))?;
-                let address = function_address(&elf, function).map_err(|error| {
-                    DebuggerError::Other(anyhow!("Cannot run to the entry function: {error}"))
-                })?;
-                Some(EntryBreakpoint {
-                    function: function.clone(),
-                    address,
-                    armed: false,
-                })
+        // The entry function of each core is looked up before anything is written to the target.
+        for core_config in &core_configs {
+            let entry_breakpoint = match &core_config.entry_function {
+                Some(function)
+                    if requested_target_session_type == TargetSessionType::LaunchRequest =>
+                {
+                    let Some(path) = core_config.program_binary.as_deref() else {
+                        return Err(DebuggerError::Other(anyhow!(
+                            "`entryFunction` needs the `programBinary` that holds it"
+                        )));
+                    };
+                    let elf = std::fs::read(path)
+                        .with_context(|| format!("Cannot read {}", path.display()))?;
+                    let address = function_address(&elf, function).map_err(|error| {
+                        DebuggerError::Other(anyhow!("Cannot run to the entry function: {error}"))
+                    })?;
+                    Some(EntryBreakpoint {
+                        function: function.clone(),
+                        address,
+                        armed: false,
+                    })
+                }
+                Some(_) => {
+                    debug_adapter.log_to_console(
+                        "`entryFunction` applies to `launch` only, it is ignored for `attach`.",
+                    );
+                    None
+                }
+                None => None,
+            };
+            if let Ok(core_data) = session_data.core_data_mut(core_config.core_index) {
+                core_data.entry_breakpoint = entry_breakpoint;
             }
-            Some(_) => {
-                debug_adapter.log_to_console(
-                    "`entryFunction` applies to `launch` only, it is ignored for `attach`.",
-                );
-                None
-            }
-            None => None,
-        };
-        if let Ok(core_data) = session_data.core_data_mut(target_core_config.core_index) {
-            core_data.entry_breakpoint = entry_breakpoint;
         }
 
         // A launch starts the program binary, whether this server writes it to
@@ -750,14 +845,28 @@ impl Debugger {
                 // Store timestamp of flashed binary
                 self.binary_timestamp = get_file_timestamp(&path_to_elf);
 
-                Self::flash(
-                    &self.config,
-                    &path_to_elf,
-                    debug_adapter,
-                    launch_attach_request,
-                    &mut session_data,
-                )
-                .await?;
+                // Each program binary of the session is written once, the first one last
+                // (it is the one the session restarts).
+                let mut others = Vec::new();
+                for path in core_configs
+                    .iter()
+                    .skip(1)
+                    .filter_map(|c| c.program_binary.clone())
+                {
+                    if path != path_to_elf && !others.contains(&path) {
+                        others.push(path);
+                    }
+                }
+                for path in others.iter().chain(std::iter::once(&path_to_elf)) {
+                    Self::flash(
+                        &self.config,
+                        path,
+                        debug_adapter,
+                        launch_attach_request,
+                        &mut session_data,
+                    )
+                    .await?;
+                }
             } else {
                 self.binary_timestamp = target_core_config
                     .program_binary
@@ -776,102 +885,108 @@ impl Debugger {
         // First, halt the core so we can finish initialization without
         // bumping into user code. (Depending on `config`, the core is
         // restarted at the end of initialization in `configuration_done`.)
-        let core_index = target_core_config.core_index;
-        session_data
-            .backend
-            .halt(core_index, Duration::from_millis(100))
-            .await
-            .map_err(DebuggerError::from)?;
-
-        if self.config.all_stop {
-            let message = match session_data.backend.set_halt_group(core_index, true).await {
-                Ok(()) => format!(
-                    "All-stop: core {core_index} halts together with the other cores that set `allStop`."
-                ),
-                Err(error) => format!(
-                    "All-stop is not available for core {core_index}, `allStop` is ignored: {error}"
-                ),
-            };
-            debug_adapter.log_to_console(message);
-        }
-
-        // TriCore cores mask interrupts during steps by default; only a change is sent.
-        if target_core_config.step_interrupts == StepInterrupts::Allow
-            && let Err(error) = session_data
+        // Each core of the session is prepared the same way, with its own settings.
+        for core_config in &core_configs {
+            let core_index = core_config.core_index;
+            session_data
                 .backend
-                .set_tricore_options(core_index, Some(false), None, None)
+                .halt(core_index, Duration::from_millis(100))
                 .await
-        {
-            debug_adapter.log_to_console(format!(
-                "`stepInterrupts` is ignored for core {core_index} (TriCore only): {error}"
-            ));
-        }
+                .map_err(DebuggerError::from)?;
 
-        // TriCore cores run on after a reset of the device by default; only a change is sent.
-        if target_core_config.reset_behavior == ResetBehavior::Halt
-            && let Err(error) = session_data
-                .backend
-                .set_tricore_options(core_index, None, None, Some(true))
-                .await
-        {
-            debug_adapter.log_to_console(format!(
-                "`resetBehavior` is ignored for core {core_index} (TriCore only): {error}"
-            ));
-        }
-
-        if let Some(window) = &target_core_config.perf_window {
-            let elf = target_core_config
-                .program_binary
-                .as_deref()
-                .and_then(|path| std::fs::read(path).ok());
-            let resolve = |name: &str| -> Result<u64, String> {
-                match parse_int::parse::<u64>(name.trim()) {
-                    Ok(address) => Ok(address),
-                    Err(_) => function_address(
-                        elf.as_deref()
-                            .ok_or("a function name needs the `programBinary`")?,
-                        name,
-                    ),
-                }
-            };
-            let message = match (resolve(&window.start), resolve(&window.stop)) {
-                (Ok(start), Ok(stop)) => match session_data
-                    .backend
-                    .set_tricore_options(core_index, None, Some(Some((start, stop))), None)
-                    .await
-                {
+            if self.config.all_stop {
+                let message = match session_data.backend.set_halt_group(core_index, true).await {
                     Ok(()) => format!(
-                        "Performance counters of core {core_index} count from {} ({start:#010x}) to {} ({stop:#010x}).",
-                        window.start, window.stop
+                        "All-stop: core {core_index} halts together with the other cores that set `allStop`."
                     ),
-                    Err(error) => format!("`perfWindow` is not available: {error}"),
-                },
-                (Err(error), _) | (_, Err(error)) => {
-                    format!("`perfWindow` is ignored: {error}")
-                }
-            };
-            debug_adapter.log_to_console(message);
-        }
+                    Err(error) => format!(
+                        "All-stop is not available for core {core_index}, `allStop` is ignored: {error}"
+                    ),
+                };
+                debug_adapter.log_to_console(message);
+            }
 
-        // Synchronize the optional SVD configuration before exposing scopes.
-        // This is non-fatal: a failed load leaves the server cache cleared.
-        let svd_timestamp = target_core_config
-            .svd_file
-            .as_deref()
-            .and_then(get_file_timestamp);
-        match session_data
-            .backend
-            .load_svd(core_index, target_core_config.svd_file.clone())
-            .await
-        {
-            Ok(()) => self.svd_timestamp = svd_timestamp,
-            Err(error) => tracing::warn!("Failed to load SVD file: {error:?}"),
+            // TriCore cores mask interrupts during steps by default; only a change is sent.
+            if core_config.step_interrupts == StepInterrupts::Allow
+                && let Err(error) = session_data
+                    .backend
+                    .set_tricore_options(core_index, Some(false), None, None)
+                    .await
+            {
+                debug_adapter.log_to_console(format!(
+                    "`stepInterrupts` is ignored for core {core_index} (TriCore only): {error}"
+                ));
+            }
+
+            // TriCore cores run on after a reset of the device by default; only a change is sent.
+            if core_config.reset_behavior == ResetBehavior::Halt
+                && let Err(error) = session_data
+                    .backend
+                    .set_tricore_options(core_index, None, None, Some(true))
+                    .await
+            {
+                debug_adapter.log_to_console(format!(
+                    "`resetBehavior` is ignored for core {core_index} (TriCore only): {error}"
+                ));
+            }
+
+            if let Some(window) = &core_config.perf_window {
+                let elf = core_config
+                    .program_binary
+                    .as_deref()
+                    .and_then(|path| std::fs::read(path).ok());
+                let resolve = |name: &str| -> Result<u64, String> {
+                    match parse_int::parse::<u64>(name.trim()) {
+                        Ok(address) => Ok(address),
+                        Err(_) => function_address(
+                            elf.as_deref()
+                                .ok_or("a function name needs the `programBinary`")?,
+                            name,
+                        ),
+                    }
+                };
+                let message = match (resolve(&window.start), resolve(&window.stop)) {
+                    (Ok(start), Ok(stop)) => match session_data
+                        .backend
+                        .set_tricore_options(core_index, None, Some(Some((start, stop))), None)
+                        .await
+                    {
+                        Ok(()) => format!(
+                            "Performance counters of core {core_index} count from {} ({start:#010x}) to {} ({stop:#010x}).",
+                            window.start, window.stop
+                        ),
+                        Err(error) => format!("`perfWindow` is not available: {error}"),
+                    },
+                    (Err(error), _) | (_, Err(error)) => {
+                        format!("`perfWindow` is ignored: {error}")
+                    }
+                };
+                debug_adapter.log_to_console(message);
+            }
+
+            // Synchronize the optional SVD configuration before exposing scopes.
+            // This is non-fatal: a failed load leaves the server cache cleared.
+            let svd_timestamp = core_config.svd_file.as_deref().and_then(get_file_timestamp);
+            match session_data
+                .backend
+                .load_svd(core_index, core_config.svd_file.clone())
+                .await
+            {
+                // The session watches the SVD file of its first core for changes.
+                Ok(()) if core_index == target_core_config.core_index => {
+                    self.svd_timestamp = svd_timestamp
+                }
+                Ok(()) => {}
+                Err(error) => tracing::warn!("Failed to load SVD file: {error:?}"),
+            }
         }
 
         if requested_target_session_type == TargetSessionType::LaunchRequest {
             // This will effectively do a `reset` and `halt` of the core, which is what we want until after the `configuration_done` request.
+            // A reset of the first core resets the device (TriCore): the other cores of the
+            // session start from it as well.
             debug_adapter
-                .restart_async(&mut session_data, core_index, None)
+                .restart_async(&mut session_data, target_core_config.core_index, None)
                 .await
                 .context("Failed to restart core")?;
         }

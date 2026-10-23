@@ -577,9 +577,10 @@ impl SessionData {
 
         match status {
             CoreStatus::Running | CoreStatus::Sleeping => {
+                // The thread of a core is its core index.
                 let event_body = Some(ContinuedEventBody {
                     all_threads_continued: Some(true),
-                    thread_id: cd_idx as i64,
+                    thread_id: self.core_data[cd_idx].core_index as i64,
                 });
                 debug_adapter.send_event("continued", event_body)?;
                 tracing::trace!("Notified DAP client that the core continued: {:?}", status);
@@ -590,7 +591,10 @@ impl SessionData {
             CoreStatus::LockedUp => {
                 debug_adapter.show_message(
                     MessageSeverity::Warning,
-                    format!("Core {} is in locked up state", cd_idx),
+                    format!(
+                        "Core {} is in locked up state",
+                        self.core_data[cd_idx].core_index
+                    ),
                 );
                 self.notify_halted(debug_adapter, cd_idx, status).await?;
             }
@@ -923,9 +927,14 @@ impl SessionData {
                 // it could expose frame ids that no longer exist server-side.
                 self.core_data[cd_idx].invalidate_stack_frame_cache();
                 debug_adapter.all_cores_halted = false;
-            } else if !cores_halted_previously {
+            } else if if self.core_data.len() == 1 {
+                !cores_halted_previously
+            } else {
+                !self.core_data[cd_idx].stack_frames_valid
+            } {
                 // If currently halted, and was previously running
-                // update the stack frames
+                // update the stack frames. With several cores, a core halted while another runs
+                // is unwound once, not at every poll.
                 let _stackframe_span = tracing::debug_span!("Update Stack Frames").entered();
                 tracing::debug!("Updating the stack frame data for core #{}", core_index);
 
@@ -1031,6 +1040,7 @@ fn build_core_data(
         last_known_status: CoreStatus::Unknown,
         target_name: format!("{}-{}", core_configuration.core_index, target_name),
         stack_frames: vec![],
+        stack_frames_valid: false,
         breakpoints: vec![],
         data_breakpoints: vec![],
         rtt_scan_ranges: WireScanRegion::Ranges(vec![]),
@@ -1051,10 +1061,22 @@ fn initialize_core_data(
     backend: &mut RpcBackend,
     config: &configuration::SessionConfig,
 ) -> Result<Vec<CoreData>, DebuggerError> {
-    if config.core_configs.len() != 1 {
-        // TODO: For multi-core, allow > 1.
+    // Several cores share one session: each core is a thread, and requests are routed to the
+    // core they name (`CoreRouting`).
+    if config.core_configs.is_empty() {
         return Err(DebuggerError::Other(anyhow!(
-            "probe-rs-debugger requires that one, and only one, core be configured for debugging."
+            "probe-rs-debugger requires at least one core to be configured for debugging."
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if let Some(duplicate) = config
+        .core_configs
+        .iter()
+        .find(|core_config| !seen.insert(core_config.core_index))
+    {
+        return Err(DebuggerError::Other(anyhow!(
+            "Core {} is configured more than once in `coreConfigs`.",
+            duplicate.core_index
         )));
     }
 
