@@ -106,6 +106,14 @@ pub trait ProtocolAdapter {
     /// return None.
     fn listen_for_request(&mut self) -> anyhow::Result<Option<Request>>;
 
+    /// Returns `true` while the transport holds bytes that [`Self::listen_for_request`] has not
+    /// read yet. A wait between two polls of the target ends as soon as this is `true`, so a
+    /// request is not delayed by the rest of the wait. The default is `false`, which keeps the
+    /// full wait.
+    fn input_ready(&mut self) -> bool {
+        false
+    }
+
     fn send_event<S: Serialize>(
         &mut self,
         event_type: &str,
@@ -153,6 +161,10 @@ impl ProtocolAdapter for BoxedAdapter {
         (**self).listen_for_request()
     }
 
+    fn input_ready(&mut self) -> bool {
+        (**self).input_ready()
+    }
+
     fn dyn_send_event(
         &mut self,
         event_type: &str,
@@ -183,6 +195,25 @@ impl ProtocolAdapter for BoxedAdapter {
 
     fn get_next_seq(&mut self) -> i64 {
         (**self).get_next_seq()
+    }
+}
+
+/// Waits up to `timeout` for input to arrive on `adapter`, and returns `true` if it did.
+///
+/// This replaces a fixed sleep between two polls of the target. With the target halted the
+/// poll waits 100 ms, so a request that arrived just after the poll had waited up to that long.
+pub async fn wait_for_input(adapter: &mut impl ProtocolAdapter, timeout: Duration) -> bool {
+    const SLICE: Duration = Duration::from_millis(1);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if adapter.input_ready() {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(left.min(SLICE)).await;
     }
 }
 
@@ -545,6 +576,14 @@ impl<R: Read, W: Write> ProtocolAdapter for DapAdapter<R, W> {
         self.listen_for_request_and_respond()
     }
 
+    /// Bytes still in the buffer of the reader count, a partial message that
+    /// `receive_data` has already moved to `input_buffer` does not: waiting for the rest of
+    /// such a message is `receive_data`'s job, and counting it would end every wait at once.
+    /// The end of the input does not count either, the poll of the target goes on as before.
+    fn input_ready(&mut self) -> bool {
+        matches!(self.input.fill_buf(), Ok(data) if !data.is_empty())
+    }
+
     #[instrument(level = "trace", skip_all)]
     fn dyn_send_event(
         &mut self,
@@ -690,6 +729,120 @@ mod test {
         let request = adapter.listen_for_request().unwrap().unwrap();
 
         assert_eq!(request.command, "test");
+    }
+
+    /// A request in the DAP wire format.
+    fn request_bytes(seq: i64) -> Vec<u8> {
+        let content = format!(r#"{{ "seq": {seq}, "type": "request", "command": "test" }}"#);
+        format!("Content-Length: {}\r\n\r\n{content}", content.len()).into_bytes()
+    }
+
+    /// A reader that has nothing to read until `open` is set, as a socket before a request.
+    struct GatedReader {
+        open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        data: Vec<u8>,
+        position: usize,
+    }
+
+    impl Read for GatedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.open.load(std::sync::atomic::Ordering::SeqCst)
+                || self.position == self.data.len()
+            {
+                return Err(io::Error::new(ErrorKind::WouldBlock, "would block"));
+            }
+            let length = (self.data.len() - self.position).min(buf.len());
+            buf[..length].copy_from_slice(&self.data[self.position..self.position + length]);
+            self.position += length;
+            Ok(length)
+        }
+    }
+
+    #[test]
+    fn input_is_ready_only_while_unread_bytes_wait() {
+        let mut output = Vec::new();
+        let mut adapter = DapAdapter::new(
+            ChunkedReader {
+                data: request_bytes(3),
+                position: 0,
+                chunk: 1024,
+            },
+            &mut output,
+        );
+
+        assert!(adapter.input_ready(), "a request waits");
+        // Asking does not take the request.
+        assert!(adapter.input_ready());
+        assert_eq!(adapter.listen_for_request().unwrap().unwrap().seq, 3);
+        assert!(!adapter.input_ready(), "the request is read");
+    }
+
+    #[test]
+    fn a_partial_message_does_not_end_the_wait() {
+        // `listen_for_request` keeps the part of a message that arrived and gives up on the rest
+        // after a timeout. That part is in `input_buffer`, not new input: counting it would end
+        // every wait at once and the loop would poll the target without pause.
+        let mut output = Vec::new();
+        let mut adapter = DapAdapter::new(
+            ChunkedReader {
+                data: Vec::new(),
+                position: 0,
+                chunk: 1024,
+            },
+            &mut output,
+        );
+        adapter
+            .input_buffer
+            .extend_from_slice(b"Content-Length: 40\r\n");
+
+        assert!(!adapter.input_ready());
+    }
+
+    #[tokio::test]
+    async fn the_wait_ends_when_a_request_arrives() {
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut output = Vec::new();
+        let mut adapter = DapAdapter::new(
+            GatedReader {
+                open: open.clone(),
+                data: request_bytes(7),
+                position: 0,
+            },
+            &mut output,
+        );
+
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            open.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let arrived = wait_for_input(&mut adapter, Duration::from_secs(10)).await;
+        sender.await.unwrap();
+
+        assert!(arrived);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the wait ended with the request, not after its full time"
+        );
+        assert_eq!(adapter.listen_for_request().unwrap().unwrap().seq, 7);
+    }
+
+    #[tokio::test]
+    async fn the_wait_runs_out_without_a_request() {
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut output = Vec::new();
+        let mut adapter = DapAdapter::new(
+            GatedReader {
+                open,
+                data: request_bytes(7),
+                position: 0,
+            },
+            &mut output,
+        );
+
+        let start = Instant::now();
+        assert!(!wait_for_input(&mut adapter, Duration::from_millis(40)).await);
+        assert!(start.elapsed() >= Duration::from_millis(40));
     }
 
     #[test]

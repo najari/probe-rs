@@ -1717,6 +1717,13 @@ impl DebugAdapter {
         self.adapter.listen_for_request()
     }
 
+    /// Waits up to `timeout` for the next request to arrive, and returns `true` if it did. A
+    /// transport that cannot tell waits the full time.
+    pub(crate) async fn wait_for_input(&mut self, timeout: std::time::Duration) -> bool {
+        crate::cmd::dap_server::debug_adapter::protocol::wait_for_input(&mut self.adapter, timeout)
+            .await
+    }
+
     /// Sends either the success response or an error response if passed a
     /// DebuggerError. For the DAP Client, it forwards the response, while for
     /// the CLI, it will print the body for success, or the message for

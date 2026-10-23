@@ -468,7 +468,13 @@ impl Debugger {
             };
         }
 
-        Ok(DebugSessionStatus::Continue(delay))
+        // A request that arrives during the wait ends it: with the cores halted the wait is
+        // 100 ms, and a request sent just after the poll would otherwise wait all of it.
+        if !delay.is_zero() {
+            debug_adapter.wait_for_input(delay).await;
+        }
+
+        Ok(DebugSessionStatus::Continue(Duration::ZERO))
     }
 
     /// RPC entry point for the DAP server. Drives the session against an
