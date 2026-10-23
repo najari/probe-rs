@@ -56,8 +56,10 @@ pub async fn cores_status(
     let core_indices = resolve_core_indices(&session, request.cores.as_deref())?;
     let mut statuses = Vec::with_capacity(core_indices.len());
 
-    for core_index in core_indices {
-        match operate_status(&mut session, core_index) {
+    // One batch read of the debug status of all cores where the architecture has one (TriCore).
+    let results = session.status_many(&core_indices);
+    for (core_index, result) in core_indices.into_iter().zip(results) {
+        match result {
             Ok(status) => statuses.push((core_index as u32, to_wire_core_status(status))),
             Err(Error::CoreDisabled(_)) => {}
             Err(error) => return Err(crate::rpc::functions::convert::rpc_error_probe_rs(error)),
@@ -98,11 +100,4 @@ fn operate_resume(
         core.run()?;
     }
     core.status()
-}
-
-fn operate_status(
-    session: &mut probe_rs::Session,
-    core_index: usize,
-) -> Result<probe_rs::CoreStatus, Error> {
-    session.core(core_index)?.status()
 }

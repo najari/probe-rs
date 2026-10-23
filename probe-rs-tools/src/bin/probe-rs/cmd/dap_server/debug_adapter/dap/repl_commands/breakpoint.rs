@@ -105,16 +105,20 @@ fn source_from_path(path: &str) -> Source {
 
 async fn resolve_one_source_breakpoint(
     backend: &mut RpcBackend,
+    core_index: usize,
     path: &str,
     line: u64,
     column: Option<u64>,
 ) -> Result<VerifiedBreakpoint, DebuggerError> {
     backend
-        .resolve_source_breakpoints(vec![SourceBreakpointLocation {
-            path: path.to_string(),
-            line,
-            column,
-        }])
+        .resolve_source_breakpoints(
+            Some(core_index),
+            vec![SourceBreakpointLocation {
+                path: path.to_string(),
+                line,
+                column,
+            }],
+        )
         .await?
         .pop()
         .ok_or_else(|| {
@@ -164,7 +168,7 @@ async fn create_breakpoint<'a>(
             let VerifiedBreakpoint {
                 address,
                 source_location,
-            } = resolve_one_source_breakpoint(backend, path, line, column).await?;
+            } = resolve_one_source_breakpoint(backend, core_index, path, line, column).await?;
             let breakpoint_type = BreakpointType::SourceBreakpoint {
                 source: Box::new(source_from_path(path)),
                 location: SourceLocationScope::Specific(source_location.clone()),
@@ -248,11 +252,14 @@ async fn clear_breakpoint<'a>(
         BreakpointLocation::Address(addr) => addr,
         BreakpointLocation::FileLine { path, line, column } => {
             backend
-                .resolve_source_breakpoints(vec![SourceBreakpointLocation {
-                    path: path.to_string(),
-                    line,
-                    column,
-                }])
+                .resolve_source_breakpoints(
+                    Some(core_index),
+                    vec![SourceBreakpointLocation {
+                        path: path.to_string(),
+                        line,
+                        column,
+                    }],
+                )
                 .await?
                 .pop()
                 .ok_or_else(|| {

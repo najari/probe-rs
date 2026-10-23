@@ -13,6 +13,9 @@ pub struct ServerDebugState {
     /// without a program binary. Callers that need DWARF must degrade
     /// gracefully; SVD and semihosting state do not depend on it.
     pub debug_info: Option<Arc<DebugInfo>>,
+    /// The DWARF of the cores that run another program binary than the session's (one DAP
+    /// session for several cores). The other cores use [`Self::debug_info`].
+    pub core_debug_info: HashMap<usize, Arc<DebugInfo>>,
     pub per_core: HashMap<usize, CoreDebugState>,
     /// Per-core semihosting file state, owned server-side so that semihosting
     /// file I/O happens next to the target. Decoupled from [`Self::per_core`]
@@ -52,9 +55,25 @@ impl ServerDebugState {
     /// binary, so they intentionally survive a debug-info reload.
     pub fn replace_debug_info(&mut self, debug_info: DebugInfo) {
         self.debug_info = Some(Arc::new(debug_info));
-        for core_state in self.per_core.values_mut() {
-            core_state.clear_dwarf_derived_state();
+        for (core, core_state) in self.per_core.iter_mut() {
+            if !self.core_debug_info.contains_key(core) {
+                core_state.clear_dwarf_derived_state();
+            }
         }
+    }
+
+    /// Replace the DWARF of one core and invalidate the state derived from it.
+    pub fn replace_core_debug_info(&mut self, core_index: usize, debug_info: DebugInfo) {
+        self.core_debug_info
+            .insert(core_index, Arc::new(debug_info));
+        self.clear_core(core_index);
+    }
+
+    /// The DWARF of `core_index`: its own, else the session's. `None` asks for the session's.
+    pub fn debug_info_for(&self, core_index: Option<usize>) -> Option<Arc<DebugInfo>> {
+        core_index
+            .and_then(|core| self.core_debug_info.get(&core).cloned())
+            .or_else(|| self.debug_info.clone())
     }
 
     pub fn store_core(
@@ -171,6 +190,35 @@ mod tests {
         assert!(core_state.stack_frames.is_empty());
         assert!(core_state.static_variables.is_none());
         assert!(state.semihosting.contains_key(&0));
+    }
+
+    #[test]
+    fn a_core_with_its_own_program_uses_its_own_debug_info() {
+        let mut state = state_with_debug_info();
+        let session = state.debug_info.clone().unwrap();
+        state.per_core.insert(
+            1,
+            CoreDebugState {
+                stack_frames: vec![stack_frame()],
+                ..Default::default()
+            },
+        );
+        state.replace_core_debug_info(1, test_debug_info());
+
+        let own = state.debug_info_for(Some(1)).unwrap();
+        assert!(!Arc::ptr_eq(&own, &session));
+        assert!(Arc::ptr_eq(
+            &state.debug_info_for(Some(0)).unwrap(),
+            &session
+        ));
+        assert!(Arc::ptr_eq(&state.debug_info_for(None).unwrap(), &session));
+        assert!(state.per_core.get(&1).unwrap().stack_frames.is_empty());
+
+        // A new session program leaves the core with its own program alone.
+        state.per_core.get_mut(&1).unwrap().stack_frames = vec![stack_frame()];
+        state.replace_debug_info(test_debug_info());
+        assert!(Arc::ptr_eq(&state.debug_info_for(Some(1)).unwrap(), &own));
+        assert_eq!(state.per_core.get(&1).unwrap().stack_frames.len(), 1);
     }
 
     #[test]

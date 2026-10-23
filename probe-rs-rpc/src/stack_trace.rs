@@ -89,6 +89,9 @@ pub type TakeStackTraceResponse = RpcResult<StackTraces>;
 #[derive(Serialize, Deserialize, Schema)]
 pub struct LoadDebugInfoRequest {
     pub sessid: Key<Session>,
+    /// `None`: the debug info of the session, for every core without its own. A core: the debug
+    /// info of that core only (a core that runs another program binary).
+    pub core: Option<u32>,
     pub path: String,
 }
 

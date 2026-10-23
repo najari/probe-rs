@@ -27,6 +27,9 @@ pub struct SourceBreakpointLocation {
 #[derive(Serialize, Deserialize, Schema)]
 pub struct ResolveSourceBreakpointsRequest {
     pub sessid: Key<Session>,
+    /// Resolve with the debug info of this core (its program binary). `None`, or a core without
+    /// its own debug info, uses the debug info of the session.
+    pub core: Option<u32>,
     pub locations: Vec<SourceBreakpointLocation>,
 }
 
@@ -47,6 +50,8 @@ pub type ResolveSourceBreakpointsResponse = RpcResult<Vec<BreakpointResolution>>
 #[derive(Serialize, Deserialize, Schema)]
 pub struct ResolveSourceLocationsRequest {
     pub sessid: Key<Session>,
+    /// As in [`ResolveSourceBreakpointsRequest::core`].
+    pub core: Option<u32>,
     pub addresses: Vec<u64>,
 }
 

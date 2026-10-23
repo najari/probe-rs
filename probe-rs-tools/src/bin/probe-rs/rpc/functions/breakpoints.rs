@@ -16,8 +16,9 @@ pub async fn resolve_source_breakpoints(
     _header: VarHeader,
     request: ResolveSourceBreakpointsRequest,
 ) -> ResolveSourceBreakpointsResponse {
+    let core = request.core.map(|c| c as usize);
     let debug_info = ctx
-        .with_server_debug_state(request.sessid, |state| state.debug_info.clone())
+        .with_server_debug_state(request.sessid, |state| state.debug_info_for(core))
         .await;
 
     // Source breakpoints cannot be placed without DWARF. Report that per
@@ -60,8 +61,9 @@ pub async fn resolve_source_locations(
     _header: VarHeader,
     request: ResolveSourceLocationsRequest,
 ) -> ResolveSourceLocationsResponse {
+    let core = request.core.map(|c| c as usize);
     let debug_info = ctx
-        .with_server_debug_state(request.sessid, |state| state.debug_info.clone())
+        .with_server_debug_state(request.sessid, |state| state.debug_info_for(core))
         .await;
 
     let Some(debug_info) = debug_info else {

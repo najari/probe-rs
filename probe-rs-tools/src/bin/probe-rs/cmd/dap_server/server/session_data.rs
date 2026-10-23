@@ -153,21 +153,37 @@ impl SessionData {
         }
 
         // Eagerly populate the authoritative server-side `DebugInfo` so
-        // consumers can resolve source locations before the first halt. Use
-        // the first configured core's binary: the accepted single-core model
-        // still caches one `DebugInfo` per session (multi-core is deferred).
-        if let Some(Some(path)) = config
+        // consumers can resolve source locations before the first halt. The
+        // first configured core's binary is the session's; a core that runs
+        // another program binary gets its own (one session for several cores).
+        let first_binary = config
             .core_configs
             .first()
-            .map(|c| c.program_binary.as_deref())
-        {
+            .and_then(|c| c.program_binary.clone());
+        if let Some(path) = &first_binary {
             backend
                 .session_interface()
-                .load_debug_info(path.to_path_buf())
+                .load_debug_info(path.clone())
                 .await
                 .map_err(|e| {
                     DebuggerError::Other(anyhow::anyhow!("Failed to load debug info: {e}"))
                 })?;
+        }
+        for core_config in config.core_configs.iter().skip(1) {
+            if let Some(path) = &core_config.program_binary
+                && Some(path) != first_binary.as_ref()
+            {
+                backend
+                    .session_interface()
+                    .load_core_debug_info(core_config.core_index as u32, path.clone())
+                    .await
+                    .map_err(|e| {
+                        DebuggerError::Other(anyhow::anyhow!(
+                            "Failed to load the debug info of core {}: {e}",
+                            core_config.core_index
+                        ))
+                    })?;
+            }
         }
 
         let mut this = SessionData {
@@ -423,7 +439,7 @@ impl SessionData {
             .collect();
         let resolved = self
             .backend
-            .resolve_source_breakpoints(requests)
+            .resolve_source_breakpoints(Some(core_index), requests)
             .await
             .map_err(DebuggerError::ProbeRs)?;
         let mut to_set = Vec::with_capacity(resolved.len());
@@ -484,9 +500,14 @@ impl SessionData {
             )));
         };
 
+        // The first core's binary is the session's debug info, another core's is its own.
+        let own = self
+            .core_data
+            .first()
+            .is_some_and(|first| first.core_index != core_configuration.core_index);
         self.backend
             .session_interface()
-            .load_debug_info_resolved(upload)
+            .load_debug_info_resolved(upload, own.then_some(core_configuration.core_index as u32))
             .await
             .map_err(|error| {
                 DebuggerError::Other(anyhow!("Failed to reload server debug info: {error}"))
@@ -774,6 +795,19 @@ impl SessionData {
         // server-owned unwinds after status, RTT, and semihosting processing.
         let mut needs_unwind: Vec<usize> = Vec::new();
 
+        // With several cores, their status is asked once for all of them (one probe request on
+        // TriCore). A failed batch leaves each core to be asked on its own below.
+        let mut batch = if self.core_data.len() > 1 && debug_adapter.configuration_is_done() {
+            let cores = self
+                .core_data
+                .iter()
+                .map(|cd| cd.core_index)
+                .collect::<Vec<_>>();
+            self.backend.status_many(&cores).await.ok()
+        } else {
+            None
+        };
+
         for core_config in session_config.core_configs.iter() {
             // Fetch status via the backend before `attach_core` so the
             // `&mut self.backend` borrow is released before `attach_core`
@@ -789,7 +823,10 @@ impl SessionData {
                 continue;
             };
 
-            let current_core_status = if debug_adapter.configuration_is_done() {
+            let batched = batch.as_mut().and_then(|b| b.remove(&core_index));
+            let current_core_status = if let Some(status) = batched {
+                status
+            } else if debug_adapter.configuration_is_done() {
                 match self.backend.status(core_index).await {
                     Ok(status) => status,
                     Err(error) => {
@@ -917,6 +954,16 @@ impl SessionData {
                     .await
                     .1;
                 debug_adapter.log_to_console(description);
+            }
+
+            // With several cores, a core that another core's run let go and that halted again
+            // before this poll (at its own breakpoint) reports a new halt: its frames are old.
+            if self.core_data.len() > 1
+                && previous_core_status.is_halted()
+                && current_core_status.is_halted()
+                && previous_core_status != current_core_status
+            {
+                self.core_data[cd_idx].invalidate_stack_frame_cache();
             }
 
             // If the core is running, we set the flag to indicate that at least one core is not halted.

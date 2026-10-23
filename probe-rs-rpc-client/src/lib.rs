@@ -1222,17 +1222,27 @@ impl SessionInterface {
     /// server copy and invalidate DWARF-derived server state.
     pub async fn load_debug_info(&self, path: PathBuf) -> Result<(), ClientError> {
         let upload = self.client.resolve_upload(&path).await?;
-        self.load_debug_info_resolved(&upload).await
+        self.load_debug_info_resolved(&upload, None).await
     }
 
-    /// Publish server-side DWARF from a prior [`ResolvedUpload`].
+    /// Load the server-side DWARF of one core from `path`: the core runs another program
+    /// binary than the session's (see [`Self::load_debug_info`]).
+    pub async fn load_core_debug_info(&self, core: u32, path: PathBuf) -> Result<(), ClientError> {
+        let upload = self.client.resolve_upload(&path).await?;
+        self.load_debug_info_resolved(&upload, Some(core)).await
+    }
+
+    /// Publish server-side DWARF from a prior [`ResolvedUpload`], for the session (`None`) or
+    /// for one core.
     pub async fn load_debug_info_resolved(
         &self,
         upload: &ResolvedUpload,
+        core: Option<u32>,
     ) -> Result<(), ClientError> {
         self.client
             .send_resp::<LoadDebugInfoEndpoint, _>(&LoadDebugInfoRequest {
                 sessid: self.sessid,
+                core,
                 path: upload.server_path().display().to_string(),
             })
             .await
@@ -1244,27 +1254,33 @@ impl SessionInterface {
         self.client.resolve_upload(path).await
     }
 
-    /// Resolve source file/line requests against the server-owned debug info.
+    /// Resolve source file/line requests against the server-owned debug info of `core` (or of
+    /// the session).
     pub async fn resolve_source_breakpoints(
         &self,
+        core: Option<u32>,
         locations: Vec<SourceBreakpointLocation>,
     ) -> Result<Vec<BreakpointResolution>, ClientError> {
         self.client
             .send_resp::<ResolveSourceBreakpointsEndpoint, _>(&ResolveSourceBreakpointsRequest {
                 sessid: self.sessid,
+                core,
                 locations,
             })
             .await
     }
 
-    /// Resolve instruction addresses to source metadata using server DWARF.
+    /// Resolve instruction addresses to source metadata using the server DWARF of `core` (or of
+    /// the session).
     pub async fn resolve_source_locations(
         &self,
+        core: Option<u32>,
         addresses: Vec<u64>,
     ) -> Result<Vec<Option<WireSourceLocation>>, ClientError> {
         self.client
             .send_resp::<ResolveSourceLocationsEndpoint, _>(&ResolveSourceLocationsRequest {
                 sessid: self.sessid,
+                core,
                 addresses,
             })
             .await

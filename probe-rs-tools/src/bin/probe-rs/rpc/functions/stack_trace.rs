@@ -27,8 +27,9 @@ pub async fn load_debug_info(
     request: LoadDebugInfoRequest,
 ) -> LoadDebugInfoResponse {
     let debug_info = DebugInfo::from_file(&request.path).map_err(|e| e.to_string())?;
-    ctx.with_server_debug_state_mut(request.sessid, |state| {
-        state.replace_debug_info(debug_info);
+    ctx.with_server_debug_state_mut(request.sessid, |state| match request.core {
+        Some(core) => state.replace_core_debug_info(core as usize, debug_info),
+        None => state.replace_debug_info(debug_info),
     })
     .await;
     Ok(())
@@ -137,8 +138,11 @@ pub async fn take_rich_stack_trace(
     _header: VarHeader,
     request: TakeRichStackTraceRequest,
 ) -> TakeRichStackTraceResponse {
-    let debug_info = ctx
-        .with_server_debug_state(request.sessid, |state| state.debug_info.clone())
+    // The DWARF of the session, and of the cores that run another program binary.
+    let (session_debug_info, core_debug_info) = ctx
+        .with_server_debug_state(request.sessid, |state| {
+            (state.debug_info.clone(), state.core_debug_info.clone())
+        })
         .await;
 
     let mut session = ctx.session(request.sessid).await;
@@ -168,7 +172,7 @@ pub async fn take_rich_stack_trace(
             // Sessions attached without a program binary have no DWARF. Unwind anyway: the
             // fallback unwinder still walks the call stack, reporting each frame's program
             // counter without a name or source location.
-            let debug_info = match &debug_info {
+            let debug_info = match core_debug_info.get(&idx).or(session_debug_info.as_ref()) {
                 Some(debug_info) => debug_info.clone(),
                 None => Arc::new(DebugInfo::empty(core.endianness()?)),
             };

@@ -128,7 +128,7 @@ pub async fn variables(
     let mut guard = states.lock().await;
     let debug_info = guard
         .get(&request.sessid)
-        .and_then(|s| s.debug_info.clone());
+        .and_then(|s| s.debug_info_for(Some(request.core as usize)));
     let Some(debug_info) = debug_info else {
         Err("No debug state for session")?
     };
@@ -481,7 +481,9 @@ pub async fn live_watch(
     request: LiveWatchRequest,
 ) -> LiveWatchResponse {
     let debug_info = ctx
-        .with_server_debug_state(request.sessid, |state| state.debug_info.clone())
+        .with_server_debug_state(request.sessid, |state| {
+            state.debug_info_for(Some(request.core as usize))
+        })
         .await;
     let Some(debug_info) = debug_info else {
         Err("No debug information for the session (the core configuration has no program binary)")?
@@ -529,7 +531,7 @@ pub async fn evaluate(
     let mut guard = states.lock().await;
     let debug_info = guard
         .get(&request.sessid)
-        .and_then(|s| s.debug_info.clone());
+        .and_then(|s| s.debug_info_for(Some(request.core as usize)));
     let Some(debug_info) = debug_info else {
         Err("No debug state for session")?
     };

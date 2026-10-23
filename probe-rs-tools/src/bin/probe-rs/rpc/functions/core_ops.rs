@@ -92,7 +92,9 @@ pub async fn core_step(
     request: StepRequest,
 ) -> StepResult {
     let debug_info = ctx
-        .with_server_debug_state(request.sessid, |state| state.debug_info.clone())
+        .with_server_debug_state(request.sessid, |state| {
+            state.debug_info_for(Some(request.core as usize))
+        })
         .await;
 
     let mut session = ctx.session(request.sessid).await;

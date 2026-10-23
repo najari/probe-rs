@@ -918,7 +918,7 @@ impl DebugAdapter {
             .collect();
         let resolved = match session_data
             .backend
-            .resolve_source_breakpoints(locations)
+            .resolve_source_breakpoints(Some(core_index), locations)
             .await
         {
             Ok(resolved) => resolved
@@ -1257,7 +1257,7 @@ impl DebugAdapter {
 
         let source_locations = session_data
             .backend
-            .resolve_source_locations(set_addrs.clone())
+            .resolve_source_locations(Some(core_index), set_addrs.clone())
             .await
             .unwrap_or_else(|error| {
                 tracing::debug!("Could not resolve instruction breakpoint sources: {error}");

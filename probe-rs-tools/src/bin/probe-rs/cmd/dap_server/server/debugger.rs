@@ -112,6 +112,8 @@ pub struct Debugger {
     // TODO: Store somewhere else
     /// Timestamp of the flashed binary
     binary_timestamp: Option<Duration>,
+    /// The timestamps of the program binaries of the other cores of the session, when written.
+    other_binary_timestamps: HashMap<std::path::PathBuf, Option<Duration>>,
 
     // TODO: Store somewhere else
     /// Timestamp of the SVD file that the server parsed last
@@ -145,6 +147,7 @@ impl Debugger {
             config: configuration::SessionConfig::default(),
             timestamp_offset,
             binary_timestamp: None,
+            other_binary_timestamps: HashMap::new(),
             svd_timestamp: None,
             debug_logger: DebugLogger::new(log_file)?,
             uploaded_files: None,
@@ -867,6 +870,10 @@ impl Debugger {
                     )
                     .await?;
                 }
+                for path in others {
+                    let timestamp = get_file_timestamp(&path);
+                    self.other_binary_timestamps.insert(path, timestamp);
+                }
             } else {
                 self.binary_timestamp = target_core_config
                     .program_binary
@@ -1088,8 +1095,72 @@ impl Debugger {
                 session_data
                     .reload_debug_info_resolved(&target_core_config, &upload)
                     .await?;
-                session_data.recompute_breakpoints(core_index).await?;
+                // Every core that runs this program binary (the session's debug info).
+                for core_config in self.config.core_configs.clone() {
+                    if core_config.core_index == core_index
+                        || core_config.program_binary.is_none()
+                        || core_config.program_binary == target_core_config.program_binary
+                    {
+                        if core_config.core_index != core_index
+                            && let Ok(core_data) =
+                                session_data.core_data_mut(core_config.core_index)
+                        {
+                            core_data.invalidate_stack_frame_cache();
+                        }
+                        session_data
+                            .recompute_breakpoints(core_config.core_index)
+                            .await?;
+                    }
+                }
                 session_data.load_rtt_location(&self.config)?;
+            }
+
+            // The other program binaries of the session (one session for several cores): each
+            // is written again when its file changed, with its debug info and breakpoints.
+            for core_config in self.config.core_configs.clone().into_iter().skip(1) {
+                let Some(path) = core_config.program_binary.clone() else {
+                    continue;
+                };
+                if Some(&path) == target_core_config.program_binary.as_ref() {
+                    continue;
+                }
+                let timestamp = get_file_timestamp(&path);
+                if timestamp.is_some()
+                    && self.other_binary_timestamps.get(&path) == Some(&timestamp)
+                {
+                    continue;
+                }
+                let other_core = core_config.core_index;
+                let upload = session_data
+                    .backend
+                    .session_interface()
+                    .resolve_upload(&path)
+                    .await
+                    .map_err(|error| {
+                        DebuggerError::Other(anyhow!(
+                            "Failed to resolve program binary upload: {error}"
+                        ))
+                    })?;
+                if let Ok(core_data) = session_data.core_data_mut(other_core) {
+                    core_data.invalidate_stack_frame_cache();
+                }
+                session_data
+                    .backend
+                    .session_interface()
+                    .clear_core_debug_state(other_core as u32)
+                    .await
+                    .map_err(|error| {
+                        DebuggerError::Other(anyhow!(
+                            "Failed to clear server debug state before reflash: {error}"
+                        ))
+                    })?;
+                Self::flash_resolved(&self.config, &upload, debug_adapter, request, session_data)
+                    .await?;
+                session_data
+                    .reload_debug_info_resolved(&core_config, &upload)
+                    .await?;
+                session_data.recompute_breakpoints(other_core).await?;
+                self.other_binary_timestamps.insert(path, timestamp);
             }
         }
 
@@ -1125,9 +1196,11 @@ impl Debugger {
             }
         }
 
-        // Reset RTT so that the link can be re-established.
-        if let Ok(cd) = session_data.core_data_mut(core_index) {
+        // Reset RTT so that the link can be re-established. The reset is a reset of the
+        // device: every core of the session starts again.
+        for cd in session_data.core_data.iter_mut() {
             cd.rtt_connection = None;
+            cd.invalidate_stack_frame_cache();
         }
 
         session_data.clear_rtt_block(&self.config).await?;

@@ -20,7 +20,9 @@ pub async fn disassemble(
     // Without DWARF the instructions are still disassembled; they just carry
     // no source locations.
     let debug_info = ctx
-        .with_server_debug_state(request.sessid, |state| state.debug_info.clone())
+        .with_server_debug_state(request.sessid, |state| {
+            state.debug_info_for(Some(request.core as usize))
+        })
         .await;
 
     let mut session = ctx.session(request.sessid).await;

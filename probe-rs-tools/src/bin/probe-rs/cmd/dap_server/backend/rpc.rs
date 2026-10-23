@@ -285,13 +285,16 @@ impl RpcBackend {
             .map_err(rpc_err)
     }
 
+    /// Resolves source lines with the debug info of `core_index` (its program binary), or of the
+    /// session for `None`.
     pub(crate) async fn resolve_source_breakpoints(
         &self,
+        core_index: Option<usize>,
         locations: Vec<SourceBreakpointLocation>,
     ) -> Result<Vec<Result<VerifiedBreakpoint, String>>, Error> {
         let resolved = self
             .session_interface()
-            .resolve_source_breakpoints(locations)
+            .resolve_source_breakpoints(core_index.map(|c| c as u32), locations)
             .await
             .map_err(rpc_err)?;
         Ok(resolved
@@ -311,12 +314,14 @@ impl RpcBackend {
             .collect())
     }
 
+    /// Resolves addresses with the debug info of `core_index`, or of the session for `None`.
     pub(crate) async fn resolve_source_locations(
         &self,
+        core_index: Option<usize>,
         addresses: Vec<u64>,
     ) -> Result<Vec<Option<DebugSourceLocation>>, Error> {
         self.session_interface()
-            .resolve_source_locations(addresses)
+            .resolve_source_locations(core_index.map(|c| c as u32), addresses)
             .await
             .map(|locations| {
                 locations
@@ -337,6 +342,25 @@ impl RpcBackend {
         let client = self.core(core_index);
         let wire: WireCoreStatus = client.status().await.map_err(rpc_err)?;
         Ok(from_wire_core_status(wire))
+    }
+
+    /// The status of several cores in one RPC call; the server reads the debug status of all of
+    /// them in one probe request where the architecture allows it (TriCore). A core missing from
+    /// the answer (disabled) has none.
+    pub(crate) async fn status_many(
+        &mut self,
+        core_indices: &[usize],
+    ) -> Result<HashMap<usize, CoreStatus>, Error> {
+        let map = self
+            .session_interface()
+            .cores_status(Some(core_indices.iter().map(|&c| c as u32).collect()))
+            .await
+            .map_err(rpc_err)?;
+        Ok(map
+            .statuses
+            .into_iter()
+            .map(|(core, wire)| (core as usize, from_wire_core_status(wire)))
+            .collect())
     }
 
     /// Set a batch of hardware breakpoints, reporting per-address failures in
@@ -814,7 +838,7 @@ impl RpcBackend {
     /// The source location of a single address. `None` when the address has no
     /// debug information, or when the server cannot be reached.
     pub(crate) async fn source_location(&self, address: u64) -> Option<DebugSourceLocation> {
-        self.resolve_source_locations(vec![address])
+        self.resolve_source_locations(None, vec![address])
             .await
             .ok()?
             .pop()
