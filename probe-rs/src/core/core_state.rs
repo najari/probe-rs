@@ -381,7 +381,7 @@ impl CombinedCoreState {
             );
         };
 
-        TriCore::new(bus, s, options, debug_sequence).with_peers(peers)
+        TriCore::new(bus, s.as_mut(), options, debug_sequence).with_peers(peers)
     }
 
     /// Get the memory AP for this core.
@@ -457,8 +457,8 @@ pub enum SpecificCoreState {
     Riscv64(RiscvCoreState),
     /// The state of an Xtensa core.
     Xtensa(XtensaCoreState),
-    /// The state of a TriCore core.
-    TriCore(TriCoreCoreState),
+    /// The state of a TriCore core (boxed: it holds the breakpoint slots and the trigger units).
+    TriCore(Box<TriCoreCoreState>),
 }
 
 impl SpecificCoreState {
@@ -474,7 +474,7 @@ impl SpecificCoreState {
             CoreType::Riscv => SpecificCoreState::Riscv(RiscvCoreState::new()),
             CoreType::Riscv64 => SpecificCoreState::Riscv64(RiscvCoreState::new()),
             CoreType::Xtensa => SpecificCoreState::Xtensa(XtensaCoreState::new()),
-            CoreType::TriCore => SpecificCoreState::TriCore(TriCoreCoreState::new()),
+            CoreType::TriCore => SpecificCoreState::TriCore(Box::new(TriCoreCoreState::new())),
         }
     }
 

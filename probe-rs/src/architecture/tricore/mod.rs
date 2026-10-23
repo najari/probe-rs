@@ -9,6 +9,7 @@
 //! DAS access hardware, verified on a TC275 (C-step).
 
 use std::{
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -26,10 +27,12 @@ use crate::{
 };
 
 pub mod bus;
+mod journal;
 pub mod registers;
 pub mod sequences;
 
 use bus::{AddressMap, BusTransfer, ResetKind, TriCoreBusAccess, TriCoreError};
+use journal::Journal;
 use registers::{FP, PC, RA, SP, TRICORE_CORE_REGISTERS};
 use sequences::TriCoreDebugSequence;
 
@@ -481,6 +484,12 @@ pub struct TriCoreCoreState {
     software_first: bool,
     /// Messages for the user (a reset was seen), taken by [`Self::take_notices`].
     notices: Vec<String>,
+    /// Where the journal of the planted `DEBUG` instructions is kept (`None`: no journal).
+    journal_dir: Option<PathBuf>,
+    /// The journal, once the core has a handle.
+    journal: Option<Journal>,
+    /// Whether the journals of sessions that are gone were looked at.
+    journal_checked: bool,
 }
 
 impl TriCoreCoreState {
@@ -507,6 +516,24 @@ impl TriCoreCoreState {
             reset_seen: None,
             software_first: false,
             notices: Vec::new(),
+            // The unit tests keep no journal, unless they ask for one.
+            journal_dir: (!cfg!(test)).then(Journal::default_dir),
+            journal: None,
+            journal_checked: false,
+        }
+    }
+
+    /// Keeps the journal of the planted `DEBUG` instructions in `dir`.
+    #[cfg(test)]
+    pub(crate) fn set_journal_dir(&mut self, dir: PathBuf) {
+        self.journal_dir = Some(dir);
+    }
+
+    /// Lets the journal file go without removing it, as when the process is killed.
+    #[cfg(test)]
+    pub(crate) fn abandon_journal(&mut self) {
+        if let Some(journal) = &mut self.journal {
+            journal.abandon();
         }
     }
 
@@ -764,6 +791,53 @@ impl<'probe> TriCore<'probe> {
         self.options.core_index
     }
 
+    fn journal(&mut self) -> &mut Journal {
+        let (core, dir) = (self.core(), self.state.journal_dir.clone());
+        self.state
+            .journal
+            .get_or_insert_with(|| Journal::new(dir, core))
+    }
+
+    /// Puts the code back under the `DEBUG` instructions that a session which is gone left in
+    /// the PSPR (it was killed), as its journal tells. Only where the `DEBUG` instruction is
+    /// still there: the program may have been loaded again since. Once per session.
+    fn recover_left_breakpoints(&mut self) -> Result<(), TriCoreError> {
+        if std::mem::replace(&mut self.state.journal_checked, true) {
+            return Ok(());
+        }
+        let mut restored = Vec::new();
+        for (address, original) in self.journal().take_abandoned() {
+            if self.memory.software.iter().any(|sw| sw.address == address) {
+                continue;
+            }
+            let debug = ocds::debug_instruction(original.len());
+            let mut code = vec![0; debug.len()];
+            if self
+                .bus()
+                .read_block(AddressMap::Target, address, &mut code)
+                .is_err()
+                || code != debug
+            {
+                continue;
+            }
+            self.bus()
+                .write_block(AddressMap::Target, address, &original)?;
+            restored.push(format!("{address:#010x}"));
+        }
+        if !restored.is_empty() {
+            let notice = format!(
+                "TriCore core {}: put the code back under {} DEBUG instruction(s) that a debugger \
+                 session left behind ({})",
+                self.core(),
+                restored.len(),
+                restored.join(", ")
+            );
+            tracing::warn!("{notice}");
+            self.state.notices.push(notice);
+        }
+        Ok(())
+    }
+
     fn csfr(&self, offset: u16) -> u32 {
         self.options.csfr_base as u32 + offset as u32
     }
@@ -940,6 +1014,7 @@ impl<'probe> TriCore<'probe> {
     /// Takes over the trigger units before the first step or breakpoint change of this session:
     /// triggers that an earlier session left behind are cleared.
     fn take_triggers(&mut self) -> Result<(), TriCoreError> {
+        self.recover_left_breakpoints()?;
         if !self.state.owns_triggers {
             self.reinit_triggers()?;
         }
@@ -1128,6 +1203,7 @@ impl<'probe> TriCore<'probe> {
     }
 
     fn update_halted(&mut self) -> Result<bool, TriCoreError> {
+        self.recover_left_breakpoints()?;
         let (mut dbgsr, stm) = self.read_status()?;
         if let Some(stm) = stm {
             let reset = self.state.last_stm.is_some_and(|last| stm < last);
@@ -2032,6 +2108,17 @@ impl<'probe> TriCore<'probe> {
 
 impl Drop for TriCore<'_> {
     fn drop(&mut self) {
+        // Record the planted `DEBUG` instructions, for a session after this one if this one
+        // does not end cleanly.
+        if !self.memory.software.is_empty() || self.state.journal.is_some() {
+            let entries = self
+                .memory
+                .software
+                .iter()
+                .map(|sw| (sw.address, sw.original.clone()))
+                .collect::<Vec<_>>();
+            self.journal().record(&entries);
+        }
         // Give the software breakpoints back to the core state.
         self.state.software = std::mem::take(&mut self.memory.software);
     }

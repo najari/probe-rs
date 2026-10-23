@@ -1173,6 +1173,70 @@ fn a_reset_of_the_device_is_noticed_and_the_core_runs_on() {
     assert_eq!(bus.bytes(0x7010_0016, 2), ocds::DEBUG16);
 }
 
+/// An empty journal directory for test `name`.
+fn journal_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "probe-rs-tricore-test-{name}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+fn journal_files(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir).map_or(0, |files| files.count())
+}
+
+#[test]
+fn debug_instructions_that_a_killed_session_left_are_taken_out() {
+    let dir = journal_dir("killed");
+    let mut bus = pspr_bus();
+    let mut state = software_state();
+    state.set_journal_dir(dir.clone());
+    {
+        let mut core = core(&mut bus, &mut state);
+        core.enable_breakpoints(true).unwrap();
+        core.set_hw_breakpoint(0, PSPR_ST_W as u64).unwrap();
+        core.set_hw_breakpoint(1, PSPR_MOV_AA as u64).unwrap();
+    }
+    assert_eq!(bus.bytes(PSPR_ST_W, 4), ocds::DEBUG32);
+    assert_eq!(journal_files(&dir), 1);
+
+    // Another session on the core while this one runs leaves its breakpoints alone.
+    let mut other = software_state();
+    other.set_journal_dir(dir.clone());
+    core(&mut bus, &mut other).status().unwrap();
+    assert_eq!(bus.bytes(PSPR_ST_W, 4), ocds::DEBUG32);
+    assert!(other.take_notices().is_empty());
+
+    // The session is killed; the program is loaded again at one of the breakpoints.
+    state.abandon_journal();
+    drop(state);
+    bus.set_bytes(PSPR_MOV_AA, &[0x40, 0xAF]);
+    let mut next = software_state();
+    next.set_journal_dir(dir.clone());
+    core(&mut bus, &mut next).status().unwrap();
+    assert_eq!(bus.bytes(PSPR_ST_W, 4), ST_W);
+    assert_eq!(bus.bytes(PSPR_MOV_AA, 2), [0x40, 0xAF]);
+    let notices = next.take_notices();
+    assert!(
+        notices.len() == 1 && notices[0].contains("1 DEBUG instruction(s)"),
+        "{notices:?}"
+    );
+    assert_eq!(journal_files(&dir), 0);
+
+    // A session that ends cleanly leaves no journal.
+    {
+        let mut core = core(&mut bus, &mut next);
+        core.enable_breakpoints(true).unwrap();
+        core.set_hw_breakpoint(0, PSPR_ST_W as u64).unwrap();
+    }
+    assert_eq!(journal_files(&dir), 1);
+    core(&mut bus, &mut next).clear_hw_breakpoint(0).unwrap();
+    assert_eq!(journal_files(&dir), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_breakpoint_in_the_pspr_takes_a_free_trigger_unit() {
     let mut bus = pspr_bus();
