@@ -1508,6 +1508,83 @@ fn debug_instructions_that_a_killed_session_left_are_taken_out() {
 }
 
 #[test]
+fn trigger_units_and_routing_that_a_killed_session_left_are_put_back() {
+    let dir = journal_dir("killed-triggers");
+    let mut bus = FakeBus::new();
+    // CPU0's routing before the session: another field of CBS_TRC0 is set.
+    bus.set_word(ocds::trc(0), 0x2);
+    bus.set_word(ocds::trc(1), ocds::TRC_HALT_GROUP);
+    let unit_evt = CSFR_BASE + 0xF000 + 8;
+    let exevt = CSFR_BASE + ocds::EXEVT as u32;
+    let mut state = TriCoreCoreState::new();
+    state.set_journal_dir(dir.clone());
+    {
+        let mut core = group_core(&mut bus, &mut state);
+        core.set_halt_group(true).unwrap();
+        core.enable_breakpoints(true).unwrap();
+        core.set_hw_breakpoint(1, 0x8000_0400).unwrap();
+    }
+    assert_eq!(bus.word(unit_evt), ocds::TRIG_EVT_IP);
+    assert!(ocds::in_halt_group(bus.word(ocds::trc(0))));
+    assert_eq!(bus.word(exevt), ocds::EXEVT_HALT);
+    assert_eq!(journal_files(&dir), 1);
+
+    // The session is killed: the next one clears its trigger unit and puts the routing back.
+    state.abandon_journal();
+    drop(state);
+    let mut next = TriCoreCoreState::new();
+    next.set_journal_dir(dir.clone());
+    group_core(&mut bus, &mut next).status().unwrap();
+    assert_eq!(bus.word(unit_evt), 0);
+    assert_eq!(bus.word(ocds::trc(0)), 0x2);
+    assert_eq!(bus.word(exevt), 0);
+    let notices = next.take_notices();
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.contains("cleared the trigger units")),
+        "{notices:?}"
+    );
+    assert_eq!(journal_files(&dir), 0);
+
+    // Its own group and breakpoint, then a clean end: no journal is left.
+    {
+        let mut core = group_core(&mut bus, &mut next);
+        core.set_halt_group(true).unwrap();
+        core.enable_breakpoints(true).unwrap();
+        core.set_hw_breakpoint(1, 0x8000_0400).unwrap();
+    }
+    assert_eq!(journal_files(&dir), 1);
+    {
+        let mut core = group_core(&mut bus, &mut next);
+        core.clear_hw_breakpoint(1).unwrap();
+        core.set_halt_group(false).unwrap();
+    }
+    assert_eq!(journal_files(&dir), 0);
+    assert_eq!(bus.word(ocds::trc(0)), 0x2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_journal_of_an_earlier_version_still_puts_the_code_back() {
+    // Two fields: a `DEBUG` instruction.
+    let dir = journal_dir("old-journal");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("core0-1-0.txt"),
+        format!("{PSPR_ST_W:08x} 59e4fcff\n"),
+    )
+    .unwrap();
+    let mut bus = pspr_bus();
+    bus.set_bytes(PSPR_ST_W, &ocds::DEBUG32);
+    let mut state = software_state();
+    state.set_journal_dir(dir.clone());
+    core(&mut bus, &mut state).status().unwrap();
+    assert_eq!(bus.bytes(PSPR_ST_W, 4), [0x59, 0xe4, 0xfc, 0xff]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_breakpoint_in_the_pspr_takes_a_free_trigger_unit() {
     let mut bus = pspr_bus();
     let mut state = TriCoreCoreState::new();

@@ -942,31 +942,42 @@ impl<'probe> TriCore<'probe> {
         self.state.journal.as_mut().expect("set above")
     }
 
-    /// Puts the code back under the `DEBUG` instructions that a session which is gone left in
-    /// the PSPR (it was killed), as its journal tells. Only where the `DEBUG` instruction is
-    /// still there: the program may have been loaded again since. Once per session.
+    /// Puts back what a session which is gone (it was killed) left in the device, as its journal
+    /// tells: the code under its `DEBUG` instructions, its armed trigger units (cleared) and its
+    /// halt group routing. Only where the value is still the one that session wrote: the program
+    /// may have been loaded again since. Once per session.
     fn recover_left_breakpoints(&mut self) -> Result<(), TriCoreError> {
         if std::mem::replace(&mut self.state.journal_checked, true) {
             return Ok(());
         }
         let mut restored = Vec::new();
-        for (address, original) in self.journal().take_abandoned() {
-            if self.memory.software.iter().any(|sw| sw.address == address) {
-                continue;
-            }
-            let debug = ocds::debug_instruction(original.len());
-            let mut code = vec![0; debug.len()];
+        let mut registers = 0;
+        for entry in self.journal().take_abandoned() {
+            let address = entry.address;
+            let planted = match &entry.planted {
+                // A `DEBUG` instruction, unless this session planted one there itself.
+                None if self.memory.software.iter().any(|sw| sw.address == address) => continue,
+                None => ocds::debug_instruction(entry.original.len()).to_vec(),
+                Some(planted) => planted.clone(),
+            };
+            // Only where the value is still the one the session wrote: the program may have been
+            // loaded again, or another session took the register over since.
+            let mut now = vec![0; planted.len()];
             if self
                 .bus()
-                .read_block(AddressMap::Target, address, &mut code)
+                .read_block(AddressMap::Target, address, &mut now)
                 .is_err()
-                || code != debug
+                || now != planted
             {
                 continue;
             }
             self.bus()
-                .write_block(AddressMap::Target, address, &original)?;
-            restored.push(format!("{address:#010x}"));
+                .write_block(AddressMap::Target, address, &entry.original)?;
+            if entry.planted.is_none() {
+                restored.push(format!("{address:#010x}"));
+            } else {
+                registers += 1;
+            }
         }
         if !restored.is_empty() {
             let notice = format!(
@@ -975,6 +986,15 @@ impl<'probe> TriCore<'probe> {
                 self.core(),
                 restored.len(),
                 restored.join(", ")
+            );
+            tracing::warn!("{notice}");
+            self.state.notices.push(notice);
+        }
+        if registers > 0 {
+            let notice = format!(
+                "TriCore core {}: cleared the trigger units and the halt group routing that a \
+                 debugger session left behind ({registers} register(s))",
+                self.core()
             );
             tracing::warn!("{notice}");
             self.state.notices.push(notice);
@@ -1049,6 +1069,16 @@ impl<'probe> TriCore<'probe> {
     /// and breakpoints are enabled, disabled otherwise. The second unit of a watchpoint range
     /// only holds the end address.
     fn write_trigger(&mut self, unit: usize) -> Result<(), TriCoreError> {
+        let (address, evt) = self.trigger_value(unit);
+        if let Some(address) = address {
+            self.write_csfr(Self::trigger_adr(unit), address)?;
+        }
+        self.write_csfr(Self::trigger_evt(unit), evt)
+    }
+
+    /// What [`Self::write_trigger`] writes to a unit: `TRnADR` (`None`: left as it is) and
+    /// `TRnEVT` (0: the unit does nothing).
+    fn trigger_value(&self, unit: usize) -> (Option<u32>, u32) {
         let enabled = self.state.breakpoints_enabled;
         let watchpoint = self
             .state
@@ -1057,32 +1087,57 @@ impl<'probe> TriCore<'probe> {
             .find(|w| w.uses(unit))
             .copied();
         match (self.state.breakpoints[unit], watchpoint) {
-            (Some(address), _) if enabled => {
-                self.write_csfr(Self::trigger_adr(unit), address)?;
-                self.write_csfr(Self::trigger_evt(unit), ocds::TRIG_EVT_IP)
-            }
-            (None, Some(w)) if enabled && w.unit == unit => {
-                self.write_csfr(Self::trigger_adr(unit), w.address)?;
-                self.write_csfr(Self::trigger_evt(unit), w.trigger_evt())
-            }
-            (None, Some(w)) if enabled => {
-                self.write_csfr(Self::trigger_adr(unit), w.address.wrapping_add(w.len))?;
-                self.write_csfr(Self::trigger_evt(unit), 0)
-            }
+            (Some(address), _) if enabled => (Some(address), ocds::TRIG_EVT_IP),
+            (None, Some(w)) if enabled && w.unit == unit => (Some(w.address), w.trigger_evt()),
+            (None, Some(w)) if enabled => (Some(w.address.wrapping_add(w.len)), 0),
             (None, None) => match self.state.perf_window {
                 // The window counts whether breakpoints are enabled or not.
-                Some(p) if p.units[0] == unit => {
-                    self.write_csfr(Self::trigger_adr(unit), p.start)?;
-                    self.write_csfr(Self::trigger_evt(unit), ocds::TRIG_EVT_PERF_START)
-                }
-                Some(p) if p.units[1] == unit => {
-                    self.write_csfr(Self::trigger_adr(unit), p.stop)?;
-                    self.write_csfr(Self::trigger_evt(unit), ocds::TRIG_EVT_PERF_STOP)
-                }
-                _ => self.write_csfr(Self::trigger_evt(unit), 0),
+                Some(p) if p.units[0] == unit => (Some(p.start), ocds::TRIG_EVT_PERF_START),
+                Some(p) if p.units[1] == unit => (Some(p.stop), ocds::TRIG_EVT_PERF_STOP),
+                _ => (None, 0),
             },
-            _ => self.write_csfr(Self::trigger_evt(unit), 0),
+            _ => (None, 0),
         }
+    }
+
+    /// The values this session wrote into the device that a session after it puts back if this
+    /// one ends without doing so (it was killed): the `DEBUG` instructions, the `TRnEVT` of the
+    /// trigger units it armed, and the halt group routing (`CBS_TRCn`, `EXEVT`).
+    fn journal_entries(&self) -> Vec<journal::Entry> {
+        let mut entries = self
+            .memory
+            .software
+            .iter()
+            .map(|sw| journal::Entry::debug_instruction(sw.address, sw.original.clone()))
+            .collect::<Vec<_>>();
+        if self.state.owns_triggers {
+            for unit in 0..ocds::TRIGGER_UNITS {
+                let (_, evt) = self.trigger_value(unit);
+                if evt != 0 {
+                    entries.push(journal::Entry::word(
+                        self.csfr(Self::trigger_evt(unit)),
+                        0,
+                        evt,
+                    ));
+                }
+            }
+        }
+        if let Some((saved_trc, saved_exevt)) = self.state.halt_group {
+            // What leaving the group writes: the other `CBS_TRCn` fields stay as the routing
+            // found them (`set_halt_group`).
+            let routed = (saved_trc & !ocds::TRC_HALT_BRKIN) | ocds::TRC_HALT_GROUP;
+            entries.push(journal::Entry::word(
+                ocds::trc(self.core()),
+                saved_trc,
+                routed,
+            ));
+            entries.push(journal::Entry::word(
+                self.csfr(ocds::EXEVT),
+                saved_exevt,
+                ocds::EXEVT_HALT,
+            ));
+        }
+        entries
     }
 
     /// Sets the performance counter window (A-to-B): the counters (`CCNT`, `ICNT`,
@@ -1907,6 +1962,9 @@ impl<'probe> TriCore<'probe> {
         let core = self.core();
         let trc_address = ocds::trc(core);
         if join {
+            // A killed session's routing goes back first: this session saves the values from
+            // before it.
+            self.recover_left_breakpoints()?;
             if self.state.halt_group.is_none() {
                 let trc = self.bus().read_u32(AddressMap::Target, trc_address)?;
                 let exevt = self.read_csfr(ocds::EXEVT)?;
@@ -2324,15 +2382,10 @@ impl<'probe> TriCore<'probe> {
 
 impl Drop for TriCore<'_> {
     fn drop(&mut self) {
-        // Record the planted `DEBUG` instructions, for a session after this one if this one
-        // does not end cleanly.
-        if !self.memory.software.is_empty() || self.state.journal.is_some() {
-            let entries = self
-                .memory
-                .software
-                .iter()
-                .map(|sw| (sw.address, sw.original.clone()))
-                .collect::<Vec<_>>();
+        // Record the planted `DEBUG` instructions, armed trigger units and the halt group
+        // routing, for a session after this one if this one does not end cleanly.
+        let entries = self.journal_entries();
+        if !entries.is_empty() || self.state.journal.is_some() {
             self.journal().record(&entries);
         }
         // Give the software breakpoints back to the core state.
