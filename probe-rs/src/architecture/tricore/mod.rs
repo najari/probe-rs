@@ -410,6 +410,8 @@ struct GroupState {
     exevt: u32,
     /// (core index, `CBS_TRCn`, `DBGSR`) of every peer.
     peers: Vec<(u8, u32, u32)>,
+    /// `DBGSR` of the core, read after the peers.
+    own_dbgsr: u32,
 }
 
 impl GroupState {
@@ -1279,7 +1281,12 @@ impl<'probe> TriCore<'probe> {
             let csfr_base = self.options.csfr_base as u32;
             self.write_group_routing(self.core(), csfr_base)?;
         }
-        if !halted {
+        // `halted` is from the read before this one: the group may have halted the cores in
+        // between (a pause in another session). The peers then read as halted, and noting them
+        // would forget the members that ran with this core, so the next run would not run them.
+        // This core is read last in the group request: if it still runs there, the peers were
+        // read while it ran.
+        if !halted && ocds::is_running(group.own_dbgsr) {
             self.state.running_peers = group.running_members();
         }
         Ok(())
@@ -1525,17 +1532,26 @@ impl<'probe> TriCore<'probe> {
                 4,
             ));
         }
+        // Last: a core that halted between the reads of the request halts at the peers' reads
+        // or after them, so a core that runs here ran at all of them.
+        transfers.push(BusTransfer::read(
+            AddressMap::Target,
+            self.csfr(ocds::DBGSR),
+            4,
+        ));
         self.bus().execute(&mut transfers)?;
+        let own = transfers.len() - 1;
         let peers = self
             .peers
             .iter()
-            .zip(transfers[2..].chunks(2))
+            .zip(transfers[2..own].chunks(2))
             .map(|(&(core, _), pair)| Ok((core, pair[0].read_u32()?, pair[1].read_u32()?)))
             .collect::<Result<_, TriCoreError>>()?;
         Ok(GroupState {
             trc: transfers[0].read_u32()?,
             exevt: transfers[1].read_u32()?,
             peers,
+            own_dbgsr: transfers[own].read_u32()?,
         })
     }
 

@@ -27,6 +27,9 @@ struct FakeBus {
     reboot_refusals: usize,
     /// The device the bus reaches ([`TriCoreBusAccess::device_key`]).
     device_key: Option<String>,
+    /// The halt group halts all cores just before the request that reads the `DBGSR` of the peer
+    /// (a pause in another session, between the reads of one status check).
+    halt_group_at_peer_read: bool,
 }
 
 impl FakeBus {
@@ -185,6 +188,16 @@ impl TriCoreBusAccess for FakeBus {
                 transfer.status = Some(TransferStatus::Failed(0x44));
             }
             return Ok(());
+        }
+        if self.halt_group_at_peer_read
+            && transfers
+                .iter()
+                .any(|t| t.is_read() && t.address == PEER_DBGSR)
+        {
+            self.halt_group_at_peer_read = false;
+            self.halted = true;
+            self.evtsrc = 0;
+            self.set_word(PEER_DBGSR, 0x0003);
         }
         self.requests.push(
             transfers
@@ -509,6 +522,40 @@ fn a_run_also_runs_the_members_that_the_group_halted() {
         dbgsr,
         0xF000_049C,
     ]));
+}
+
+#[test]
+fn a_pause_in_the_middle_of_a_status_check_keeps_the_members_to_run() {
+    let mut bus = FakeBus::new();
+    bus.set_word(ocds::trc(1), ocds::TRC_HALT_GROUP);
+    let mut state = TriCoreCoreState::new();
+    group_core(&mut bus, &mut state)
+        .set_halt_group(true)
+        .unwrap();
+
+    // Both cores run, and a status check notes that CPU1 runs with this core.
+    bus.set_word(PEER_DBGSR, 0x0001);
+    assert_eq!(
+        group_core(&mut bus, &mut state).status().unwrap(),
+        CoreStatus::Running
+    );
+
+    // The halt group halts all cores between the reads of the next status check: this core
+    // still reads as running, CPU1 already as halted. That check must not forget CPU1.
+    bus.halt_group_at_peer_read = true;
+    group_core(&mut bus, &mut state).status().unwrap();
+    assert!(!bus.halt_group_at_peer_read, "the halt happened");
+    assert_eq!(
+        group_core(&mut bus, &mut state).status().unwrap(),
+        CoreStatus::Halted(HaltReason::External)
+    );
+
+    // Running this core runs CPU1 again.
+    group_core(&mut bus, &mut state).run().unwrap();
+    assert!(
+        bus.write_words().contains(&(PEER_DBGSR, ocds::DBGSR_RUN)),
+        "CPU1 runs with this core"
+    );
 }
 
 #[test]
