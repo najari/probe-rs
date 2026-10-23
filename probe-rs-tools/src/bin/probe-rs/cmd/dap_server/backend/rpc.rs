@@ -507,6 +507,17 @@ impl RpcBackend {
         client.run().await.map_err(rpc_err)
     }
 
+    /// [`Self::run`] for this core alone: on TriCore the halt group members stay halted (a DAP
+    /// `continue` with `singleThread`).
+    pub(crate) async fn run_alone(&mut self, core_index: usize) -> Result<(), Error> {
+        self.session_interface()
+            .clear_core_debug_state(core_index as u32)
+            .await
+            .map_err(rpc_err)?;
+        let client = self.core(core_index);
+        client.run_alone().await.map_err(rpc_err)
+    }
+
     pub(crate) async fn core_halted(&mut self, core_index: usize) -> Result<bool, Error> {
         Ok(self.status(core_index).await?.is_halted())
     }

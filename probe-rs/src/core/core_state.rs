@@ -310,7 +310,6 @@ impl CombinedCoreState {
         matches!(&self.specific_state, SpecificCoreState::TriCore(state) if state.has_perf_window())
     }
 
-    /// Takes the messages for the user that this TriCore core collected (none for other cores).
     /// Gives the next status check of this TriCore core the registers of a batch read (see
     /// [`crate::architecture::tricore::prefetch_status`]); `None` drops a batch left unused.
     pub(crate) fn tricore_set_prefetched(
@@ -322,6 +321,15 @@ impl CombinedCoreState {
         }
     }
 
+    /// Makes the next run of this TriCore core leave the halt group members halted (nothing for
+    /// other cores).
+    pub(crate) fn tricore_set_run_alone(&mut self, alone: bool) {
+        if let SpecificCoreState::TriCore(state) = &mut self.specific_state {
+            state.set_run_alone(alone);
+        }
+    }
+
+    /// Takes the messages for the user that this TriCore core collected (none for other cores).
     pub(crate) fn tricore_take_notices(&mut self) -> Vec<String> {
         match &mut self.specific_state {
             SpecificCoreState::TriCore(state) => state.take_notices(),

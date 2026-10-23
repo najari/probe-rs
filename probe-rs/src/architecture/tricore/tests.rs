@@ -779,6 +779,39 @@ fn a_run_that_halts_at_once_runs_the_members_again_next_time() {
 }
 
 #[test]
+fn a_run_alone_leaves_the_members_halted_and_the_next_run_takes_them() {
+    let mut bus = FakeBus::new();
+    bus.set_word(ocds::trc(1), ocds::TRC_HALT_GROUP);
+    let mut state = TriCoreCoreState::new();
+    group_core(&mut bus, &mut state)
+        .set_halt_group(true)
+        .unwrap();
+    bus.set_word(PEER_DBGSR, 0x0001);
+    group_core(&mut bus, &mut state).status().unwrap();
+    // The group halts both.
+    bus.set_word(PEER_DBGSR, 0x0003);
+    bus.halted = true;
+    group_core(&mut bus, &mut state).status().unwrap();
+    let peer_runs = |bus: &FakeBus| {
+        bus.write_words()
+            .iter()
+            .filter(|&&w| w == (PEER_DBGSR, ocds::DBGSR_RUN))
+            .count()
+    };
+
+    state.set_run_alone(true);
+    group_core(&mut bus, &mut state).run().unwrap();
+    assert_eq!(peer_runs(&bus), 0);
+
+    // CPU0 halts again; the next run runs CPU1 with it.
+    bus.writes.clear();
+    bus.halted = true;
+    group_core(&mut bus, &mut state).status().unwrap();
+    group_core(&mut bus, &mut state).run().unwrap();
+    assert!(peer_runs(&bus) > 0);
+}
+
+#[test]
 fn a_member_that_missed_the_halt_is_halted_when_the_halt_is_seen() {
     let mut bus = FakeBus::new();
     bus.set_word(ocds::trc(1), ocds::TRC_HALT_GROUP);

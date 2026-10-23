@@ -612,6 +612,9 @@ pub struct TriCoreCoreState {
     /// another session ran and that halted again before the next status check (at its own
     /// breakpoint, for example) reads as halted both times; other values tell the new halt.
     halt_mark: Option<(u32, u32)>,
+    /// Set for the next run: the core runs alone, the halt group members it would run with stay
+    /// halted (a debugger's single-thread continue). The members stay in `running_peers`.
+    run_alone: bool,
 }
 
 impl TriCoreCoreState {
@@ -644,12 +647,18 @@ impl TriCoreCoreState {
             journal_checked: false,
             prefetched: None,
             halt_mark: None,
+            run_alone: false,
         }
     }
 
     /// Gives the next status check of this core the registers read by [`prefetch_status`].
     pub(crate) fn set_prefetched(&mut self, snapshot: Option<StatusSnapshot>) {
         self.prefetched = snapshot;
+    }
+
+    /// Makes the next run of this core leave the halt group members halted.
+    pub(crate) fn set_run_alone(&mut self, alone: bool) {
+        self.run_alone = alone;
     }
 
     /// Keeps the journal of the planted `DEBUG` instructions in `dir`.
@@ -1648,9 +1657,12 @@ impl<'probe> TriCore<'probe> {
         // that halt would not reach them.
         // This core runs last: it is the one the user continues, often close to a breakpoint, and
         // a halt before the others run would not reach them.
+        // A run alone leaves them halted; they still run with the next run of this core.
         let mut writes = Vec::new();
-        for dbgsr in self.halted_group_members()? {
-            writes.extend(Self::run_writes(dbgsr));
+        if !std::mem::take(&mut self.state.run_alone) {
+            for dbgsr in self.halted_group_members()? {
+                writes.extend(Self::run_writes(dbgsr));
+            }
         }
         let peers_run = !writes.is_empty();
         writes.extend(Self::run_writes(self.csfr(ocds::DBGSR)));

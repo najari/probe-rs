@@ -131,6 +131,7 @@ endpoints! {
     | CoreStatusEndpoint           | CoreAccessRequest        | CoreStatusResponse         | "core/status"             |
     | CoreHaltEndpoint             | CoreHaltRequest          | CoreInfoResponse           | "core/halt"               |
     | CoreRunEndpoint              | CoreAccessRequest        | NoResponse                 | "core/run"                |
+    | CoreRunAloneEndpoint         | CoreAccessRequest        | NoResponse                 | "core/run_alone"          |
     | CoreStepEndpoint             | StepRequest              | StepResult                 | "core/step"               |
     | CoreWriteRegEndpoint         | CoreWriteRegRequest      | NoResponse                 | "core/write_reg"          |
     | CoreSetHwBpsEndpoint         | CoreBreakpointsRequest   | CoreSetHwBpsResponse       | "core/set_hw_bps"         |

@@ -88,11 +88,11 @@ use probe_rs_rpc::{
     AttachEndpoint, BootEndpoint, BuildEndpoint, ChipInfoEndpoint, CleanUpRttEndpoint,
     ClearCoreDebugStateEndpoint, ClearRttControlBlockEndpoint, CoreClearHwBpsEndpoint,
     CoreDumpEndpoint, CoreEnableVcEndpoint, CoreHaltEndpoint, CoreHaltGroupEndpoint,
-    CoreMetadataEndpoint, CoreNoticesEndpoint, CoreReadRegistersEndpoint, CoreRunEndpoint,
-    CoreSetHwBpsEndpoint, CoreStatusEndpoint, CoreStepEndpoint, CoreTriCoreOptionsEndpoint,
-    CoreWatchpointEndpoint, CoreWriteRegEndpoint, CoresStatusEndpoint, CreateRttClientEndpoint,
-    CreateTempFileEndpoint, DisassembleEndpoint, EraseAllEndpoint, EraseRangeEndpoint,
-    EvaluateEndpoint, FlashEndpoint, GetRttChannelsEndpoint, HaltCoresEndpoint,
+    CoreMetadataEndpoint, CoreNoticesEndpoint, CoreReadRegistersEndpoint, CoreRunAloneEndpoint,
+    CoreRunEndpoint, CoreSetHwBpsEndpoint, CoreStatusEndpoint, CoreStepEndpoint,
+    CoreTriCoreOptionsEndpoint, CoreWatchpointEndpoint, CoreWriteRegEndpoint, CoresStatusEndpoint,
+    CreateRttClientEndpoint, CreateTempFileEndpoint, DisassembleEndpoint, EraseAllEndpoint,
+    EraseRangeEndpoint, EvaluateEndpoint, FlashEndpoint, GetRttChannelsEndpoint, HaltCoresEndpoint,
     HandleSemihostingEndpoint, ListChipFamiliesEndpoint, ListProbesEndpoint, ListTestsEndpoint,
     LiveWatchEndpoint, LoadChipFamilyEndpoint, LoadDebugInfoEndpoint, LoadRegionEndpoint,
     LoadSvdEndpoint, MonitorEndpoint, NewFlashLoaderEndpoint, PollRttUpEndpoint,
@@ -1657,6 +1657,13 @@ impl CoreInterface {
     pub async fn run(&self) -> Result<(), ClientError> {
         self.client
             .send_resp::<CoreRunEndpoint, _>(&self.access_request())
+            .await
+    }
+
+    /// Runs this core alone: on TriCore the halt group members it would run with stay halted.
+    pub async fn run_alone(&self) -> Result<(), ClientError> {
+        self.client
+            .send_resp::<CoreRunAloneEndpoint, _>(&self.access_request())
             .await
     }
 

@@ -12,8 +12,8 @@ use crate::rpc::{
         core_ops::{
             core_clear_hw_bps, core_dump, core_enable_vc, core_halt, core_halt_group,
             core_handle_semihosting, core_metadata, core_notices, core_read_registers, core_run,
-            core_set_hw_bps, core_status, core_step, core_tricore_options, core_watchpoint,
-            core_write_reg,
+            core_run_alone, core_set_hw_bps, core_status, core_step, core_tricore_options,
+            core_watchpoint, core_write_reg,
         },
         cores::{cores_status, halt_cores, resume_cores},
         debug_vars::{
@@ -515,6 +515,7 @@ postcard_rpc::define_dispatch! {
         | CoreStatusEndpoint               | async | core_status                |
         | CoreHaltEndpoint                 | async | core_halt                  |
         | CoreRunEndpoint                  | async | core_run                   |
+        | CoreRunAloneEndpoint             | async | core_run_alone             |
         | CoreStepEndpoint                 | async | core_step                  |
         | CoreWriteRegEndpoint             | async | core_write_reg             |
         | CoreSetHwBpsEndpoint             | async | core_set_hw_bps            |

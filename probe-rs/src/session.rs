@@ -612,6 +612,22 @@ impl Session {
         Ok(session)
     }
 
+    /// Runs core `core_index` alone: on TriCore the halt group members that the group halted stay
+    /// halted (a debugger's single-thread continue) and run with the next normal run of the core.
+    /// Other cores just run.
+    pub fn run_alone(&mut self, core_index: usize) -> Result<(), Error> {
+        self.cores
+            .get_mut(core_index)
+            .ok_or(Error::CoreNotFound(core_index))?
+            .tricore_set_run_alone(true);
+        let result = self.core(core_index).and_then(|mut core| core.run());
+        // A run that failed before it took the flag must not make a later run alone.
+        if let Some(core) = self.cores.get_mut(core_index) {
+            core.tricore_set_run_alone(false);
+        }
+        result
+    }
+
     /// Puts TriCore core `core_index` in the halt group of the device (`join`), or takes it out.
     ///
     /// The members of the halt group halt together (all-stop): when one halts at a breakpoint,

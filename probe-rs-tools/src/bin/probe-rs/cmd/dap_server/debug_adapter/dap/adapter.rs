@@ -1552,6 +1552,38 @@ impl DebugAdapter {
         core_index: usize,
         request: &Request,
     ) -> Result<()> {
+        // `singleThread` (a client that supports it): with several cores, only this core runs;
+        // the halt group members stay halted.
+        let alone = self.routing().is_multi_core()
+            && request
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get("singleThread"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+        if alone {
+            let core_data = session_data
+                .core_data
+                .iter_mut()
+                .find(|c| c.core_index == core_index)
+                .ok_or_else(|| {
+                    DebuggerError::Other(anyhow!("No core data for core {core_index}"))
+                })?;
+            core_data.invalidate_stack_frame_cache();
+            if let Err(error) = session_data.backend.run_alone(core_index).await {
+                let error = DebuggerError::from(error);
+                self.send_response::<()>(request, Err(&error))?;
+                return Err(error.into());
+            }
+            core_data.last_known_status = CoreStatus::Unknown;
+            self.all_cores_halted = false;
+            return self.send_response(
+                request,
+                Ok(Some(ContinueResponseBody {
+                    all_threads_continued: Some(false),
+                })),
+            );
+        }
         match self
             .continue_impl_async(
                 &mut session_data.backend,

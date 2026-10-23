@@ -82,6 +82,17 @@ pub async fn core_run(
     Ok(())
 }
 
+/// Runs a core alone: on TriCore the halt group members it would run with stay halted.
+pub async fn core_run_alone(
+    ctx: &mut RpcContext,
+    _header: VarHeader,
+    request: CoreAccessRequest,
+) -> NoResponse {
+    let mut session = ctx.session(request.sessid).await;
+    probe_rs_try!(session.run_alone(request.core as usize));
+    Ok(())
+}
+
 /// Full `SteppingMode::step` (over/into/out/instruction) run server-side
 /// against the cached `DebugInfo` and the live `Core`. On
 /// `WarnAndContinue`, re-reads status/pc and surfaces the warning; other

@@ -48,6 +48,9 @@ fn dap_capabilities() -> Capabilities {
         supports_data_breakpoints: Some(true),
         supports_data_breakpoint_bytes: Some(true),
         supports_stepping_granularity: Some(true),
+        // A step moves its core only; a `continue` with `singleThread` leaves the other cores of
+        // the session halted (see `DebugAdapter::continue`).
+        supports_single_thread_execution_requests: Some(true),
         supports_completions_request: Some(true),
         // ANSI output is emitted only when the client also opts in.
         supports_ansi_styling: Some(true),
