@@ -1,38 +1,50 @@
-//! PRD test T-12: the TC27x flash sequence refuses invalid requests before the loader runs a
-//! flash command. It starts the loader, asks for an unaligned erase, an erase and a program
-//! outside the PFLASH, and stops the loader again. No flash is changed.
+//! PRD test T-12: the flash sequence refuses invalid requests before the loader runs a flash
+//! command. It starts the loader, asks for an unaligned erase, an erase and a program outside
+//! the PFLASH, and stops the loader again. No flash is changed.
 //!
 //! ```text
 //! cargo run -p probe-rs-infineon --example flash_refusals
 //! ```
+//!
+//! The chip (TC275 or TC36x) is detected.
 
 use probe_rs::{Permissions, flashing::DebugFlashSequence, probe::list::Lister};
-use probe_rs_infineon::flash::Tc27xFlash;
+use probe_rs_infineon::flash::{AurixFlash, FlashDevice};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     probe_rs_infineon::register_plugin();
     let probe = Lister::new().open("058b:0000".parse::<probe_rs::probe::DebugProbeSelector>()?)?;
-    let mut session = probe.attach("TC275", Permissions::default())?;
-    let flash = Tc27xFlash::default();
+    let mut session = probe.attach(
+        probe_rs::config::TargetSelector::Auto,
+        Permissions::default(),
+    )?;
+    let device =
+        FlashDevice::for_chip(&session.target().name).ok_or("no flash loader for this chip")?;
+    let flash = AurixFlash::new(device);
     let mut failed = 0;
 
+    let sectors = device.sectors();
+    let inside = sectors[1].base as u64 + 0x10;
+    let last = sectors.last().unwrap();
+    let after = (last.base + last.size) as u64;
+
     flash.prepare_flash(&mut session)?;
-    let cases: [(&str, Result<(), probe_rs::Error>); 4] = [
+    let cases: [(String, Result<(), probe_rs::Error>); 4] = [
         (
-            "erase inside a sector (0xA021C010)",
-            flash.erase_sector(&mut session, 0xA021_C010),
+            format!("erase inside a sector ({inside:#010x})"),
+            flash.erase_sector(&mut session, inside),
         ),
         (
-            "erase after the PFLASH (0xA0400000)",
-            flash.erase_sector(&mut session, 0xA040_0000),
+            format!("erase after the PFLASH ({after:#010x})"),
+            flash.erase_sector(&mut session, after),
         ),
         (
-            "erase in DFLASH (0xAF000000)",
+            "erase in DFLASH (0xAF000000)".to_string(),
             flash.erase_sector(&mut session, 0xAF00_0000),
         ),
         (
-            "program after the PFLASH (0x80400000)",
-            flash.program(&mut session, 0x8040_0000, &[0; 32]),
+            format!("program after the PFLASH ({:#010x})", after - 0x2000_0000),
+            flash.program(&mut session, after - 0x2000_0000, &[0; 32]),
         ),
     ];
     for (what, result) in cases {

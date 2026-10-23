@@ -25,6 +25,8 @@ struct FakeBus {
     evtsrc: u32,
     /// The number of requests that a reset refuses after it, as the device reboots.
     reboot_refusals: usize,
+    /// The device the bus reaches ([`TriCoreBusAccess::device_key`]).
+    device_key: Option<String>,
 }
 
 impl FakeBus {
@@ -230,6 +232,10 @@ impl TriCoreBusAccess for FakeBus {
 
     fn jtag_id(&mut self) -> Result<u32, TriCoreError> {
         Ok(0x401D_A083)
+    }
+
+    fn device_key(&self) -> Option<String> {
+        self.device_key.clone()
     }
 }
 
@@ -1103,7 +1109,10 @@ fn a_member_halted_at_a_watchpoint_stays_halted() {
 /// Sets the 64-bit system timer (STM0, second view).
 fn set_stm(bus: &mut FakeBus, value: u64) {
     bus.set_word(ocds::STM0_TIM0SV, value as u32);
-    bus.set_word(ocds::STM0_CAPSV, (value >> 32) as u32);
+    bus.set_word(
+        ocds::STM0_TIM0SV + ocds::STM0_CAPSV_OFFSET,
+        (value >> 32) as u32,
+    );
 }
 
 #[test]
@@ -1185,6 +1194,41 @@ fn journal_dir(name: &str) -> std::path::PathBuf {
 
 fn journal_files(dir: &std::path::Path) -> usize {
     std::fs::read_dir(dir).map_or(0, |files| files.count())
+}
+
+#[test]
+fn the_journal_of_one_board_is_not_taken_back_on_another() {
+    let dir = journal_dir("boards");
+    let mut bus = pspr_bus();
+    bus.device_key = Some("tas-TriBoard TC3X5/A".into());
+    let mut state = software_state();
+    state.set_journal_dir(dir.clone());
+    {
+        let mut core = core(&mut bus, &mut state);
+        core.enable_breakpoints(true).unwrap();
+        core.set_hw_breakpoint(0, PSPR_ST_W as u64).unwrap();
+    }
+    // The session on board A is killed; board B (same core, same addresses) is connected.
+    state.abandon_journal();
+    drop(state);
+    bus.device_key = Some("tas-DAS JTAG AURDUINO B".into());
+    let mut other = software_state();
+    other.set_journal_dir(dir.clone());
+    core(&mut bus, &mut other).status().unwrap();
+    assert_eq!(bus.bytes(PSPR_ST_W, 4), ocds::DEBUG32);
+    assert!(other.take_notices().is_empty());
+
+    // Board A again: its session puts the code back.
+    bus.device_key = Some("tas-TriBoard TC3X5/A".into());
+    let mut next = software_state();
+    next.set_journal_dir(dir.clone());
+    core(&mut bus, &mut next).status().unwrap();
+    assert_eq!(bus.bytes(PSPR_ST_W, 4), ST_W);
+    assert_eq!(
+        journal::file_name_part("tas-TriBoard TC3X5/A"),
+        "tas-TriBoard_TC3X5_A"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

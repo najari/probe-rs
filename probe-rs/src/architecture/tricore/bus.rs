@@ -200,6 +200,13 @@ pub trait TriCoreBusAccess: Send + std::fmt::Debug {
     /// The JTAG ID code of the device.
     fn jtag_id(&mut self) -> Result<u32, TriCoreError>;
 
+    /// A name of the device that tells it apart from other devices the probes reach, for
+    /// example the TAS server and target. State kept across sessions (the journal of the
+    /// software breakpoints) is kept per device; `None` keeps it for all devices together.
+    fn device_key(&self) -> Option<String> {
+        None
+    }
+
     /// Reads `buf.len()` bytes at `address`, splitting the access into transfers the probe
     /// supports.
     fn read_block(
@@ -349,6 +356,9 @@ pub enum TriCoreError {
         /// The last DBGSR value.
         dbgsr: u32,
     },
+
+    /// Core {0} is in boot halt (SYSCON.BHALT): the application has not started it.
+    CoreInBootHalt(u8),
 
     /// Core {core} did not start running (DBGSR = {dbgsr:#010x}).
     CoreDidNotRun {

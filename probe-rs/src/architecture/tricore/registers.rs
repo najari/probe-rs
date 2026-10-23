@@ -21,6 +21,11 @@ pub const CSFR_PCXI: u16 = 0xFE00;
 pub const CSFR_PSW: u16 = 0xFE04;
 /// CSFR offset of `PC` (program counter).
 pub const CSFR_PC: u16 = 0xFE08;
+/// CSFR offset of `SYSCON` (system configuration).
+pub const CSFR_SYSCON: u16 = 0xFE14;
+/// `SYSCON.BHALT`: the core is in boot halt. A core other than CPU0 stays there after reset
+/// until the application starts it; it does not take a halt request.
+pub const SYSCON_BHALT: u32 = 1 << 24;
 /// CSFR offset of `BIV` (interrupt vector table base).
 pub const CSFR_BIV: u16 = 0xFE20;
 /// CSFR offset of `BTV` (trap vector table base).

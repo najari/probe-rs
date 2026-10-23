@@ -1,12 +1,14 @@
-//! TC27x program flash (PFLASH) programming.
+//! AURIX program flash (PFLASH) programming, for the TC27x and the TC36x.
 //!
 //! A small loader (`loader/m25_flash_loader.c`) runs on CPU0 from PSPR and executes the flash
 //! command sequences; the host drives it through a mailbox in DSPR. The command sequences are
-//! the ones of the Infineon iLLD `IfxFlash` driver (Boost Software License 1.0).
+//! the ones of the Infineon iLLD `IfxFlash` driver (Boost Software License 1.0), the same on
+//! the TC2xx and the TC3xx; the loader is built once per flash controller ([`FlashDevice`]).
 //!
-//! The TC27x PFLASH has logical sectors of 16 KiB to 256 KiB and 32 byte pages. An erased page
-//! does not read as a value: it fails with an uncorrectable ECC error. So the flash is read
-//! page by page, and a page that can not be read is erased.
+//! The TC27x PFLASH has logical sectors of 16 KiB to 256 KiB, the TC36x PFLASH 16 KiB ones;
+//! pages are 32 bytes on both. An erased TC27x page does not read as a value: it fails with an
+//! uncorrectable ECC error. So the flash is read page by page, and a page that can not be read
+//! is erased.
 //!
 //! A sector the image touches is erased and the image's pages are written, the rest of a
 //! partly written page is 0 (the erased value in the target description). Bytes the image does
@@ -28,15 +30,20 @@ use base64::Engine as _;
 
 use probe_rs::{
     Error, MemoryInterface, RegisterId, Session,
-    architecture::tricore::registers::{CSFR_A0, CSFR_ICR, CSFR_PC, TRICORE_CORE_REGISTERS},
+    architecture::tricore::{
+        bus::TriCoreError,
+        registers::{CSFR_A0, CSFR_ICR, CSFR_PC, TRICORE_CORE_REGISTERS},
+    },
     flashing::{DebugFlashSequence, FlashLayout, FlashPage},
 };
 use probe_rs_target::NvmRegion;
 
 use crate::device_config;
 
-/// The TC27x loader, built by `loader/build.ps1`.
-const LOADER: &[u8] = include_bytes!("../loader/m25_flash_loader_tc27x.bin");
+/// The TC27x loader (TC2xx flash module), built by `loader/build.ps1`.
+const LOADER_TC27X: &[u8] = include_bytes!("../loader/m25_flash_loader_tc27x.bin");
+/// The TC3xx loader (DMU), built by `loader/build.ps1`.
+const LOADER_TC3XX: &[u8] = include_bytes!("../loader/m25_flash_loader_tc3xx.bin");
 
 const PSPR: u32 = 0x7010_0000;
 const MAILBOX: u32 = 0x7000_F000;
@@ -46,9 +53,6 @@ const LOADER_SP: u32 = 0x7000_E000;
 const MAGIC: u32 = 0x4D32_354D;
 /// The RAM the loader uses: payload, stack, data and mailbox in DSPR, code in PSPR.
 const LOADER_RAM: [(u32, usize); 2] = [(0x7000_A000, 0x6000), (PSPR, 0x2000)];
-
-const WDTCPU0_CON0: u64 = 0xF003_6100;
-const WDTS_CON0: u64 = 0xF003_60F0;
 
 /// The PFLASH program page size.
 pub const PAGE: usize = 32;
@@ -99,6 +103,91 @@ pub fn tc27x_sectors() -> Vec<Sector> {
         }
     }
     sectors
+}
+
+/// The 256 logical sectors of 16 KiB of the TC36x PFLASH: PF0 and PF1 of 2 MiB each, at the
+/// 3 MiB bank stride of the TC3xx.
+pub fn tc36x_sectors() -> Vec<Sector> {
+    [0xA000_0000u32, 0xA030_0000]
+        .into_iter()
+        .flat_map(|bank| {
+            (0..128).map(move |i| Sector {
+                base: bank + i * 0x4000,
+                size: 0x4000,
+            })
+        })
+        .collect()
+}
+
+/// A device that a flash loader of probe-rs programs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashDevice {
+    /// The TC27x (TC2xx flash module).
+    Tc27x,
+    /// The TC36x (TC3xx DMU).
+    Tc36x,
+}
+
+impl FlashDevice {
+    /// The device of a chip name of the AURIX targets.
+    pub fn for_chip(name: &str) -> Option<Self> {
+        let name = name.to_ascii_uppercase();
+        if name.starts_with("TC27") {
+            Some(Self::Tc27x)
+        } else if name.starts_with("TC36") {
+            Some(Self::Tc36x)
+        } else {
+            None
+        }
+    }
+
+    /// The device of a JTAG ID; the step (bits 31:28) does not matter.
+    pub fn for_jtag_id(jtag_id: u32) -> Option<Self> {
+        match jtag_id & 0x0FFF_FFFF {
+            0x001D_A083 => Some(Self::Tc27x),
+            0x0020_9083 => Some(Self::Tc36x),
+            _ => None,
+        }
+    }
+
+    /// The device family name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Tc27x => "TC27x",
+            Self::Tc36x => "TC36x",
+        }
+    }
+
+    /// The flash loader that the AURIX Flasher names for the device (`flaxFileName`).
+    fn flax_file_name(self) -> &'static str {
+        match self {
+            Self::Tc27x => device_config::FLAX_TC2XX,
+            Self::Tc36x => "flax_TC36x.hex",
+        }
+    }
+
+    fn loader(self) -> &'static [u8] {
+        match self {
+            Self::Tc27x => LOADER_TC27X,
+            Self::Tc36x => LOADER_TC3XX,
+        }
+    }
+
+    /// `WDTCPU0_CON0` and `WDTS_CON0`, which hold ENDINIT.
+    fn watchdogs(self) -> (u64, u64) {
+        match self {
+            Self::Tc27x => (0xF003_6100, 0xF003_60F0),
+            Self::Tc36x => (0xF003_624C, 0xF003_62A8),
+        }
+    }
+
+    /// The built-in sector map.
+    pub fn sectors(self) -> Vec<Sector> {
+        match self {
+            Self::Tc27x => tc27x_sectors(),
+            Self::Tc36x => tc36x_sectors(),
+        }
+    }
 }
 
 /// The non-cached alias of a cached PFLASH address (`0x8...` to `0xA...`).
@@ -254,7 +343,9 @@ const SCU_CHIPID: u64 = 0xF003_6140;
 /// The PFLASH sectors of the connected device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashMap {
-    /// Where the map comes from: an AURIX Flasher device file, or the built-in TC27x map.
+    /// The device.
+    pub device: FlashDevice,
+    /// Where the map comes from: an AURIX Flasher device file, or the built-in map.
     pub source: String,
     /// The logical sectors.
     pub sectors: Vec<Sector>,
@@ -263,44 +354,47 @@ pub struct FlashMap {
 }
 
 impl FlashMap {
-    /// The built-in TC27x map.
-    pub fn builtin() -> Self {
+    /// The built-in map of `device`.
+    pub fn builtin(device: FlashDevice) -> Self {
         Self {
-            source: "the built-in TC27x map".into(),
-            sectors: tc27x_sectors(),
+            device,
+            source: format!("the built-in {} map", device.name()),
+            sectors: device.sectors(),
             restricted: BTreeSet::new(),
         }
     }
 
     /// The map for a device with these IDs: from its AURIX Flasher device file in `dirs` if
-    /// there is one, else the built-in TC27x map. Fails for a device this loader cannot program.
+    /// there is one, else the built-in map. Fails for a device no loader can program.
     pub fn for_device(
         dirs: &[std::path::PathBuf],
         jtag_id: u32,
         chip_id: Option<u32>,
     ) -> Result<Self, Error> {
         let config = device_config::find_in(dirs, jtag_id, chip_id);
-        let is_tc27x = jtag_id & 0x0FFF_FFFF == 0x001D_A083;
+        let Some(device) = FlashDevice::for_jtag_id(jtag_id) else {
+            return Err(other(match &config {
+                Some(config) => format!(
+                    "{} uses the flash controller of {}; probe-rs has flash loaders for the \
+                     TC27x and the TC36x only",
+                    config.device_name, config.flax_file_name
+                ),
+                None => format!(
+                    "probe-rs has flash loaders for the TC27x and the TC36x only, not for JTAG \
+                     ID {jtag_id:#010x}"
+                ),
+            }));
+        };
         let Some(config) = config else {
-            if !is_tc27x {
-                return Err(other(format!(
-                    "the TC27x flash loader does not support JTAG ID {jtag_id:#010x}"
-                )));
-            }
-            return Ok(Self::builtin());
+            return Ok(Self::builtin(device));
         };
         let name = &config.device_name;
-        if config.flax_file_name != device_config::FLAX_TC2XX {
+        if config.flax_file_name != device.flax_file_name() {
             return Err(other(format!(
-                "{name} uses the flash controller of {}; probe-rs has a flash loader for the \
-                 TC27x only",
-                config.flax_file_name
-            )));
-        }
-        if !is_tc27x {
-            return Err(other(format!(
-                "{name} is a TC2xx device, but the probe-rs flash loader is built and tested \
-                 for the TC27x only"
+                "{name} uses the flash controller of {}, not the one of the {} ({})",
+                config.flax_file_name,
+                device.name(),
+                device.flax_file_name()
             )));
         }
         let pflash = config
@@ -320,13 +414,15 @@ impl FlashMap {
                 size: s.size,
             })
             .collect::<Vec<_>>();
-        if sectors != tc27x_sectors() {
+        if sectors != device.sectors() {
             tracing::warn!(
-                "The PFLASH map of {name} differs from the built-in TC27x map; using {}",
+                "The PFLASH map of {name} differs from the built-in {} map; using {}",
+                device.name(),
                 config.file.display()
             );
         }
         Ok(Self {
+            device,
             source: format!("{name} ({})", config.file.display()),
             restricted: pflash
                 .sectors
@@ -361,9 +457,11 @@ impl FlashMap {
 /// `blank` 1 for the erased pages (the format the `pflash_check` example compares with).
 pub const BACKUP_ENV: &str = "PROBE_RS_TRICORE_FLASH_BACKUP";
 
-/// Programs the TC27x PFLASH through the RAM loader.
-#[derive(Debug, Default)]
-pub struct Tc27xFlash {
+/// Programs the PFLASH of a TC27x or a TC36x through the RAM loader.
+#[derive(Debug)]
+pub struct AurixFlash {
+    /// The device of the target description.
+    device: FlashDevice,
     saved: Mutex<Option<SavedState>>,
     /// The pages written in this session, which must read back as data.
     programmed: Mutex<BTreeSet<u32>>,
@@ -420,7 +518,18 @@ fn other(message: impl Into<String>) -> Error {
     Error::Other(message.into())
 }
 
-impl Tc27xFlash {
+impl AurixFlash {
+    /// The flash programming of `device`.
+    pub fn new(device: FlashDevice) -> Self {
+        Self {
+            device,
+            saved: Mutex::default(),
+            programmed: Mutex::default(),
+            map: Mutex::default(),
+            backup: Mutex::default(),
+        }
+    }
+
     /// Saves `pages`, the content of `sector` before its erase, when backups are on
     /// ([`BACKUP_ENV`]). A backup that cannot be written stops the download before the erase.
     fn save_backup(&self, sector: Sector, pages: &[PageImage]) -> Result<(), Error> {
@@ -456,6 +565,13 @@ impl Tc27xFlash {
         let jtag_id = session.get_tricore_bus()?.jtag_id()?;
         let chip_id = session.core(0)?.read_word_32(SCU_CHIPID).ok();
         let map = FlashMap::for_device(&device_config::config_dirs(), jtag_id, chip_id)?;
+        if map.device != self.device {
+            return Err(other(format!(
+                "the target is a {}, but the connected device (JTAG ID {jtag_id:#010x}) is a {}",
+                self.device.name(),
+                map.device.name()
+            )));
+        }
         tracing::info!(
             "PFLASH map: {} ({} sectors; JTAG ID {jtag_id:#010x}, chip ID {})",
             map.source,
@@ -472,7 +588,7 @@ impl Tc27xFlash {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
-            .unwrap_or_else(FlashMap::builtin)
+            .unwrap_or_else(|| FlashMap::builtin(self.device))
     }
 
     fn mailbox_read(session: &mut Session, index: u32) -> Result<u32, Error> {
@@ -583,9 +699,15 @@ impl Tc27xFlash {
         let mut running = Vec::new();
         for id in 0..session.list_cores().len() {
             let mut core = session.core(id)?;
-            running.push(!core.core_halted()?);
+            let was_running = !core.core_halted()?;
             // The application may reset the device when a core stops answering.
-            core.halt(Duration::from_millis(500))?;
+            match core.halt(Duration::from_millis(500)) {
+                Ok(_) => running.push(was_running),
+                // A core the application has not started runs no code: nothing to stop, and
+                // nothing to run again afterwards.
+                Err(Error::TriCore(TriCoreError::CoreInBootHalt(_))) => running.push(false),
+                Err(error) => return Err(error),
+            }
         }
 
         let mut core = session.core(0)?;
@@ -600,8 +722,13 @@ impl Tc27xFlash {
             ram.push((address, data));
         }
 
-        tracing::info!("Starting the TC27x flash loader ({} bytes)", LOADER.len());
-        core.write(PSPR as u64, LOADER)?;
+        let loader = self.device.loader();
+        tracing::info!(
+            "Starting the {} flash loader ({} bytes)",
+            self.device.name(),
+            loader.len()
+        );
+        core.write(PSPR as u64, loader)?;
         core.write_word_32((MAILBOX + 4 * MB_MAGIC) as u64, 0)?;
         core.write_core_reg(RegisterId(CSFR_PC), PSPR)?;
         core.write_core_reg(RegisterId(CSFR_A0 + 4 * 10), LOADER_SP)?;
@@ -639,8 +766,9 @@ impl Tc27xFlash {
         core.halt(Duration::from_millis(500))?;
 
         // The loader must have set ENDINIT again.
-        let cpu0 = core.read_word_32(WDTCPU0_CON0)?;
-        let safety = core.read_word_32(WDTS_CON0)?;
+        let (wdtcpu0_con0, wdts_con0) = self.device.watchdogs();
+        let cpu0 = core.read_word_32(wdtcpu0_con0)?;
+        let safety = core.read_word_32(wdts_con0)?;
 
         for (address, data) in &saved.ram {
             core.write(*address as u64, data)?;
@@ -667,7 +795,7 @@ impl Tc27xFlash {
     }
 }
 
-impl DebugFlashSequence for Tc27xFlash {
+impl DebugFlashSequence for AurixFlash {
     fn prepare_flash(&self, session: &mut Session) -> Result<(), Error> {
         self.programmed
             .lock()
@@ -684,7 +812,7 @@ impl DebugFlashSequence for Tc27xFlash {
     }
 
     fn erase_all(&self, _session: &mut Session) -> Result<(), Error> {
-        Err(Error::NotImplemented("chip erase of the TC27x PFLASH"))
+        Err(Error::NotImplemented("chip erase of the AURIX PFLASH"))
     }
 
     fn supports_chip_erase(&self) -> bool {
@@ -915,6 +1043,7 @@ mod tests {
         let map = FlashMap::for_device(std::slice::from_ref(&dir), 0x401D_A083, Some(0x4742_7060))
             .unwrap();
         assert!(map.source.starts_with("TC27x_test"), "{}", map.source);
+        assert_eq!(map.device, FlashDevice::Tc27x);
         assert_eq!(map.sectors, tc27x_sectors());
         assert_eq!(map.sector(0x8021_C0B0).unwrap().base, 0xA021_C000);
         std::fs::remove_dir_all(dir).unwrap();
@@ -955,23 +1084,78 @@ mod tests {
         let error = FlashMap::for_device(std::slice::from_ref(&tc26), 0x201E_8083, None)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("TC27x only"), "{error}");
+        assert!(error.contains("TC36x only"), "{error}");
         std::fs::remove_dir_all(tc26).unwrap();
+
+        // A TC36x with a device file of another flash controller.
+        let wrong = device_dir(
+            "TC36x_wrong",
+            "flax_TC2xx.hex",
+            "0x10209083",
+            &[(0xA000_0000, 0x4000, false)],
+        );
+        let error = FlashMap::for_device(std::slice::from_ref(&wrong), 0x1020_9083, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("flax_TC36x.hex"), "{error}");
+        std::fs::remove_dir_all(wrong).unwrap();
     }
 
     #[test]
-    fn without_a_device_file_the_builtin_map_is_used_for_the_tc27x_only() {
+    fn without_a_device_file_the_builtin_map_is_used() {
         assert_eq!(
             FlashMap::for_device(&[], 0x401D_A083, None).unwrap(),
-            FlashMap::builtin()
+            FlashMap::builtin(FlashDevice::Tc27x)
         );
+        assert_eq!(
+            FlashMap::for_device(&[], 0x1020_9083, None).unwrap(),
+            FlashMap::builtin(FlashDevice::Tc36x)
+        );
+        // TC37x: no loader.
         assert!(FlashMap::for_device(&[], 0x1020_7083, None).is_err());
     }
 
     #[test]
-    fn the_loader_is_the_reviewed_build() {
-        // A change of the loader binary must be deliberate: rebuild with loader/build.ps1 and
-        // update this check. SHA-256 9E16F30D38DCF1FCDC3E1C663A67577605999AA5B5B146770D4F2F7380377BC4.
-        assert_eq!(LOADER.len(), 946);
+    fn the_tc36x_map_has_two_banks_of_16_kib_sectors() {
+        let sectors = tc36x_sectors();
+        assert_eq!(sectors.len(), 256);
+        assert!(sectors.iter().all(|s| s.size == 0x4000));
+        assert_eq!(sectors[127].base + sectors[127].size, 0xA020_0000);
+        assert_eq!(sectors[128].base, 0xA030_0000);
+        assert_eq!(sectors.last().unwrap().base + 0x4000, 0xA050_0000);
+        // The gap between the banks is not flash.
+        assert_eq!(sector_at(&sectors, 0xA021_C000), None);
+        assert_eq!(
+            sector_at(&sectors, 0xA04F_C010),
+            Some(Sector {
+                base: 0xA04F_C000,
+                size: 0x4000
+            })
+        );
+    }
+
+    #[test]
+    fn chips_and_jtag_ids_name_their_flash_device() {
+        assert_eq!(FlashDevice::for_chip("TC275"), Some(FlashDevice::Tc27x));
+        assert_eq!(FlashDevice::for_chip("TC36x"), Some(FlashDevice::Tc36x));
+        assert_eq!(FlashDevice::for_chip("TC375"), None);
+        assert_eq!(
+            FlashDevice::for_jtag_id(0x501D_A083),
+            Some(FlashDevice::Tc27x)
+        );
+        assert_eq!(
+            FlashDevice::for_jtag_id(0x1020_9083),
+            Some(FlashDevice::Tc36x)
+        );
+    }
+
+    #[test]
+    fn the_loaders_are_the_reviewed_builds() {
+        // A change of a loader binary must be deliberate: rebuild with loader/build.ps1 and
+        // update this check.
+        // TC27x SHA-256 9E16F30D38DCF1FCDC3E1C663A67577605999AA5B5B146770D4F2F7380377BC4.
+        assert_eq!(LOADER_TC27X.len(), 946);
+        // TC3xx SHA-256 437DC5BC82ACCE13FD6EA751EF35D6CC852C541308FE7C4675F68F2EAC85164C.
+        assert_eq!(LOADER_TC3XX.len(), 966);
     }
 }

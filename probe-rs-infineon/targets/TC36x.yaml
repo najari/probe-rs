@@ -1,0 +1,138 @@
+name: TC36x
+manufacturer:
+  id: 0x41
+  cc: 0x0
+variants:
+- name: TC36x
+  cores:
+  - name: cpu0
+    type: tricore
+    core_access_options: !TriCore
+      core_index: 0
+      csfr_base: 0xf8810000
+  - name: cpu1
+    type: tricore
+    core_access_options: !TriCore
+      core_index: 1
+      csfr_base: 0xf8830000
+  memory_map:
+  # Program flash: PF0 and PF1, 2 MiB each, at the 3 MiB bank stride of the TC3xx (the AURIX
+  # Flasher device file `TC36x_A_step.json`). Code is usually linked at the cached addresses
+  # (0x8...), the non-cached alias (0xA...) is the same memory. Logical sectors are 16 KiB.
+  - !Nvm
+    name: PFLASH0
+    range:
+      start: 0x80000000
+      end: 0x80200000
+    cores:
+    - cpu0
+    - cpu1
+    access:
+      boot: true
+  - !Nvm
+    name: PFLASH1
+    range:
+      start: 0x80300000
+      end: 0x80500000
+    cores:
+    - cpu0
+    - cpu1
+  - !Nvm
+    name: PFLASH uncached0
+    range:
+      start: 0xa0000000
+      end: 0xa0200000
+    cores:
+    - cpu0
+    - cpu1
+    is_alias: true
+  - !Nvm
+    name: PFLASH uncached1
+    range:
+      start: 0xa0300000
+      end: 0xa0500000
+    cores:
+    - cpu0
+    - cpu1
+    is_alias: true
+  # Scratchpad RAMs (global addresses) and the DLMU of each core (tc36x.lsl).
+  - !Ram
+    name: DSPR0
+    range:
+      start: 0x70000000
+      end: 0x70030000
+    cores:
+    - cpu0
+  - !Ram
+    name: PSPR0
+    range:
+      start: 0x70100000
+      end: 0x70108000
+    cores:
+    - cpu0
+  - !Ram
+    name: DSPR1
+    range:
+      start: 0x60000000
+      end: 0x60030000
+    cores:
+    - cpu1
+  - !Ram
+    name: PSPR1
+    range:
+      start: 0x60100000
+      end: 0x60108000
+    cores:
+    - cpu1
+  - !Ram
+    name: DLMU0
+    range:
+      start: 0x90000000
+      end: 0x90010000
+    cores:
+    - cpu0
+    - cpu1
+  - !Ram
+    name: DLMU1
+    range:
+      start: 0x90010000
+      end: 0x90020000
+    cores:
+    - cpu0
+    - cpu1
+  flash_algorithms:
+  - tc36x-pflash
+  - tc36x-pflash-uncached
+flash_algorithms:
+- name: tc36x-pflash
+  description: TC36x PFLASH (cached addresses), host-side programming with a RAM loader
+  default: true
+  flash_properties:
+    address_range:
+      start: 0x80000000
+      end: 0x80500000
+    page_size: 0x4000
+    erased_byte_value: 0x0
+    program_page_timeout: 10000
+    erase_sector_timeout: 30000
+    sectors:
+    - size: 0x4000
+      address: 0x0
+  cores:
+  - cpu0
+- name: tc36x-pflash-uncached
+  description: TC36x PFLASH (non-cached addresses), host-side programming with a RAM loader
+  default: true
+  flash_properties:
+    address_range:
+      start: 0xa0000000
+      end: 0xa0500000
+    page_size: 0x4000
+    erased_byte_value: 0x0
+    program_page_timeout: 10000
+    erase_sector_timeout: 30000
+    sectors:
+    - size: 0x4000
+      address: 0x0
+  cores:
+  - cpu0

@@ -185,10 +185,14 @@ pub mod ocds {
 
     /// STM0 `TIM0SV`, the second view of the low 32 bits of the system timer: reading it
     /// captures the high bits in `CAPSV` and leaves the application's `TIM0` / `CAP` pair alone.
-    /// The system timer counts up from 0 after every application reset.
+    /// The system timer counts up from 0 after every application reset. This is the TC2xx
+    /// address; the chip's sequence gives the address of its STM0 (`stm0_tim0sv`).
     pub const STM0_TIM0SV: u32 = 0xF000_0050;
-    /// STM0 `CAPSV`: the system timer bits 63:32 captured by the last `TIM0SV` read.
-    pub const STM0_CAPSV: u32 = 0xF000_0054;
+    /// The TC3xx STM0 `TIM0SV`.
+    pub const STM0_TIM0SV_TC3XX: u32 = 0xF000_1050;
+    /// The offset of `CAPSV` (the system timer bits 63:32 captured by the last `TIM0SV` read)
+    /// from `TIM0SV`.
+    pub const STM0_CAPSV_OFFSET: u32 = 4;
     /// `SCU_RSTSTAT`: the triggers of the last reset.
     pub const SCU_RSTSTAT: u32 = 0xF003_6050;
 
@@ -280,10 +284,12 @@ pub mod ocds {
     }
 }
 
-/// The local scratchpad windows of a core, and their global aliases.
+/// The local scratchpad windows of a core, and their global aliases. The windows cover the
+/// largest scratchpads of the supported chips (TC27x DSPR up to 120 KiB, TC36x 192 KiB, PSPR
+/// up to 32 KiB on both).
 mod spr {
     pub const DSPR_LOCAL: u32 = 0xD000_0000;
-    pub const DSPR_SIZE: u32 = 0x2_0000;
+    pub const DSPR_SIZE: u32 = 0x3_0000;
     pub const DSPR_GLOBAL: u32 = 0x7000_0000;
     pub const PSPR_LOCAL: u32 = 0xC000_0000;
     pub const PSPR_SIZE: u32 = 0x8000;
@@ -756,7 +762,6 @@ pub struct TriCore<'probe> {
     /// The other TriCore cores of the device, as (core index, CSFR base). A run resumes the
     /// halt group members among them.
     peers: Vec<(u8, u32)>,
-    #[expect(dead_code, reason = "kept for chip specific core hooks")]
     sequence: Arc<dyn TriCoreDebugSequence>,
 }
 
@@ -792,10 +797,17 @@ impl<'probe> TriCore<'probe> {
     }
 
     fn journal(&mut self) -> &mut Journal {
-        let (core, dir) = (self.core(), self.state.journal_dir.clone());
-        self.state
-            .journal
-            .get_or_insert_with(|| Journal::new(dir, core))
+        if self.state.journal.is_none() {
+            // Two boards debugged at the same time have the same core indices: a journal of
+            // one must not be taken back on the other.
+            let key = self.bus().device_key();
+            let dir = self.state.journal_dir.clone().map(|dir| match key {
+                Some(key) => dir.join(journal::file_name_part(&key)),
+                None => dir,
+            });
+            self.state.journal = Some(Journal::new(dir, self.core()));
+        }
+        self.state.journal.as_mut().expect("set above")
     }
 
     /// Puts the code back under the `DEBUG` instructions that a session which is gone left in
@@ -1094,10 +1106,11 @@ impl<'probe> TriCore<'probe> {
 
     /// `DBGSR` and the system timer (when it can be read), in one request.
     fn read_status(&mut self) -> Result<(u32, Option<u64>), TriCoreError> {
+        let tim0sv = self.sequence.stm0_tim0sv();
         let mut transfers = [
             BusTransfer::read(AddressMap::Target, self.csfr(ocds::DBGSR), 4),
-            BusTransfer::read(AddressMap::Target, ocds::STM0_TIM0SV, 4),
-            BusTransfer::read(AddressMap::Target, ocds::STM0_CAPSV, 4),
+            BusTransfer::read(AddressMap::Target, tim0sv, 4),
+            BusTransfer::read(AddressMap::Target, tim0sv + ocds::STM0_CAPSV_OFFSET, 4),
         ];
         self.bus().execute(&mut transfers)?;
         let dbgsr = transfers[0].read_u32()?;
@@ -1285,6 +1298,9 @@ impl<'probe> TriCore<'probe> {
                 return self.halt_group_members();
             }
             if start.elapsed() > timeout {
+                if self.read_csfr(registers::CSFR_SYSCON)? & registers::SYSCON_BHALT != 0 {
+                    return Err(TriCoreError::CoreInBootHalt(self.core()));
+                }
                 let dbgsr = self.dbgsr()?;
                 return Err(TriCoreError::CoreDidNotHalt {
                     core: self.core(),

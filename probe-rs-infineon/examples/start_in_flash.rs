@@ -1,4 +1,4 @@
-//! Points CPU0 of a TC275 at the entry of an image in PFLASH or RAM, without a reset.
+//! Points CPU0 of an AURIX (TC275, TC36x) at the entry of an image in PFLASH or RAM, without a reset.
 //!
 //! For images the boot code does not start, like the demo in the PF1 test sector: it checks
 //! that the flash holds the image (segments in RAM, like the demo in the CPU0 PSPR, are written
@@ -10,6 +10,8 @@
 //! ```text
 //! cargo run -p probe-rs-infineon --example start_in_flash -- <elf> [stack top, default 0x7000C000]
 //! ```
+//!
+//! The chip is detected; `PROBE_RS_CHIP` names it instead, for example `TC36x`.
 
 use std::time::Duration;
 
@@ -43,7 +45,11 @@ fn main() -> Result<()> {
     // `PROBE_RS_PROBE` selects another probe, for example the MCD probe.
     let selector = std::env::var("PROBE_RS_PROBE").unwrap_or_else(|_| "058b:0000".to_string());
     let probe = Lister::new().open(selector.parse::<probe_rs::probe::DebugProbeSelector>()?)?;
-    let mut session = probe.attach("TC275", Permissions::default())?;
+    let chip = std::env::var("PROBE_RS_CHIP")
+        .map(probe_rs::config::TargetSelector::from)
+        .unwrap_or(probe_rs::config::TargetSelector::Auto);
+    let mut session = probe.attach(chip, Permissions::default())?;
+    println!("{}", session.target().name);
     let mut core = session.core(0)?;
     core.halt(Duration::from_millis(500))?;
 

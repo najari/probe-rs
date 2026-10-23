@@ -3,7 +3,7 @@
  *
  * Runs on CPU0 from PSPR (linked at 0x70100000), driven by the host (TCF agent)
  * through a mailbox in DSPR at 0x7000F000.  Built per device:
- *   default   TC37x (TC3xx DMU)          -> m25_flash_loader.bin
+ *   default   TC3xx (DMU; TC36x, TC37x)   -> m25_flash_loader_tc3xx.bin
  *   -DTC27X   TC27x (TC2xx FLASH0 module) -> m25_flash_loader_tc27x.bin
  *
  * Flash command sequences (same on TC2xx and TC3xx, from the Infineon iLLD
@@ -11,7 +11,7 @@
  *   - command interface : 0xAF000000 | {0x5554, 0xAA50, 0xAA58, 0xAAA8, 0x55F0}
  * Device specific (TC27x values checked against the Infineon AURIX Flasher's
  * flax_TC2xx.hex algorithm and DeviceConfigs/TC27x_D_step.json):
- *   TC37x: status DMU_HF_STATUS 0xF8040010 (P0BUSY bit2, P1BUSY bit3),
+ *   TC3xx: status DMU_HF_STATUS 0xF8040010 (P0BUSY bit2, P1BUSY bit3),
  *          errors DMU_HF_ERRSR 0xF8040034, WDTS_CON0 0xF00362A8,
  *          WDTCPU0_CON0 0xF003624C, 16 KiB logical sectors
  *   TC27x: status/errors FLASH0_FSR 0xF8002010 (FABUSY..P1BUSY bits 0-4,

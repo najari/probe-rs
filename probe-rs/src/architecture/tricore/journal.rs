@@ -150,6 +150,20 @@ impl Journal {
     }
 }
 
+/// `key` with every character that is not a letter, a digit, `-` or `.` replaced by `_`, for a
+/// file or directory name.
+pub(crate) fn file_name_part(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// The entries of the journal at `path`, unless a running session holds it.
 fn read_abandoned(path: &Path) -> Option<Vec<Entry>> {
     let mut file = OpenOptions::new().read(true).write(true).open(path).ok()?;

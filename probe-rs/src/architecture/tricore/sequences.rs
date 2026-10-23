@@ -45,6 +45,12 @@ pub trait TriCoreDebugSequence: Send + Sync + Debug {
     fn flash_verify_sequence(&self) -> Option<Arc<dyn crate::flashing::FlashVerify>> {
         None
     }
+
+    /// The address of STM0 `TIM0SV`; `CAPSV` follows 4 bytes later. STM0 starts at
+    /// `0xF000_0000` on the TC2xx and at `0xF000_1000` on the TC3xx.
+    fn stm0_tim0sv(&self) -> u32 {
+        super::ocds::STM0_TIM0SV
+    }
 }
 
 /// The sequences used for TriCore chips without a specific sequence.

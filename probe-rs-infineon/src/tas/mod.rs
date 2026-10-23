@@ -524,6 +524,12 @@ impl TriCoreBusAccess for TasProbe {
     fn jtag_id(&mut self) -> Result<u32, TriCoreError> {
         Ok(self.device_type)
     }
+
+    /// The TAS target name: it names the board (adapter and serial number), wherever the
+    /// server runs.
+    fn device_key(&self) -> Option<String> {
+        (!self.target_name.is_empty()).then(|| format!("tas-{}", self.target_name))
+    }
 }
 
 #[cfg(test)]

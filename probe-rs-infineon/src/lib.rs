@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use probe_rs::{
     Error,
-    architecture::tricore::sequences::TriCoreDebugSequence,
+    architecture::tricore::{ocds, sequences::TriCoreDebugSequence},
     config::{DebugSequence, Registry},
     flashing::DebugFlashSequence,
     plugin,
@@ -55,6 +55,8 @@ fn targets() -> Vec<ChipFamily> {
 const PART_NUMBERS: &[(u32, &str)] = &[
     // TC27x: C-step 0x401DA083, D-step 0x501DA083.
     (0x01DA, "TC275"),
+    // TC36x: A-step 0x10209083.
+    (0x0209, "TC36x"),
 ];
 
 /// The target name for a JTAG ID code, if it is a known AURIX device.
@@ -73,24 +75,61 @@ pub fn target_by_jtag_id(jtag_id: u32) -> Option<&'static str> {
 /// The debug sequence of AURIX chips.
 #[derive(Debug)]
 pub struct AurixSequence {
+    /// The chip name of the target.
+    chip: String,
     flash: Option<Arc<dyn DebugFlashSequence>>,
+    /// The address of STM0 `TIM0SV`.
+    stm0_tim0sv: u32,
 }
 
 impl AurixSequence {
     /// Creates the AURIX debug sequence of the chip `name`.
     pub fn create(name: &str) -> Arc<dyn TriCoreDebugSequence> {
-        let flash: Option<Arc<dyn DebugFlashSequence>> = if name.starts_with("TC27") {
-            Some(Arc::new(flash::Tc27xFlash::default()))
+        let flash = flash::FlashDevice::for_chip(name)
+            .map(|device| Arc::new(flash::AurixFlash::new(device)) as Arc<dyn DebugFlashSequence>);
+        let stm0_tim0sv = if is_tc3xx(name) {
+            ocds::STM0_TIM0SV_TC3XX
         } else {
-            None
+            ocds::STM0_TIM0SV
         };
-        Arc::new(Self { flash })
+        Arc::new(Self {
+            chip: name.to_string(),
+            flash,
+            stm0_tim0sv,
+        })
     }
 }
 
+/// Whether `name` is a chip of the AURIX TC3xx family.
+fn is_tc3xx(name: &str) -> bool {
+    name.to_ascii_uppercase().starts_with("TC3")
+}
+
 impl TriCoreDebugSequence for AurixSequence {
+    /// Refuses a device of another known chip: the boards of a test setup are swapped on one
+    /// TAS server, and a TC275 session on a TC36x (or the other way) would use the wrong cores,
+    /// memory map and flash loader.
+    fn on_connect(
+        &self,
+        bus: &mut dyn probe_rs::architecture::tricore::bus::TriCoreBusAccess,
+    ) -> Result<(), Error> {
+        let jtag_id = bus.jtag_id()?;
+        match target_by_jtag_id(jtag_id) {
+            Some(found) if !found.eq_ignore_ascii_case(&self.chip) => Err(Error::Other(format!(
+                "the target is {}, but the connected device (JTAG ID {jtag_id:#010x}) is a \
+                 {found}: use the {found} configuration",
+                self.chip
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     fn debug_flash_sequence(&self) -> Option<Arc<dyn DebugFlashSequence>> {
         self.flash.clone()
+    }
+
+    fn stm0_tim0sv(&self) -> u32 {
+        self.stm0_tim0sv
     }
 }
 
@@ -162,6 +201,23 @@ mod tests {
     }
 
     #[test]
+    fn tc36x_is_detected_by_its_jtag_id() {
+        assert_eq!(target_by_jtag_id(0x1020_9083), Some("TC36x"));
+    }
+
+    #[test]
+    fn tc3xx_chips_read_the_tc3xx_system_timer() {
+        assert_eq!(
+            AurixSequence::create("TC36x").stm0_tim0sv(),
+            ocds::STM0_TIM0SV_TC3XX
+        );
+        assert_eq!(
+            AurixSequence::create("TC275").stm0_tim0sv(),
+            ocds::STM0_TIM0SV
+        );
+    }
+
+    #[test]
     fn the_targets_load() {
         let families = targets();
         let tc27x = families.iter().find(|f| f.name == "TC27x").unwrap();
@@ -173,5 +229,8 @@ mod tests {
                 .iter()
                 .all(|c| c.core_type == CoreType::TriCore)
         );
+        let tc36x = families.iter().find(|f| f.name == "TC36x").unwrap();
+        assert_eq!(tc36x.variants[0].name, "TC36x");
+        assert_eq!(tc36x.variants[0].cores.len(), 2);
     }
 }

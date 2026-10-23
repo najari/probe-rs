@@ -24,7 +24,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let selector = std::env::var("PROBE_RS_PROBE").unwrap_or_else(|_| "058b:0000".to_string());
     let mut session = Lister::new()
         .open(selector.parse::<DebugProbeSelector>()?)?
-        .attach("TC275", Permissions::default())?;
+        .attach(
+            probe_rs::config::TargetSelector::Auto,
+            Permissions::default(),
+        )?;
     let mut data = vec![0; length];
     session
         .get_tricore_bus()?
