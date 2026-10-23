@@ -311,6 +311,17 @@ impl CombinedCoreState {
     }
 
     /// Takes the messages for the user that this TriCore core collected (none for other cores).
+    /// Gives the next status check of this TriCore core the registers of a batch read (see
+    /// [`crate::architecture::tricore::prefetch_status`]); `None` drops a batch left unused.
+    pub(crate) fn tricore_set_prefetched(
+        &mut self,
+        snapshot: Option<crate::architecture::tricore::StatusSnapshot>,
+    ) {
+        if let SpecificCoreState::TriCore(state) = &mut self.specific_state {
+            state.set_prefetched(snapshot);
+        }
+    }
+
     pub(crate) fn tricore_take_notices(&mut self) -> Vec<String> {
         match &mut self.specific_state {
             SpecificCoreState::TriCore(state) => state.take_notices(),

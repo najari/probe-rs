@@ -559,6 +559,126 @@ fn a_pause_in_the_middle_of_a_status_check_keeps_the_members_to_run() {
 }
 
 #[test]
+fn a_core_that_ran_and_halted_again_between_two_checks_reports_the_new_halt() {
+    let mut bus = FakeBus::new();
+    bus.halted = true;
+    let mut state = TriCoreCoreState::new();
+    {
+        let mut core = core(&mut bus, &mut state);
+        core.enable_breakpoints(true).unwrap();
+        core.set_hw_breakpoint(1, 0x8000_0400).unwrap();
+    }
+    // Halted by the halt group (a break-in): an external halt.
+    assert_eq!(
+        core(&mut bus, &mut state).status().unwrap(),
+        CoreStatus::Halted(HaltReason::External)
+    );
+    // The group ran the core, and it halted at its breakpoint before the next check: it is
+    // halted at both checks, but at another PC and with another event source.
+    bus.hit_trigger(1);
+    assert_eq!(
+        core(&mut bus, &mut state).status().unwrap(),
+        CoreStatus::Halted(HaltReason::Breakpoint(BreakpointCause::Hardware))
+    );
+    // Nothing changed since: the same halt.
+    assert_eq!(
+        core(&mut bus, &mut state).status().unwrap(),
+        CoreStatus::Halted(HaltReason::Breakpoint(BreakpointCause::Hardware))
+    );
+}
+
+#[test]
+fn a_step_and_a_pc_write_are_not_a_new_halt() {
+    let mut bus = FakeBus::new();
+    bus.halted = true;
+    let mut state = TriCoreCoreState::new();
+    let mut core = core(&mut bus, &mut state);
+    core.status().unwrap();
+    core.step().unwrap();
+    assert_eq!(core.status().unwrap(), CoreStatus::Halted(HaltReason::Step));
+    core.write_core_reg(
+        RegisterId(registers::CSFR_PC),
+        crate::RegisterValue::U32(0x8000_0200),
+    )
+    .unwrap();
+    assert_eq!(core.status().unwrap(), CoreStatus::Halted(HaltReason::Step));
+}
+
+#[test]
+fn a_status_check_uses_the_batch_read_of_the_cores() {
+    let mut bus = FakeBus::new();
+    bus.set_word(ocds::trc(1), ocds::TRC_HALT_GROUP);
+    let mut state = TriCoreCoreState::new();
+    group_core(&mut bus, &mut state)
+        .set_halt_group(true)
+        .unwrap();
+    bus.set_word(PEER_DBGSR, 0x0001);
+    assert_eq!(
+        group_core(&mut bus, &mut state).status().unwrap(),
+        CoreStatus::Running
+    );
+
+    // One request reads both cores; the status check of this core then needs none.
+    let before = bus.requests.len();
+    let snapshot = prefetch_status(
+        &mut bus,
+        &[(0, CSFR_BASE), (1, PEER_CSFR_BASE)],
+        0xF000_0050,
+    )
+    .unwrap();
+    assert_eq!(bus.requests.len(), before + 1);
+    state.set_prefetched(Some(snapshot));
+    assert_eq!(
+        group_core(&mut bus, &mut state).status().unwrap(),
+        CoreStatus::Running
+    );
+    assert_eq!(bus.requests.len(), before + 1, "no request of its own");
+    assert!(state.prefetched.is_none(), "the batch read is used once");
+}
+
+#[test]
+fn a_batch_read_during_a_pause_keeps_the_members_to_run() {
+    let mut bus = FakeBus::new();
+    bus.set_word(ocds::trc(1), ocds::TRC_HALT_GROUP);
+    let mut state = TriCoreCoreState::new();
+    group_core(&mut bus, &mut state)
+        .set_halt_group(true)
+        .unwrap();
+    bus.set_word(PEER_DBGSR, 0x0001);
+    group_core(&mut bus, &mut state).status().unwrap();
+
+    // The group halted all cores during the batch read: this core reads as running first and
+    // as halted at the end, CPU1 already as halted.
+    let trc = bus.word(ocds::trc(0));
+    let exevt = bus.word(CSFR_BASE + ocds::EXEVT as u32);
+    state.set_prefetched(Some(StatusSnapshot {
+        stm: None,
+        cores: vec![
+            (0, 0x0000, trc, exevt, 0x8000_0100, 0x0002),
+            (
+                1,
+                0x0003,
+                ocds::TRC_HALT_GROUP,
+                ocds::EXEVT_HALT,
+                0x8000_0200,
+                0x0003,
+            ),
+        ],
+    }));
+    group_core(&mut bus, &mut state).status().unwrap();
+
+    // The halt shows on the next check; running this core runs CPU1 again.
+    bus.halted = true;
+    bus.set_word(PEER_DBGSR, 0x0003);
+    assert_eq!(
+        group_core(&mut bus, &mut state).status().unwrap(),
+        CoreStatus::Halted(HaltReason::External)
+    );
+    group_core(&mut bus, &mut state).run().unwrap();
+    assert!(bus.write_words().contains(&(PEER_DBGSR, ocds::DBGSR_RUN)));
+}
+
+#[test]
 fn joining_while_halted_runs_the_members_it_halted() {
     let mut bus = FakeBus::new();
     bus.set_word(ocds::trc(1), ocds::TRC_HALT_GROUP);
@@ -675,6 +795,32 @@ fn a_member_that_missed_the_halt_is_halted_when_the_halt_is_seen() {
     bus.halted = true;
     group_core(&mut bus, &mut state).status().unwrap();
     assert!(bus.write_words().contains(&(PEER_DBGSR, ocds::DBGSR_HALT)));
+}
+
+#[test]
+fn a_halt_seen_late_does_not_halt_the_members_that_run() {
+    let mut bus = FakeBus::new();
+    bus.set_word(ocds::trc(1), ocds::TRC_HALT_GROUP);
+    bus.set_word(PEER_DBGSR, 0x0003);
+    bus.halted = true;
+    let mut state = TriCoreCoreState::new();
+    {
+        let mut core = group_core(&mut bus, &mut state);
+        core.set_halt_group(true).unwrap();
+        core.enable_breakpoints(true).unwrap();
+        core.set_hw_breakpoint(1, 0x8000_0400).unwrap();
+        core.status().unwrap();
+    }
+    // Another session ran the group, CPU0 halted at its breakpoint, and a newer run let CPU1
+    // go again, all before this check: CPU1 runs as it should.
+    bus.hit_trigger(1);
+    bus.set_word(PEER_DBGSR, 0x0001);
+    bus.writes.clear();
+    assert_eq!(
+        group_core(&mut bus, &mut state).status().unwrap(),
+        CoreStatus::Halted(HaltReason::Breakpoint(BreakpointCause::Hardware))
+    );
+    assert!(!bus.write_words().contains(&(PEER_DBGSR, ocds::DBGSR_HALT)));
 }
 
 #[test]

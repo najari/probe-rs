@@ -414,6 +414,113 @@ struct GroupState {
     own_dbgsr: u32,
 }
 
+/// (`DBGSR`, system timer, PC) of a core, as one status check reads them.
+type CoreStatusRead = (u32, Option<u64>, u32);
+
+/// The status registers of the TriCore cores of a device, read in one request for the status
+/// checks of several cores (one debug session for several cores, see [`prefetch_status`]).
+#[derive(Debug, Clone)]
+pub(crate) struct StatusSnapshot {
+    /// The system timer, when it could be read.
+    stm: Option<u64>,
+    /// (core index, `DBGSR`, `CBS_TRCn`, `EXEVT`, PC, `DBGSR` read again at the end) of each
+    /// core.
+    cores: Vec<(u8, u32, u32, u32, u32, u32)>,
+}
+
+impl StatusSnapshot {
+    /// The status of `core` and its halt group registers, as its status check reads them.
+    fn for_core(&self, core: u8) -> Option<(CoreStatusRead, GroupState)> {
+        let &(_, dbgsr, trc, exevt, pc, dbgsr_after) = self.cores.iter().find(|c| c.0 == core)?;
+        let peers = self
+            .cores
+            .iter()
+            .filter(|c| c.0 != core)
+            .map(|&(peer, peer_dbgsr, peer_trc, _, _, _)| (peer, peer_trc, peer_dbgsr))
+            .collect();
+        Some((
+            (dbgsr, self.stm, pc),
+            GroupState {
+                trc,
+                exevt,
+                peers,
+                own_dbgsr: dbgsr_after,
+            },
+        ))
+    }
+}
+
+/// Reads the status of the TriCore cores `members` (core index, CSFR base) in one request:
+/// `DBGSR`, `CBS_TRCn`, `EXEVT` and the PC of each core, then `DBGSR` of each again, and the
+/// system timer at `stm0_tim0sv` last. Each core's own `DBGSR` read at the end comes after the
+/// reads of its peers, as [`TriCore::check_group`] needs it.
+pub(crate) fn prefetch_status(
+    bus: &mut dyn TriCoreBusAccess,
+    members: &[(u8, u32)],
+    stm0_tim0sv: u32,
+) -> Result<StatusSnapshot, TriCoreError> {
+    const PER_CORE: usize = 4;
+    let mut transfers = Vec::with_capacity((PER_CORE + 1) * members.len() + 2);
+    for &(core, csfr_base) in members {
+        transfers.push(BusTransfer::read(
+            AddressMap::Target,
+            csfr_base + ocds::DBGSR as u32,
+            4,
+        ));
+        transfers.push(BusTransfer::read(AddressMap::Target, ocds::trc(core), 4));
+        transfers.push(BusTransfer::read(
+            AddressMap::Target,
+            csfr_base + ocds::EXEVT as u32,
+            4,
+        ));
+        transfers.push(BusTransfer::read(
+            AddressMap::Target,
+            csfr_base + registers::CSFR_PC as u32,
+            4,
+        ));
+    }
+    for &(_, csfr_base) in members {
+        transfers.push(BusTransfer::read(
+            AddressMap::Target,
+            csfr_base + ocds::DBGSR as u32,
+            4,
+        ));
+    }
+    transfers.push(BusTransfer::read(AddressMap::Target, stm0_tim0sv, 4));
+    transfers.push(BusTransfer::read(
+        AddressMap::Target,
+        stm0_tim0sv + ocds::STM0_CAPSV_OFFSET,
+        4,
+    ));
+    bus.execute(&mut transfers)?;
+
+    let again = PER_CORE * members.len();
+    let cores = members
+        .iter()
+        .enumerate()
+        .map(|(i, &(core, _))| {
+            let at = PER_CORE * i;
+            Ok((
+                core,
+                transfers[at].read_u32()?,
+                transfers[at + 1].read_u32()?,
+                transfers[at + 2].read_u32()?,
+                transfers[at + 3].read_u32()?,
+                transfers[again + i].read_u32()?,
+            ))
+        })
+        .collect::<Result<Vec<_>, TriCoreError>>()?;
+    let stm_at = (PER_CORE + 1) * members.len();
+    let stm = match (
+        transfers[stm_at].read_u32(),
+        transfers[stm_at + 1].read_u32(),
+    ) {
+        (Ok(low), Ok(high)) => Some((high as u64) << 32 | low as u64),
+        _ => None,
+    };
+    Ok(StatusSnapshot { stm, cores })
+}
+
 impl GroupState {
     /// The peers that are in the halt group and run.
     fn running_members(&self) -> Vec<u8> {
@@ -498,6 +605,13 @@ pub struct TriCoreCoreState {
     journal: Option<Journal>,
     /// Whether the journals of sessions that are gone were looked at.
     journal_checked: bool,
+    /// The status registers of this core read by [`prefetch_status`] for the next status check,
+    /// taken by it.
+    prefetched: Option<StatusSnapshot>,
+    /// `DBGSR` and the PC of the halt the core was last seen in. A core that the halt group or
+    /// another session ran and that halted again before the next status check (at its own
+    /// breakpoint, for example) reads as halted both times; other values tell the new halt.
+    halt_mark: Option<(u32, u32)>,
 }
 
 impl TriCoreCoreState {
@@ -528,7 +642,14 @@ impl TriCoreCoreState {
             journal_dir: (!cfg!(test)).then(Journal::default_dir),
             journal: None,
             journal_checked: false,
+            prefetched: None,
+            halt_mark: None,
         }
+    }
+
+    /// Gives the next status check of this core the registers read by [`prefetch_status`].
+    pub(crate) fn set_prefetched(&mut self, snapshot: Option<StatusSnapshot>) {
+        self.prefetched = snapshot;
     }
 
     /// Keeps the journal of the planted `DEBUG` instructions in `dir`.
@@ -1103,24 +1224,39 @@ impl<'probe> TriCore<'probe> {
             self.core()
         );
         self.state.halt_reason = Some(reason);
+        self.state.halt_mark = Some((dbgsr, pc));
         Ok(())
     }
 
-    /// `DBGSR` and the system timer (when it can be read), in one request.
-    fn read_status(&mut self) -> Result<(u32, Option<u64>), TriCoreError> {
+    /// `DBGSR`, the system timer (when it can be read) and the PC, in one request.
+    fn read_status(&mut self) -> Result<CoreStatusRead, TriCoreError> {
         let tim0sv = self.sequence.stm0_tim0sv();
         let mut transfers = [
             BusTransfer::read(AddressMap::Target, self.csfr(ocds::DBGSR), 4),
+            BusTransfer::read(AddressMap::Target, self.csfr(registers::CSFR_PC), 4),
             BusTransfer::read(AddressMap::Target, tim0sv, 4),
             BusTransfer::read(AddressMap::Target, tim0sv + ocds::STM0_CAPSV_OFFSET, 4),
         ];
         self.bus().execute(&mut transfers)?;
         let dbgsr = transfers[0].read_u32()?;
-        let stm = match (transfers[1].read_u32(), transfers[2].read_u32()) {
+        let pc = transfers[1].read_u32()?;
+        let stm = match (transfers[2].read_u32(), transfers[3].read_u32()) {
             (Ok(low), Ok(high)) => Some((high as u64) << 32 | low as u64),
             _ => None,
         };
-        Ok((dbgsr, stm))
+        Ok((dbgsr, stm, pc))
+    }
+
+    /// Notes `DBGSR` and the PC of the halt the core is in: a later status check that finds
+    /// other values knows that the core ran and halted again in between (see `halt_mark`).
+    fn mark_halt(&mut self) -> Result<(), TriCoreError> {
+        let mut transfers = [
+            BusTransfer::read(AddressMap::Target, self.csfr(ocds::DBGSR), 4),
+            BusTransfer::read(AddressMap::Target, self.csfr(registers::CSFR_PC), 4),
+        ];
+        self.bus().execute(&mut transfers)?;
+        self.state.halt_mark = Some((transfers[0].read_u32()?, transfers[1].read_u32()?));
+        Ok(())
     }
 
     /// Called when the system timer counted down since the last status check: the device was
@@ -1219,13 +1355,30 @@ impl<'probe> TriCore<'probe> {
 
     fn update_halted(&mut self) -> Result<bool, TriCoreError> {
         self.recover_left_breakpoints()?;
-        let (mut dbgsr, stm) = self.read_status()?;
+        // The registers of a batch read of several cores, if the session made one for this check.
+        let core = self.core();
+        let prefetched = self
+            .state
+            .prefetched
+            .take()
+            .and_then(|snapshot| snapshot.for_core(core));
+        let (status, mut group) = match prefetched {
+            Some((status, group)) => (Some(status), Some(group)),
+            None => (None, None),
+        };
+        let (mut dbgsr, stm, mut pc) = match status {
+            Some(status) => status,
+            None => self.read_status()?,
+        };
         if let Some(stm) = stm {
             let reset = self.state.last_stm.is_some_and(|last| stm < last);
             self.state.last_stm = Some(stm);
             if reset {
                 self.on_device_reset()?;
                 dbgsr = self.dbgsr()?;
+                pc = self.pc()?;
+                // The reset handling rewrote the routing: read the group again.
+                group = None;
             } else if let Some(seen) = self.state.reset_seen {
                 // The start code may copy its code into the PSPR after the reset was seen, over
                 // the software breakpoints planted then.
@@ -1237,11 +1390,23 @@ impl<'probe> TriCore<'probe> {
             }
         }
         let halted = ocds::is_halted(dbgsr);
-        if halted && !self.state.was_halted {
+        // A core halted at both checks that ran in between: the halt group or another session
+        // ran it, and it halted again before this check (at its own breakpoint, for example).
+        // Its debug status or PC are not those of the halt seen last.
+        let halted_again = halted
+            && self.state.was_halted
+            && self.state.halt_mark.is_some_and(|mark| mark != (dbgsr, pc));
+        if halted_again {
+            self.state.last_action = LastAction::Run;
+            self.on_halted(dbgsr)?;
+        } else if halted && !self.state.was_halted {
             self.on_halted(dbgsr)?;
             // A member that ran when this core halted missed the halt on the group line (it was
-            // still halted itself, or resumed just after): halt it now.
+            // still halted itself, or resumed just after): halt it now. Not after a halt seen
+            // late (`halted_again`): the members may run again since, by a newer run.
             self.halt_group_members()?;
+            // That may have halted peers since the batch read.
+            group = None;
         }
         if !halted {
             self.state.halt_reason = None;
@@ -1252,7 +1417,7 @@ impl<'probe> TriCore<'probe> {
             }
         }
         if self.state.halt_group.is_some() {
-            self.check_group(halted)?;
+            self.check_group(halted, group)?;
         }
         self.state.was_halted = halted;
         Ok(halted)
@@ -1275,8 +1440,15 @@ impl<'probe> TriCore<'probe> {
     /// For a core that this session put in the halt group: routes it again when a reset (by
     /// another session, for example) cleared the routing, and notes the members that run while
     /// this core runs (see `running_peers`).
-    fn check_group(&mut self, halted: bool) -> Result<(), TriCoreError> {
-        let group = self.read_group()?;
+    fn check_group(
+        &mut self,
+        halted: bool,
+        prefetched: Option<GroupState>,
+    ) -> Result<(), TriCoreError> {
+        let group = match prefetched {
+            Some(group) => group,
+            None => self.read_group()?,
+        };
         if !ocds::in_halt_group(group.trc) || group.exevt != ocds::EXEVT_HALT {
             let csfr_base = self.options.csfr_base as u32;
             self.write_group_routing(self.core(), csfr_base)?;
@@ -1371,7 +1543,7 @@ impl<'probe> TriCore<'probe> {
             self.state.last_action = LastAction::Step;
             self.state.halt_reason = Some(HaltReason::Step);
             self.state.was_halted = true;
-            return Ok(());
+            return self.mark_halt();
         }
         // The instruction under a software breakpoint at the PC runs, the breakpoint is planted
         // again after the step.
@@ -1448,7 +1620,7 @@ impl<'probe> TriCore<'probe> {
                 self.state.last_action = LastAction::Step;
                 self.state.halt_reason = Some(HaltReason::Step);
                 self.state.was_halted = true;
-                return Ok(());
+                return self.mark_halt();
             }
         }
         Err(TriCoreError::StepFailed(self.core()))
@@ -2240,7 +2412,14 @@ impl CoreInterface for TriCore<'_> {
             return Err(TriCoreError::NotHalted(self.core()).into());
         }
         let value: u32 = value.try_into()?;
-        Ok(self.write_csfr(address.0, value)?)
+        self.write_csfr(address.0, value)?;
+        // A debugger that moves the PC of the halted core does not make it halt again.
+        if address.0 == registers::CSFR_PC
+            && let Some((_, pc)) = self.state.halt_mark.as_mut()
+        {
+            *pc = value;
+        }
+        Ok(())
     }
 
     /// The breakpoint slots: the trigger units, plus the software breakpoints that the PSPR of

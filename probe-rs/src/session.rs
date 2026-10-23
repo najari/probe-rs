@@ -698,6 +698,55 @@ impl Session {
         Ok(())
     }
 
+    /// The status of each core of `cores`, in their order.
+    ///
+    /// The same as [`Core::status`] for each core. On a TriCore target the debug status of the
+    /// cores is read in one request first (`DBGSR`, the halt group registers and the system
+    /// timer), and each core's check uses it: in the steady state the status of all cores costs
+    /// one request instead of two per core.
+    pub fn status_many(&mut self, cores: &[usize]) -> Vec<Result<crate::CoreStatus, Error>> {
+        if let ArchitectureInterface::TriCore(probe) = &mut self.interfaces
+            && let Ok(bus) = probe.try_get_tricore_bus()
+        {
+            let members = self
+                .target
+                .cores
+                .iter()
+                .filter_map(|core| match &core.core_access_options {
+                    probe_rs_target::CoreAccessOptions::TriCore(options) => {
+                        Some((options.core_index, options.csfr_base as u32))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let stm0_tim0sv = match &self.target.debug_sequence {
+                DebugSequence::TriCore(sequence) => sequence.stm0_tim0sv(),
+                _ => crate::architecture::tricore::ocds::STM0_TIM0SV,
+            };
+            // A failed batch read leaves each core to read its own registers.
+            if let Ok(snapshot) =
+                crate::architecture::tricore::prefetch_status(bus, &members, stm0_tim0sv)
+            {
+                for &core in cores {
+                    if let Some(state) = self.cores.get_mut(core) {
+                        state.tricore_set_prefetched(Some(snapshot.clone()));
+                    }
+                }
+            }
+        }
+        let statuses = cores
+            .iter()
+            .map(|&core| self.core(core).and_then(|mut core| core.status()))
+            .collect();
+        // A core whose check failed before it took the batch read must not use it later.
+        for &core in cores {
+            if let Some(state) = self.cores.get_mut(core) {
+                state.tricore_set_prefetched(None);
+            }
+        }
+        statuses
+    }
+
     /// Get the memory and reset access of a TriCore target.
     pub fn get_tricore_bus(&mut self) -> Result<&mut dyn TriCoreBusAccess, Error> {
         match &mut self.interfaces {
