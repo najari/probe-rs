@@ -8,8 +8,13 @@
 //! reset the device afterwards.
 //!
 //! ```text
-//! cargo run -p probe-rs-infineon --example start_in_flash -- <elf> [stack top, default 0x7000C000]
+//! cargo run -p probe-rs-infineon --example start_in_flash -- <elf> [stack top, default 0x7000C000] [--core N]
 //! ```
+//!
+//! `--core N` starts the image on core N instead of CPU0, with the stack in the core's own DSPR
+//! (its local alias, default 0xD000C000), so several cores can run the same code (one DAP
+//! session for several cores, PRD test T-M8). Each core keeps the context save areas its
+//! application set up.
 //!
 //! The chip is detected; `PROBE_RS_CHIP` names it instead, for example `TC36x`.
 
@@ -24,13 +29,26 @@ use probe_rs::{
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    let core_index = match args.iter().position(|a| a == "--core") {
+        Some(i) => {
+            let core = args
+                .get(i + 1)
+                .ok_or("--core needs a core index")?
+                .parse()?;
+            args.drain(i..i + 2);
+            core
+        }
+        None => 0usize,
+    };
+    let mut args = args.into_iter();
     let path = args
         .next()
-        .ok_or("usage: start_in_flash <elf> [stack top]")?;
+        .ok_or("usage: start_in_flash <elf> [stack top] [--core N]")?;
     let stack = match args.next() {
         Some(s) => u32::from_str_radix(s.trim_start_matches("0x"), 16)?,
-        None => 0x7000_C000,
+        None if core_index == 0 => 0x7000_C000,
+        None => 0xD000_C000,
     };
 
     let elf = std::fs::read(&path)?;
@@ -50,7 +68,7 @@ fn main() -> Result<()> {
         .unwrap_or(probe_rs::config::TargetSelector::Auto);
     let mut session = probe.attach(chip, Permissions::default())?;
     println!("{}", session.target().name);
-    let mut core = session.core(0)?;
+    let mut core = session.core(core_index)?;
     core.halt(Duration::from_millis(500))?;
 
     // A stale image would run garbage.
@@ -90,6 +108,8 @@ fn main() -> Result<()> {
     core.write_core_reg(RegisterId(CSFR_PCXI), 0u32)?;
     let icr: u32 = core.read_core_reg(RegisterId(CSFR_ICR))?;
     core.write_core_reg(RegisterId(CSFR_ICR), icr & !(1 << 15))?;
-    println!("CPU0 halted at {entry:#010x}, A10 = {stack:#010x}, A11 = PCXI = 0, ICR.IE off");
+    println!(
+        "CPU{core_index} halted at {entry:#010x}, A10 = {stack:#010x}, A11 = PCXI = 0, ICR.IE off"
+    );
     Ok(())
 }
