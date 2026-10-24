@@ -1287,10 +1287,10 @@ fn a_watchpoint_takes_the_highest_free_trigger_units() {
     drop(core);
 
     assert_eq!(bus.word(trig_adr(7)), 0x7000_A000);
-    assert_eq!(bus.word(trig_evt(7)), 0x0800_0032);
+    assert_eq!(bus.word(trig_evt(7)), 0x0800_0022);
     // Units 6 and 7 are not a free pair: 4 and 5 hold the range.
     assert_eq!(bus.word(trig_adr(4)), 0x7000_A004);
-    assert_eq!(bus.word(trig_evt(4)), 0x1800_2032);
+    assert_eq!(bus.word(trig_evt(4)), 0x1800_2022);
     assert_eq!(bus.word(trig_adr(5)), 0x7000_A008);
     assert_eq!(bus.word(trig_evt(5)), 0);
 
@@ -1298,7 +1298,7 @@ fn a_watchpoint_takes_the_highest_free_trigger_units() {
     core.clear_watchpoint(0x7000_A004).unwrap();
     drop(core);
     assert_eq!(bus.word(trig_evt(4)), 0);
-    assert_eq!(bus.word(trig_evt(7)), 0x0800_0032);
+    assert_eq!(bus.word(trig_evt(7)), 0x0800_0022);
 }
 
 #[test]
@@ -1349,7 +1349,7 @@ fn a_watchpoint_halt_is_reported_and_survives_a_step() {
     // The step reprograms the trigger window; the watchpoint is armed again after it.
     core.step().unwrap();
     drop(core);
-    assert_eq!(bus.word(trig_evt(6)), 0x0800_2032);
+    assert_eq!(bus.word(trig_evt(6)), 0x0800_2022);
     assert_eq!(bus.word(trig_adr(7)), 0x7000_A008);
 }
 
@@ -1367,6 +1367,11 @@ fn a_member_halted_at_a_watchpoint_stays_halted() {
             .set_halt_group(true)
             .unwrap();
         bus.set_word(PEER_DBGSR, 0x0001);
+        // The peer's watchpoint in its trigger unit 6.
+        bus.set_word(
+            PEER_CSFR_BASE + 0xF000 + 8 * 6,
+            ocds::TRIG_EVT_DATA | ocds::TRIG_EVT_STORE,
+        );
         group_core(&mut bus, &mut state).status().unwrap();
         bus.set_word(PEER_DBGSR, peer_dbgsr);
         bus.halted = true;
@@ -1381,6 +1386,26 @@ fn a_member_halted_at_a_watchpoint_stays_halted() {
             "DBGSR {peer_dbgsr:#x}"
         );
     }
+}
+
+#[test]
+fn a_member_with_a_suspend_mark_but_no_watchpoint_runs_with_the_group() {
+    // PREVSUSP left from an earlier halt, then halted by a halt request (no debug event).
+    let mut bus = FakeBus::new();
+    bus.set_word(ocds::trc(1), ocds::TRC_HALT_GROUP);
+    let mut state = TriCoreCoreState::new();
+    group_core(&mut bus, &mut state)
+        .set_halt_group(true)
+        .unwrap();
+    bus.set_word(PEER_DBGSR, 0x0041);
+    group_core(&mut bus, &mut state).status().unwrap();
+    bus.set_word(PEER_DBGSR, 0x0043);
+    bus.halted = true;
+    let mut core = group_core(&mut bus, &mut state);
+    core.status().unwrap();
+    core.run().unwrap();
+    drop(core);
+    assert!(bus.write_words().contains(&(PEER_DBGSR, ocds::DBGSR_RUN)));
 }
 
 /// Sets the 64-bit system timer (STM0, second view).
@@ -1756,7 +1781,7 @@ fn a_perf_window_counts_between_two_triggers_and_puts_cctrl_back() {
     assert_eq!(bus.word(trig_evt(6)), ocds::TRIG_EVT_PERF_START);
     assert_eq!(bus.word(trig_adr(7)), 0x8021_C024);
     assert_eq!(bus.word(trig_evt(7)), ocds::TRIG_EVT_PERF_STOP);
-    assert_eq!(bus.word(trig_evt(4)), 0x0800_2032);
+    assert_eq!(bus.word(trig_evt(4)), 0x0800_2022);
     // Cleared counters, task mode, enabled, M1 kept.
     assert_eq!(bus.word(CSFR_BASE + registers::CSFR_ICNT as u32), 0);
     assert_eq!(bus.word(CCTRL), 0x0000_0007);

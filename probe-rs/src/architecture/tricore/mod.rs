@@ -126,10 +126,11 @@ pub mod ocds {
         0,
         0,
     ];
-    /// The [`SWEVT`] value of a session: a `DEBUG` instruction halts the core, break before make
-    /// (the PC stays at the instruction), with a break-out pulse for the halt group. (The debug
-    /// init of the reference writes 0x2A: `SUSP` set, which gives no pulse.)
-    pub const SWEVT_HALT: u32 = 0x0A;
+    /// The [`SWEVT`] value of the debug init: a `DEBUG` instruction halts the core, break before
+    /// make (the PC stays at the instruction), with a break-out pulse for the halt group (`BOD`
+    /// = 0) and `SUSP` set, which tells the halt from the group's break-in that follows it (see
+    /// [`halted_by_suspend_event`]).
+    pub const SWEVT_HALT: u32 = 0x2A;
 
     /// `DBGSR.EVTSRC` after a halt by a `DEBUG` instruction.
     pub const EVTSRC_SWEVT: u32 = 2;
@@ -140,11 +141,11 @@ pub mod ocds {
     pub const DBGSR_PREVSUSP: u32 = 1 << 6;
 
     /// `TRnEVT` of a data watchpoint without the access bits: address input (`TYP` = 0), halt,
-    /// no break-out pulse, break after make, and `SUSP` set so that the halt can be told from
-    /// the halt group's break-in that follows it (see [`halted_by_suspend_event`]). An event
-    /// with `SUSP` gives no break-out pulse: the other members halt when the session sees this
-    /// halt (`halt_group_members`).
-    pub const TRIG_EVT_DATA: u32 = 0x32;
+    /// a break-out pulse for the halt group (`BOD` = 0), break after make, and `SUSP` set so
+    /// that the halt can be told from the halt group's break-in that follows it (see
+    /// [`halted_by_suspend_event`]). Measured on the TC275: `SUSP` with `BOD` = 0 gives the
+    /// pulse, and the break-in moves `SUSP` to `PREVSUSP`.
+    pub const TRIG_EVT_DATA: u32 = 0x22;
     /// `TRnEVT.ALD`: trigger on loads.
     pub const TRIG_EVT_LOAD: u32 = 1 << 28;
     /// `TRnEVT.AST`: trigger on stores.
@@ -1863,10 +1864,8 @@ impl<'probe> TriCore<'probe> {
             .iter()
             .filter(|&&(core, trc, dbgsr)| {
                 previous.contains(&core) && ocds::in_halt_group(trc) && ocds::is_halted(dbgsr)
-                    // Halted at a data watchpoint (or a `DEBUG` instruction).
-                    && !ocds::halted_by_suspend_event(dbgsr)
             })
-            .filter_map(|&(core, _, _)| Some((core, self.peer_csfr_base(core)?)))
+            .filter_map(|&(core, _, dbgsr)| Some((core, self.peer_csfr_base(core)?, dbgsr)))
             .collect::<Vec<_>>();
         if halted.is_empty() {
             return Ok(Vec::new());
@@ -1874,7 +1873,7 @@ impl<'probe> TriCore<'probe> {
 
         // The PC and the trigger units of each halted member, in one request.
         let mut transfers = Vec::new();
-        for &(_, csfr_base) in &halted {
+        for &(_, csfr_base, _) in &halted {
             transfers.push(BusTransfer::read(
                 AddressMap::Target,
                 csfr_base + registers::CSFR_PC as u32,
@@ -1888,16 +1887,29 @@ impl<'probe> TriCore<'probe> {
         }
         self.bus().execute(&mut transfers)?;
         let mut candidates = Vec::new();
-        for (&(core, csfr_base), pair) in halted.iter().zip(transfers.chunks(2)) {
+        for (&(core, csfr_base, dbgsr), pair) in halted.iter().zip(transfers.chunks(2)) {
             let pc = pair[0].read_u32()?;
             pair[1].check()?;
             // Each trigger unit is `TRnEVT` followed by `TRnADR`.
-            let at_breakpoint = pair[1].data.as_chunks::<8>().0.iter().any(|unit| {
+            let units = pair[1].data.as_chunks::<8>().0.iter().map(|unit| {
                 let [e0, e1, e2, e3, a0, a1, a2, a3] = *unit;
-                ocds::is_halt_trigger(u32::from_le_bytes([e0, e1, e2, e3]))
-                    && u32::from_le_bytes([a0, a1, a2, a3]) == pc
+                (
+                    u32::from_le_bytes([e0, e1, e2, e3]),
+                    u32::from_le_bytes([a0, a1, a2, a3]),
+                )
             });
-            if !at_breakpoint {
+            let mut at_breakpoint = false;
+            let mut watchpoint = false;
+            for (evt, address) in units {
+                at_breakpoint |= ocds::is_halt_trigger(evt) && address == pc;
+                watchpoint |= ocds::is_halt_trigger(evt)
+                    && evt & (ocds::TRIG_EVT_LOAD | ocds::TRIG_EVT_STORE) != 0;
+            }
+            // Halted at its data watchpoint: the `SUSP` mark of the event, while the member has
+            // one armed. The mark alone can be left from an earlier halt (`PREVSUSP` stays until
+            // the next debug event, and a halt request is none).
+            let at_watchpoint = watchpoint && ocds::halted_by_suspend_event(dbgsr);
+            if !at_breakpoint && !at_watchpoint {
                 candidates.push((core, translate_local_address(core, pc), csfr_base));
             }
         }
