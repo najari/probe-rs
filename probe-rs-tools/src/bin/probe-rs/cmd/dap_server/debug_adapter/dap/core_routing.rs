@@ -49,6 +49,9 @@ pub(crate) struct CoreRouting {
     focus: Option<usize>,
     /// The cores that reported a halt and have not run since.
     halted: HashSet<usize>,
+    /// The last `stopped` event of each core that stopped on its own (not by the halt group),
+    /// while the core stays halted.
+    own_stops: HashMap<usize, serde_json::Map<String, Value>>,
     /// While a request goes to several cores: its command and the responses collected.
     captured: Option<(String, Vec<Response>)>,
 }
@@ -75,6 +78,13 @@ impl CoreRouting {
         self.references.clear();
         self.focus = None;
         self.halted.clear();
+        self.own_stops.clear();
+    }
+
+    /// Notes that `core` runs.
+    fn running(&mut self, core: usize) {
+        self.halted.remove(&core);
+        self.own_stops.remove(&core);
     }
 
     /// Whether every configured core reported a halt and has not run since.
@@ -176,7 +186,7 @@ impl CoreRouting {
                 "continue" | "next" | "stepIn" | "stepOut" | "stepBack" | "reverseContinue"
             )
         {
-            self.halted.remove(&core);
+            self.running(core);
         }
         let Some(body) = response.body.as_mut() else {
             return;
@@ -234,17 +244,21 @@ impl CoreRouting {
         }
     }
 
-    /// Notes the core of a `stopped` event. With several cores, each core reports its own halt:
-    /// an event claims that all threads stopped only when it leaves every core halted (the last
-    /// core of an all-stop), and never that all threads continued. A client may keep only the
-    /// state of the last `stopped` event (Zed does), so the earlier cores would look as if they
-    /// still ran.
-    fn observe_event(&mut self, event_type: &str, body: &mut Option<Value>) {
+    /// Notes the core of a `stopped` event. With several cores, each core reports its own halt,
+    /// and an event never claims that all threads continued.
+    ///
+    /// A client may keep only the state of the last `stopped` event (Zed does), so when every
+    /// core is halted the last event must say `allThreadsStopped`. VS Code, given that, clears
+    /// every call stack and reads back only the one of the event's thread. So the claim goes on
+    /// the stop of a core that stopped on its own: on that event when it is the last halt, else
+    /// (the halt group stopped the last core) on a copy of the focus core's stop, returned here
+    /// to be sent after the event.
+    fn observe_event(&mut self, event_type: &str, body: &mut Option<Value>) -> Option<Value> {
         if !self.is_multi_core() {
-            return;
+            return None;
         }
         let Some(Value::Object(body)) = body.as_mut() else {
-            return;
+            return None;
         };
         let thread = body
             .get("threadId")
@@ -261,19 +275,31 @@ impl CoreRouting {
                 } else if thread.is_some() {
                     self.focus = thread.or(self.focus);
                 }
-                if let Some(thread) = thread {
-                    self.halted.insert(thread);
+                body.insert("allThreadsStopped".to_string(), Value::Bool(false));
+                let thread = thread?;
+                self.halted.insert(thread);
+                if !by_group {
+                    self.own_stops.insert(thread, body.clone());
                 }
-                let all = thread.is_some() && self.all_halted();
-                body.insert("allThreadsStopped".to_string(), Value::Bool(all));
+                if !self.all_halted() {
+                    return None;
+                }
+                if !by_group {
+                    body.insert("allThreadsStopped".to_string(), Value::Bool(true));
+                    return None;
+                }
+                let mut again = self.own_stops.get(&self.focus?)?.clone();
+                again.insert("allThreadsStopped".to_string(), Value::Bool(true));
+                Some(Value::Object(again))
             }
             "continued" => {
                 if let Some(thread) = thread {
-                    self.halted.remove(&thread);
+                    self.running(thread);
                 }
                 body.insert("allThreadsContinued".to_string(), Value::Bool(false));
+                None
             }
-            _ => {}
+            _ => None,
         }
     }
 }
@@ -470,8 +496,12 @@ impl ProtocolAdapter for RoutingAdapter {
         event_type: &str,
         mut event_body: Option<Value>,
     ) -> anyhow::Result<()> {
-        self.routing().observe_event(event_type, &mut event_body);
-        self.inner.dyn_send_event(event_type, event_body)
+        let again = self.routing().observe_event(event_type, &mut event_body);
+        self.inner.dyn_send_event(event_type, event_body)?;
+        if let Some(again) = again {
+            self.inner.dyn_send_event(event_type, Some(again))?;
+        }
+        Ok(())
     }
 
     fn send_raw_response(&mut self, mut response: Response) -> anyhow::Result<()> {
@@ -624,29 +654,38 @@ mod tests {
     #[test]
     fn the_stop_that_leaves_every_core_halted_says_so() {
         let mut routing = routing(&[0, 1, 2]);
+        // The event's `allThreadsStopped`, and the thread and reason of the stop sent after it.
         let stop = |routing: &mut CoreRouting, reason: &str, thread: i64| {
             let mut body = Some(json!({ "reason": reason, "threadId": thread }));
-            routing.observe_event("stopped", &mut body);
-            body.unwrap()["allThreadsStopped"].clone()
+            let again = routing.observe_event("stopped", &mut body).map(|again| {
+                assert_eq!(again["allThreadsStopped"], true);
+                (again["threadId"].clone(), again["reason"].clone())
+            });
+            (body.unwrap()["allThreadsStopped"].clone(), again)
         };
-        // An all-stop: the core that hit its breakpoint, then the cores the group stopped.
-        assert_eq!(stop(&mut routing, "breakpoint", 0), false);
-        assert_eq!(stop(&mut routing, "external", 1), false);
-        assert_eq!(stop(&mut routing, "external", 2), true);
+        // An all-stop: the core that hit its breakpoint, then the cores the group stopped. The
+        // last of those leaves every core halted: the breakpoint's stop is sent again, saying so.
+        assert_eq!(stop(&mut routing, "breakpoint", 0), (json!(false), None));
+        assert_eq!(stop(&mut routing, "external", 1), (json!(false), None));
+        assert_eq!(
+            stop(&mut routing, "external", 2),
+            (json!(false), Some((json!(0), json!("breakpoint"))))
+        );
 
-        // A continue lets its core run: the next halt of another core leaves it out.
+        // A continue lets its core run: the next halt of another core leaves it out. A core
+        // that stops on its own as the last one says so on its own event.
         routing.set_current(Some(0));
         let mut resumed = response("continue", true, json!({}));
         routing.observe_response(&mut resumed);
-        assert_eq!(stop(&mut routing, "pause", 1), false);
-        assert_eq!(stop(&mut routing, "breakpoint", 0), true);
+        assert_eq!(stop(&mut routing, "pause", 1), (json!(false), None));
+        assert_eq!(stop(&mut routing, "breakpoint", 0), (json!(true), None));
 
         // So does a `continued` event, and its body never claims that every thread runs.
         let mut continued = Some(json!({ "threadId": 2, "allThreadsContinued": true }));
         routing.observe_event("continued", &mut continued);
         assert_eq!(continued.unwrap()["allThreadsContinued"], false);
-        assert_eq!(stop(&mut routing, "pause", 1), false);
-        assert_eq!(stop(&mut routing, "step", 2), true);
+        assert_eq!(stop(&mut routing, "pause", 1), (json!(false), None));
+        assert_eq!(stop(&mut routing, "step", 2), (json!(true), None));
     }
 
     #[test]
