@@ -9,7 +9,11 @@
 //! ```text
 //! cargo run -p probe-rs-infineon --example trigger_switch -- dump
 //! cargo run -p probe-rs-infineon --example trigger_switch -- try 0x00700007 0x12
+//! cargo run -p probe-rs-infineon --example trigger_switch -- brkout 0x700 0x700000 0x100a
 //! ```
+//!
+//! `brkout <TRC0> <TRC1> <EVT0>` tries a halt propagation by the break-out pulse of a trigger on
+//! CPU0 (see `try_brkout`).
 
 use std::time::{Duration, Instant};
 
@@ -186,6 +190,68 @@ fn try_routing(session: &mut Session, trc: u32, exevt: u32) -> Result<()> {
     result
 }
 
+/// Halt propagation by a break-out pulse instead of the halt state: CPU0 halted at `main` of
+/// `demo_flash.elf` (`start_in_flash`) gets trigger unit 0 at `square` (0x8021C008) with
+/// `TR0EVT` = `evt0`; `CBS_TRC0` = `trc0`, `CBS_TRC1`/`CBS_TRC2` = `trc1`, `EXEVT1`/`EXEVT2` =
+/// halt on break-in. CPU0 runs into the trigger; the run states show whether CPU1 and CPU2
+/// halt with it. Everything is put back.
+fn try_brkout(session: &mut Session, trc0: u32, trc1: u32, evt0: u32) -> Result<()> {
+    const TR0EVT: u32 = 0xF000;
+    const TR0ADR: u32 = 0xF004;
+    let saved_trc: Vec<u32> = (0..3)
+        .map(|core| read(session, CBS_TRC0 + 4 * core))
+        .collect::<Result<_>>()?;
+    let saved_exevt: Vec<u32> = (0..3)
+        .map(|core| read(session, csfr(core, EXEVT)))
+        .collect::<Result<_>>()?;
+    let saved_unit = [
+        read(session, csfr(0, TR0EVT))?,
+        read(session, csfr(0, TR0ADR))?,
+    ];
+    println!("saved TRC0-2 {saved_trc:#x?}, EXEVT0-2 {saved_exevt:#x?}, TR0 {saved_unit:#x?}");
+
+    let result = (|| -> Result<()> {
+        write(session, CBS_TRC0, trc0)?;
+        // CPU0 in the group too (its BRKIN routed): it halts on break-in like the others.
+        if trc0 & 0x00F0_0000 != 0 {
+            write(session, csfr(0, EXEVT), 0x12)?;
+        }
+        for core in 1..3 {
+            write(session, CBS_TRC0 + 4 * core, trc1)?;
+            write(session, csfr(core, EXEVT), 0x12)?;
+        }
+        write(session, csfr(0, TR0ADR), 0x8021_C008)?;
+        write(session, csfr(0, TR0EVT), evt0)?;
+        sample(
+            session,
+            "routing and trigger set",
+            Duration::from_millis(200),
+        )?;
+        // A raw run of CPU0 (it is halted at `main`, no breakpoint under it).
+        write(session, csfr(0, DBGSR), 0x4)?;
+        sample(session, "after running CPU0", Duration::from_millis(500))?;
+        let pc = read(session, csfr(0, PC))?;
+        let dbgsr = read(session, csfr(0, DBGSR))?;
+        // TRIG_ACC: one bit per trigger unit that fired (reading clears it).
+        let trig_acc = read(session, csfr(0, 0xFD30))?;
+        println!(
+            "CPU0 PC {pc:#010x} DBGSR {dbgsr:#06x} (EVTSRC {}) TRIG_ACC {trig_acc:#x}",
+            (dbgsr >> 8) & 0x1F
+        );
+        Ok(())
+    })();
+
+    write(session, csfr(0, TR0EVT), saved_unit[0])?;
+    write(session, csfr(0, TR0ADR), saved_unit[1])?;
+    for core in 0..3 {
+        write(session, CBS_TRC0 + 4 * core, saved_trc[core as usize])?;
+        write(session, csfr(core, EXEVT), saved_exevt[core as usize])?;
+    }
+    run_all(session);
+    sample(session, "registers put back", Duration::from_millis(200))?;
+    result
+}
+
 fn parse(value: &str) -> Result<u32> {
     Ok(u32::from_str_radix(value.trim_start_matches("0x"), 16)?)
 }
@@ -206,6 +272,24 @@ fn main() -> Result<()> {
             dump(&mut session)
         }
         ["try", trc, exevt] => try_routing(&mut session, parse(trc)?, parse(exevt)?),
-        _ => Err("usage: trigger_switch dump | reset-halt | try <TRC> <EXEVT>".into()),
+        ["mask"] => {
+            // The writable bits of CBS_TRC0-2: all ones written, read back, put back.
+            for core in 0..3 {
+                let address = CBS_TRC0 + 4 * core;
+                let saved = read(&mut session, address)?;
+                write(&mut session, address, u32::MAX)?;
+                let ones = read(&mut session, address)?;
+                write(&mut session, address, saved)?;
+                println!("CBS_TRC{core}: writable bits {ones:#010x} (was {saved:#010x})");
+            }
+            Ok(())
+        }
+        ["brkout", trc0, trc1, evt0] => {
+            try_brkout(&mut session, parse(trc0)?, parse(trc1)?, parse(evt0)?)
+        }
+        _ => Err(
+            "usage: trigger_switch dump | reset-halt | try <TRC> <EXEVT> | brkout <TRC0> <TRC1> <EVT0>"
+                .into(),
+        ),
     }
 }

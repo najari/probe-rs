@@ -10,8 +10,10 @@
 //! is not accessible after the reset: the routing survives it, and CPU1 (in boot halt) halts
 //! CPU0 in its start-up software. `probe-rs reset --connect-under-reset` brings it back.
 //!
+//! `--trc <hex>` then writes that `CBS_TRCn` to the group members (another routing to try).
+//!
 //! ```text
-//! cargo run -p probe-rs-infineon --example sw_reset -- [--arm] [--group N]
+//! cargo run -p probe-rs-infineon --example sw_reset -- [--arm] [--group N [--trc <hex>]]
 //! ```
 
 use std::time::Duration;
@@ -92,6 +94,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .attach("TC275", Permissions::default())?;
     for core in 0..group {
         session.set_tricore_halt_group(core, true)?;
+    }
+    // `--trc <hex>`: the `CBS_TRCn` of the group members instead (another routing to try).
+    if let Some(i) = args.iter().position(|a| a == "--trc") {
+        let trc = u32::from_str_radix(
+            args.get(i + 1)
+                .ok_or("--trc needs a value")?
+                .trim_start_matches("0x"),
+            16,
+        )?;
+        let bus = session.get_tricore_bus()?;
+        for core in 0..group {
+            bus.write_u32(AddressMap::Target, 0xF000_0420 + 4 * core as u32, trc)?;
+        }
     }
     if arm {
         session.set_tricore_halt_group(0, true)?;
