@@ -32,6 +32,10 @@ probe-rs-debug = { version = "0.32.0", path = "../probe-rs-debug" }
 typed-path = "0.12.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[[example]]
+name = "mcd_list"
+required-features = ["mcd"]
+
 [build-dependencies]
 probe-rs-target = { workspace = true, features = ["bincode"] }
 

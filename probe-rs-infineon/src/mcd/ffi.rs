@@ -1,12 +1,13 @@
 //! The parts of the MCD (Multi-Core Debug) API v1.1 that the MCD probe uses.
 //!
 //! The types and constants are transcribed from the SPRINT MCD API header `mcd_api.h`
-//! (version 1.1). Only the functions for connecting, memory transactions, reset and error
-//! information are declared. The original copyright notice and license are reproduced below,
-//! as the license requires.
+//! (version 1.1). Only the functions for connecting, memory spaces, memory transactions, reset
+//! and error information are declared. The original copyright notice and license are
+//! reproduced below, as the license requires.
 //!
 //! Modification notice: this file is a partial Rust translation of `mcd_api.h` and
-//! `mcd_types.h`, made by the probe-rs contributors on 2026-10-23.
+//! `mcd_types.h`, made by the probe-rs contributors on 2026-10-23 (memory spaces added on
+//! 2026-10-24).
 //!
 //! ```text
 //! Copyright (c) 2008, ARM Ltd., Infineon Technologies, NXP Semiconductors,
@@ -80,6 +81,11 @@ pub const MCD_ERR_TXLIST_WRITE: mcd_error_code_et = 0x2101;
 pub const MCD_ERR_TXLIST_TX: mcd_error_code_et = 0x2102;
 
 pub const MCD_NOTUSED_ID: u32 = 0;
+
+pub const MCD_MEM_SPACE_NAME_LEN: usize = 32;
+pub const MCD_MEM_SPACE_IS_REGISTERS: u32 = 0x01;
+pub const MCD_MEM_SPACE_IS_VIRTUAL: u32 = 0x04;
+pub const MCD_MEM_SPACE_IS_CACHE: u32 = 0x08;
 
 pub const MCD_TX_AT_R: u32 = 1;
 pub const MCD_TX_AT_W: u32 = 2;
@@ -157,6 +163,23 @@ pub struct mcd_addr_st {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct mcd_memspace_st {
+    pub mem_space_id: u32,
+    pub mem_space_name: [c_char; MCD_MEM_SPACE_NAME_LEN],
+    pub mem_type: u32,
+    pub bits_per_mau: u32,
+    pub invariance: u8,
+    pub endian: u32,
+    pub min_addr: u64,
+    pub max_addr: u64,
+    pub num_mem_blocks: u32,
+    pub supported_access_options: u32,
+    pub core_mode_mask_read: u32,
+    pub core_mode_mask_write: u32,
+}
+
+#[repr(C)]
 #[derive(Debug)]
 pub struct mcd_tx_st {
     pub addr: mcd_addr_st,
@@ -210,6 +233,12 @@ pub type mcd_open_core_f = unsafe extern "C" fn(
     core: *mut *mut mcd_core_st,
 ) -> mcd_return_et;
 pub type mcd_close_core_f = unsafe extern "C" fn(core: *const mcd_core_st) -> mcd_return_et;
+pub type mcd_qry_mem_spaces_f = unsafe extern "C" fn(
+    core: *const mcd_core_st,
+    start_index: u32,
+    num_mem_spaces: *mut u32,
+    mem_spaces: *mut mcd_memspace_st,
+) -> mcd_return_et;
 pub type mcd_qry_error_info_f =
     unsafe extern "C" fn(core: *const mcd_core_st, error_info: *mut mcd_error_info_st);
 pub type mcd_qry_max_payload_size_f =
@@ -236,6 +265,8 @@ pub struct McdFunctions {
     pub qry_cores: mcd_qry_cores_f,
     pub open_core: mcd_open_core_f,
     pub close_core: mcd_close_core_f,
+    /// Optional: without it the probe uses memory space 0.
+    pub qry_mem_spaces: Option<mcd_qry_mem_spaces_f>,
     pub qry_error_info: mcd_qry_error_info_f,
     pub qry_max_payload_size: mcd_qry_max_payload_size_f,
     pub execute_txlist: mcd_execute_txlist_f,
@@ -264,6 +295,7 @@ impl McdFunctions {
                 qry_cores: *library.get(b"mcd_qry_cores_f\0")?,
                 open_core: *library.get(b"mcd_open_core_f\0")?,
                 close_core: *library.get(b"mcd_close_core_f\0")?,
+                qry_mem_spaces: library.get(b"mcd_qry_mem_spaces_f\0").ok().map(|f| *f),
                 qry_error_info: *library.get(b"mcd_qry_error_info_f\0")?,
                 qry_max_payload_size: *library.get(b"mcd_qry_max_payload_size_f\0")?,
                 execute_txlist: *library.get(b"mcd_execute_txlist_f\0")?,
@@ -316,6 +348,9 @@ mod tests {
         assert_eq!(size_of::<mcd_error_info_st>(), 268);
         assert_eq!(size_of::<mcd_core_con_info_st>(), 596);
         assert_eq!(offset_of!(mcd_core_con_info_st, device_type), 452);
+        assert_eq!(size_of::<mcd_memspace_st>(), 88);
+        assert_eq!(offset_of!(mcd_memspace_st, endian), 48);
+        assert_eq!(offset_of!(mcd_memspace_st, min_addr), 56);
         assert_eq!(size_of::<mcd_addr_st>(), 24);
         assert_eq!(size_of::<mcd_tx_st>(), 56);
         assert_eq!(offset_of!(mcd_tx_st, data), 40);

@@ -26,6 +26,18 @@ struct Fake {
     resets: Vec<(u32, u32)>,
     last_error: (u32, String),
     open: bool,
+    /// The memory spaces of every core: (id, name, type). Transactions must use the first that
+    /// is not registers, a cache or virtual, or 0 without one.
+    spaces: Vec<(u32, &'static str, u32)>,
+}
+
+impl Fake {
+    fn device_space(&self) -> u32 {
+        self.spaces
+            .iter()
+            .find(|(_, _, mem_type)| mem_type & 0xD == 0)
+            .map_or(0, |(id, ..)| *id)
+    }
 }
 
 static FAKE: Mutex<Option<Fake>> = Mutex::new(None);
@@ -89,55 +101,113 @@ unsafe extern "C" fn close_server(_server: *const mcd_server_st) -> mcd_return_e
     0
 }
 
+/// Answers a list query of the MCD API from `entries`: a count of 0 asks for their number.
+unsafe fn answer<T: Copy>(
+    entries: &[T],
+    start: u32,
+    count: *mut u32,
+    out: *mut T,
+) -> mcd_return_et {
+    unsafe {
+        if *count == 0 {
+            *count = entries.len() as u32;
+            return 0;
+        }
+        let rest = entries.get(start as usize..).unwrap_or_default();
+        let n = rest.len().min(*count as usize);
+        std::ptr::copy_nonoverlapping(rest.as_ptr(), out, n);
+        *count = n as u32;
+    }
+    0
+}
+
+/// The devices of the fake server: (device, access hardware, JTAG ID, number of cores).
+const DEVICES: [(&str, &str, u32, usize); 2] = [
+    ("TC27x", "DAS JTAG AURDUINO 46YPEADW", JTAG_ID, 3),
+    ("TC36x", "DAS JTAG TriBoard 0815", 0x1020_6083, 2),
+];
+
 unsafe extern "C" fn qry_systems(
-    _start: u32,
+    start: u32,
     count: *mut u32,
     info: *mut mcd_core_con_info_st,
 ) -> mcd_return_et {
-    unsafe {
-        set_c_string(&mut (*info).system, b"Real HW");
-        *count = 1;
-    }
-    0
+    let mut system: mcd_core_con_info_st = zeroed();
+    set_c_string(&mut system.system, b"Real HW");
+    unsafe { answer(&[system], start, count, info) }
 }
 
 unsafe extern "C" fn qry_devices(
     _system: *const mcd_core_con_info_st,
-    _start: u32,
+    start: u32,
     count: *mut u32,
     info: *mut mcd_core_con_info_st,
 ) -> mcd_return_et {
-    unsafe {
-        set_c_string(&mut (*info).device, b"TC27x");
-        set_c_string(&mut (*info).acc_hw, b"DAS JTAG AURDUINO");
-        (*info).device_type = JTAG_ID;
-        *count = 1;
-    }
-    0
+    let devices = DEVICES.map(|(name, acc_hw, jtag_id, _)| {
+        let mut device: mcd_core_con_info_st = zeroed();
+        set_c_string(&mut device.system, b"Real HW");
+        set_c_string(&mut device.device, name.as_bytes());
+        set_c_string(&mut device.acc_hw, acc_hw.as_bytes());
+        device.device_type = jtag_id;
+        device
+    });
+    unsafe { answer(&devices, start, count, info) }
 }
 
 unsafe extern "C" fn qry_cores(
     device: *const mcd_core_con_info_st,
-    _start: u32,
+    start: u32,
     count: *mut u32,
     info: *mut mcd_core_con_info_st,
 ) -> mcd_return_et {
-    unsafe {
-        *info = *device;
-        set_c_string(&mut (*info).core, b"Core 0: CPU0 TriCore 1.6E");
-        (*info).core_type = 44;
-        *count = 1;
-    }
-    0
+    let device = unsafe { *device };
+    let name = c_string(&device.device);
+    let (.., cores) = DEVICES.iter().find(|d| d.0 == name).unwrap();
+    let cores = (0..*cores)
+        .map(|i| {
+            let mut core = device;
+            let kind = if i == 0 { "1.6E" } else { "1.6P" };
+            set_c_string(
+                &mut core.core,
+                format!("Core {i}: CPU{i} TriCore {kind}").as_bytes(),
+            );
+            core.core_id = i as u32;
+            core.core_type = 44;
+            core
+        })
+        .collect::<Vec<_>>();
+    unsafe { answer(&cores, start, count, info) }
+}
+
+unsafe extern "C" fn qry_mem_spaces(
+    _core: *const mcd_core_st,
+    start: u32,
+    count: *mut u32,
+    out: *mut mcd_memspace_st,
+) -> mcd_return_et {
+    let spaces = with(|s| s.spaces.clone())
+        .into_iter()
+        .map(|(id, name, mem_type)| {
+            let mut space: mcd_memspace_st = zeroed();
+            space.mem_space_id = id;
+            set_c_string(&mut space.mem_space_name, name.as_bytes());
+            space.mem_type = mem_type;
+            space.max_addr = 0xFFFF_FFFF;
+            space
+        })
+        .collect::<Vec<_>>();
+    unsafe { answer(&spaces, start, count, out) }
 }
 
 unsafe extern "C" fn open_core(
     info: *const mcd_core_con_info_st,
     core: *mut *mut mcd_core_st,
 ) -> mcd_return_et {
+    let name = c_string(unsafe { &(*info).core });
+    let device = c_string(unsafe { &(*info).device });
     with(|s| {
         s.open = true;
-        s.calls.push("open_core".into());
+        s.calls.push(format!("open_core {device} {name}"));
     });
     // Like a library, the fake owns the core object; the tests leak it.
     let info: &'static mcd_core_con_info_st = Box::leak(Box::new(unsafe { *info }));
@@ -189,7 +259,7 @@ unsafe extern "C" fn execute_txlist(
             assert_eq!(tx.access_width as u32, tx.num_bytes);
         }
         let address = tx.addr.address;
-        if tx.addr.mem_space_id != 0 {
+        if tx.addr.mem_space_id != with(|s| s.device_space()) {
             return fail(MCD_ERR_TXLIST_TX, "unknown memory space");
         }
         if tx.access_type == MCD_TX_AT_R {
@@ -243,6 +313,7 @@ const FUNCTIONS: McdFunctions = McdFunctions {
     qry_cores,
     open_core,
     close_core,
+    qry_mem_spaces: Some(qry_mem_spaces),
     qry_error_info,
     qry_max_payload_size,
     execute_txlist,
@@ -250,15 +321,19 @@ const FUNCTIONS: McdFunctions = McdFunctions {
     rst,
 };
 
-/// Sets up a fresh fake library and a probe for it.
+/// Sets up a fresh fake library and a probe for it, with `config` as in a selector.
 fn probe(config: &str) -> (MutexGuard<'static, ()>, McdProbe) {
+    probe_with(config, FUNCTIONS)
+}
+
+fn probe_with(config: &str, functions: McdFunctions) -> (MutexGuard<'static, ()>, McdProbe) {
     let guard = TEST.lock().unwrap_or_else(|e| e.into_inner());
-    *fake() = Some(Fake::default());
-    let endpoint = McdEndpoint {
-        library: "fake.dll".into(),
-        config: config.into(),
-    };
-    (guard, McdProbe::with_functions(endpoint, FUNCTIONS))
+    *fake() = Some(Fake {
+        spaces: vec![(0, "Code and Data", 0)],
+        ..Fake::default()
+    });
+    let endpoint = McdEndpoint::parse(&format!("fake.dll|{config}"), |_| None).unwrap();
+    (guard, McdProbe::with_functions(endpoint, functions))
 }
 
 #[test]
@@ -269,6 +344,7 @@ fn endpoints_are_parsed() {
         McdEndpoint {
             library: r"C:\tools\mcd_tas.dll".into(),
             config: String::new(),
+            target: McdTarget::default(),
         }
     );
     let endpoint = McdEndpoint::parse(
@@ -293,10 +369,50 @@ fn endpoints_are_parsed() {
         McdEndpoint {
             library: "from_env.dll".into(),
             config: "McdHostName=env".into(),
+            target: McdTarget::default(),
         }
     );
     // An explicit, even empty, configuration wins over the environment.
     assert_eq!(McdEndpoint::parse("x.dll|", env).unwrap().config, "");
+}
+
+#[test]
+fn the_probe_keys_are_taken_out_of_the_configuration() {
+    let none = |_: &str| None;
+    let endpoint = McdEndpoint::parse(
+        "x.dll|McdHostName=box proBeRsDevice=TriBoard McdServerPort=1 ProbeRsCore=2",
+        none,
+    )
+    .unwrap();
+    assert_eq!(endpoint.config, "McdHostName=box McdServerPort=1");
+    assert_eq!(
+        endpoint.target,
+        McdTarget {
+            system: None,
+            device: Some(McdPick::Name("TriBoard".into())),
+            core: Some(McdPick::Index(2)),
+        }
+    );
+    assert_eq!(
+        endpoint.serial(),
+        "x.dll|McdHostName=box McdServerPort=1 ProbeRsDevice=TriBoard ProbeRsCore=2"
+    );
+    assert_eq!(
+        McdEndpoint::parse(&endpoint.serial(), none).unwrap(),
+        endpoint
+    );
+
+    // The keys alone, without case; a key without a value is refused.
+    let endpoint = McdEndpoint::parse("x.dll|PROBERSSYSTEM=0", none).unwrap();
+    assert_eq!(endpoint.config, "");
+    assert_eq!(endpoint.target.system, Some(McdPick::Index(0)));
+    assert_eq!(endpoint.serial(), "x.dll|ProbeRsSystem=0");
+    let error = McdEndpoint::parse("x.dll|ProbeRsCore=", none).unwrap_err();
+    assert!(error.contains("ProbeRsCore"), "{error}");
+
+    // A configuration without them is passed on as written.
+    let endpoint = McdEndpoint::parse("x.dll|A=1   B=2", none).unwrap();
+    assert_eq!(endpoint.config, "A=1   B=2");
 }
 
 #[test]
@@ -324,7 +440,7 @@ fn attach_opens_the_first_core_and_moves_memory() {
     assert!(probe.try_as_tricore_bus().is_none());
     probe.attach().unwrap();
     assert_eq!(probe.core_name(), "Core 0: CPU0 TriCore 1.6E");
-    assert_eq!(probe.access_hardware(), "DAS JTAG AURDUINO");
+    assert_eq!(probe.access_hardware(), "DAS JTAG AURDUINO 46YPEADW");
     assert_eq!(probe.jtag_id().unwrap(), JTAG_ID);
     assert_eq!(
         probe.limits(),
@@ -356,7 +472,7 @@ fn attach_opens_the_first_core_and_moves_memory() {
         [
             "initialize",
             "open_server McdHostName=localhost",
-            "open_core",
+            "open_core TC27x Core 0: CPU0 TriCore 1.6E",
             "close_core",
             "close_server",
             "exit"
@@ -368,7 +484,8 @@ fn attach_opens_the_first_core_and_moves_memory() {
 fn a_failed_read_stops_the_batch() {
     let (_guard, mut probe) = probe("");
     probe.attach().unwrap();
-    assert_eq!(with(|s| s.calls[1].clone()), "open_server <none>");
+    // An empty string, not NULL: the Infineon library reads the string.
+    assert_eq!(with(|s| s.calls[1].clone()), "open_server ");
 
     let mut transfers = [
         BusTransfer::read(AddressMap::Target, 0xA021_BFF8, 8),
@@ -425,4 +542,101 @@ fn a_dropped_probe_closes_the_library() {
     drop(probe);
     assert!(!with(|s| s.open));
     assert_eq!(with(|s| s.calls.last().cloned()).as_deref(), Some("exit"));
+}
+
+#[test]
+fn the_configuration_picks_the_device_and_the_core() {
+    let (_guard, mut probe) = probe("ProbeRsDevice=triboard ProbeRsCore=1");
+    probe.attach().unwrap();
+    assert_eq!(probe.core_name(), "Core 1: CPU1 TriCore 1.6P");
+    assert_eq!(probe.access_hardware(), "DAS JTAG TriBoard 0815");
+    assert_eq!(probe.jtag_id().unwrap(), 0x1020_6083);
+    // The library does not see the probe's keys.
+    assert_eq!(
+        with(|s| s.calls[1..3].to_vec()),
+        ["open_server ", "open_core TC36x Core 1: CPU1 TriCore 1.6P"]
+    );
+}
+
+#[test]
+fn a_missing_core_names_the_cores_there_are() {
+    let (_guard, mut probe) = probe("ProbeRsCore=CPU7");
+    let error = messages(&probe.attach().unwrap_err());
+    assert!(error.contains("no core 'CPU7'"), "{error}");
+    assert!(
+        error.contains("0 = Core 0: CPU0 TriCore 1.6E, 1 = Core 1: CPU1 TriCore 1.6P"),
+        "{error}"
+    );
+    // The failed attach closed the library again.
+    assert!(!with(|s| s.open));
+    assert_eq!(with(|s| s.calls.last().cloned()).as_deref(), Some("exit"));
+}
+
+#[test]
+fn a_device_index_past_the_end_is_refused() {
+    let (_guard, mut probe) = probe("ProbeRsDevice=2");
+    let error = messages(&probe.attach().unwrap_err());
+    assert!(error.contains("no device '2'"), "{error}");
+    assert!(
+        error.contains("1 = TC36x / DAS JTAG TriBoard 0815"),
+        "{error}"
+    );
+}
+
+/// The messages of an error and its sources.
+fn messages(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        text = format!("{text}: {error}");
+        source = error.source();
+    }
+    text
+}
+
+#[test]
+fn transactions_use_the_memory_space_of_the_device_memory() {
+    let (_guard, mut probe) = probe("");
+    with(|s| s.spaces = vec![(1, "Registers", 0x1), (4, "Cache", 0x8), (7, "AM0", 0x10)]);
+    probe.attach().unwrap();
+    probe.write_u32(AddressMap::Target, 0x7000_0000, 5).unwrap();
+    assert_eq!(probe.read_u32(AddressMap::Target, 0x7000_0000).unwrap(), 5);
+}
+
+#[test]
+fn a_library_without_memory_spaces_gets_space_0() {
+    let functions = McdFunctions {
+        qry_mem_spaces: None,
+        ..FUNCTIONS
+    };
+    let (_guard, mut probe) = probe_with("", functions);
+    with(|s| s.spaces.clear());
+    probe.attach().unwrap();
+    assert_eq!(probe.read_u32(AddressMap::Target, 0x7000_0000).unwrap(), 0);
+}
+
+#[test]
+fn the_inventory_lists_every_core_and_closes_again() {
+    let (_guard, mut probe) = probe("ProbeRsCore=9");
+    let entries = probe.inventory().unwrap();
+    assert_eq!(entries.len(), 5);
+    assert_eq!(entries[0].indices, (0, 0, 0));
+    assert_eq!(entries[4].indices, (0, 1, 1));
+    assert_eq!(entries[4].core, "Core 1: CPU1 TriCore 1.6P");
+    assert_eq!(entries[4].device, "TC36x");
+    assert_eq!(entries[4].access_hardware, "DAS JTAG TriBoard 0815");
+    assert_eq!(entries[4].jtag_id, 0x1020_6083);
+    assert_eq!(
+        entries[0].memory_spaces,
+        Ok(vec![McdMemorySpace {
+            id: 0,
+            name: "Code and Data".into(),
+            mem_type: 0,
+            device_memory: true,
+        }])
+    );
+    assert!(!with(|s| s.open));
+    assert_eq!(with(|s| s.calls.last().cloned()).as_deref(), Some("exit"));
+    // The probe still attaches afterwards (and the bad pick of its own target shows then).
+    assert!(probe.attach().is_err());
 }
