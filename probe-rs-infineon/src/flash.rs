@@ -29,11 +29,8 @@ use std::{
 use base64::Engine as _;
 
 use probe_rs::{
-    Error, MemoryInterface, RegisterId, Session,
-    architecture::tricore::{
-        bus::TriCoreError,
-        registers::{CSFR_A0, CSFR_ICR, CSFR_PC, TRICORE_CORE_REGISTERS},
-    },
+    CoreStatus, Error, MemoryInterface, RegisterId, Session,
+    architecture::tricore::registers::{CSFR_A0, CSFR_ICR, CSFR_PC, TRICORE_CORE_REGISTERS},
     flashing::{DebugFlashSequence, FlashLayout, FlashPage},
 };
 use probe_rs_target::NvmRegion;
@@ -699,15 +696,11 @@ impl AurixFlash {
         let mut running = Vec::new();
         for id in 0..session.list_cores().len() {
             let mut core = session.core(id)?;
-            let was_running = !core.core_halted()?;
+            // A core the application has not started (boot halt) sleeps: the halt leaves it as
+            // it is, and it is not run afterwards.
+            running.push(core.status()? == CoreStatus::Running);
             // The application may reset the device when a core stops answering.
-            match core.halt(Duration::from_millis(500)) {
-                Ok(_) => running.push(was_running),
-                // A core the application has not started runs no code: nothing to stop, and
-                // nothing to run again afterwards.
-                Err(Error::TriCore(TriCoreError::CoreInBootHalt(_))) => running.push(false),
-                Err(error) => return Err(error),
-            }
+            core.halt(Duration::from_millis(500))?;
         }
 
         let mut core = session.core(0)?;

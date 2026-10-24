@@ -77,15 +77,22 @@ fn main() -> Result<()> {
     for (index, (_, dspr)) in CORES.iter().enumerate() {
         let mut core = session.core(index)?;
         let before = core.status()?;
-        let info = match core.halt(Duration::from_millis(500)) {
-            Ok(info) => info,
-            Err(Error::TriCore(error @ TriCoreError::CoreInBootHalt(_))) => {
-                let pc: u32 = core.read_core_reg(RegisterId(CSFR_PC))?;
-                println!("[SKIP] CPU{index}: {error} (PC {pc:#010x})");
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
+        if before == CoreStatus::Sleeping {
+            // Boot halt: the application has not started the core. A halt leaves it sleeping,
+            // a step is refused, and its registers can be read.
+            let halt = core.halt(Duration::from_millis(500)).is_ok();
+            let still = core.status()? == CoreStatus::Sleeping;
+            let step = core.step();
+            let pc: u32 = core.read_core_reg(RegisterId(CSFR_PC))?;
+            report.check(
+                &format!("CPU{index} in boot halt"),
+                halt && still
+                    && matches!(step, Err(Error::TriCore(TriCoreError::CoreInBootHalt(_)))),
+                format!("sleeping, halt leaves it, step refused, PC {pc:#010x}"),
+            );
+            continue;
+        }
+        let info = core.halt(Duration::from_millis(500))?;
         let halted = core.status()? == CoreStatus::Halted(HaltReason::Request);
         report.check(
             &format!("CPU{index} halt"),

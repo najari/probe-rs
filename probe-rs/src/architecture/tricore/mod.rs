@@ -430,8 +430,9 @@ struct GroupState {
     own_dbgsr: u32,
 }
 
-/// (`DBGSR`, system timer, PC) of a core, as one status check reads them.
-type CoreStatusRead = (u32, Option<u64>, u32);
+/// (`DBGSR`, system timer, PC, boot halt: `SYSCON.BHALT`) of a core, as one status check reads
+/// them.
+type CoreStatusRead = (u32, Option<u64>, u32, bool);
 
 /// The status registers of the TriCore cores of a device, read in one request for the status
 /// checks of several cores (one debug session for several cores, see [`prefetch_status`]).
@@ -442,6 +443,8 @@ pub(crate) struct StatusSnapshot {
     /// (core index, `DBGSR`, `CBS_TRCn`, `EXEVT`, PC, `DBGSR` read again at the end) of each
     /// core.
     cores: Vec<(u8, u32, u32, u32, u32, u32)>,
+    /// The cores in boot halt (`SYSCON.BHALT`).
+    boot_halt: Vec<u8>,
 }
 
 impl StatusSnapshot {
@@ -455,7 +458,7 @@ impl StatusSnapshot {
             .map(|&(peer, peer_dbgsr, peer_trc, _, _, _)| (peer, peer_trc, peer_dbgsr))
             .collect();
         Some((
-            (dbgsr, self.stm, pc),
+            (dbgsr, self.stm, pc, self.boot_halt.contains(&core)),
             GroupState {
                 trc,
                 exevt,
@@ -467,16 +470,16 @@ impl StatusSnapshot {
 }
 
 /// Reads the status of the TriCore cores `members` (core index, CSFR base) in one request:
-/// `DBGSR`, `CBS_TRCn`, `EXEVT` and the PC of each core, then `DBGSR` of each again, and the
-/// system timer at `stm0_tim0sv` last. Each core's own `DBGSR` read at the end comes after the
-/// reads of its peers, as [`TriCore::check_group`] needs it.
+/// `DBGSR`, `CBS_TRCn`, `EXEVT` and the PC of each core, then `DBGSR` of each again, the
+/// system timer at `stm0_tim0sv`, and `SYSCON` of each core last. Each core's own `DBGSR` read at
+/// the end comes after the reads of its peers, as [`TriCore::check_group`] needs it.
 pub(crate) fn prefetch_status(
     bus: &mut dyn TriCoreBusAccess,
     members: &[(u8, u32)],
     stm0_tim0sv: u32,
 ) -> Result<StatusSnapshot, TriCoreError> {
     const PER_CORE: usize = 4;
-    let mut transfers = Vec::with_capacity((PER_CORE + 1) * members.len() + 2);
+    let mut transfers = Vec::with_capacity((PER_CORE + 2) * members.len() + 2);
     for &(core, csfr_base) in members {
         transfers.push(BusTransfer::read(
             AddressMap::Target,
@@ -508,6 +511,13 @@ pub(crate) fn prefetch_status(
         stm0_tim0sv + ocds::STM0_CAPSV_OFFSET,
         4,
     ));
+    for &(_, csfr_base) in members {
+        transfers.push(BusTransfer::read(
+            AddressMap::Target,
+            csfr_base + registers::CSFR_SYSCON as u32,
+            4,
+        ));
+    }
     bus.execute(&mut transfers)?;
 
     let again = PER_CORE * members.len();
@@ -534,7 +544,18 @@ pub(crate) fn prefetch_status(
         (Ok(low), Ok(high)) => Some((high as u64) << 32 | low as u64),
         _ => None,
     };
-    Ok(StatusSnapshot { stm, cores })
+    let syscon_at = stm_at + 2;
+    let mut boot_halt = Vec::new();
+    for (i, &(core, _)) in members.iter().enumerate() {
+        if transfers[syscon_at + i].read_u32()? & registers::SYSCON_BHALT != 0 {
+            boot_halt.push(core);
+        }
+    }
+    Ok(StatusSnapshot {
+        stm,
+        cores,
+        boot_halt,
+    })
 }
 
 impl GroupState {
@@ -631,6 +652,12 @@ pub struct TriCoreCoreState {
     /// Set for the next run: the core runs alone, the halt group members it would run with stay
     /// halted (a debugger's single-thread continue). The members stay in `running_peers`.
     run_alone: bool,
+    /// The core is in boot halt (`SYSCON.BHALT`), as the last status check saw it: the
+    /// application has not started it. It runs no code and takes no halt request; it reports
+    /// as sleeping, a halt of it succeeds at once, and a run leaves it as it is.
+    boot_halt: bool,
+    /// Whether the user was told about the boot halt.
+    boot_halt_noted: bool,
 }
 
 impl TriCoreCoreState {
@@ -664,6 +691,8 @@ impl TriCoreCoreState {
             prefetched: None,
             halt_mark: None,
             run_alone: false,
+            boot_halt: false,
+            boot_halt_noted: false,
         }
     }
 
@@ -1308,7 +1337,7 @@ impl<'probe> TriCore<'probe> {
         Ok(())
     }
 
-    /// `DBGSR`, the system timer (when it can be read) and the PC, in one request.
+    /// `DBGSR`, the system timer (when it can be read), the PC and the boot halt, in one request.
     fn read_status(&mut self) -> Result<CoreStatusRead, TriCoreError> {
         let tim0sv = self.sequence.stm0_tim0sv();
         let mut transfers = [
@@ -1316,6 +1345,7 @@ impl<'probe> TriCore<'probe> {
             BusTransfer::read(AddressMap::Target, self.csfr(registers::CSFR_PC), 4),
             BusTransfer::read(AddressMap::Target, tim0sv, 4),
             BusTransfer::read(AddressMap::Target, tim0sv + ocds::STM0_CAPSV_OFFSET, 4),
+            BusTransfer::read(AddressMap::Target, self.csfr(registers::CSFR_SYSCON), 4),
         ];
         self.bus().execute(&mut transfers)?;
         let dbgsr = transfers[0].read_u32()?;
@@ -1324,7 +1354,8 @@ impl<'probe> TriCore<'probe> {
             (Ok(low), Ok(high)) => Some((high as u64) << 32 | low as u64),
             _ => None,
         };
-        Ok((dbgsr, stm, pc))
+        let boot_halt = transfers[4].read_u32()? & registers::SYSCON_BHALT != 0;
+        Ok((dbgsr, stm, pc, boot_halt))
     }
 
     /// Notes `DBGSR` and the PC of the halt the core is in: a later status check that finds
@@ -1446,7 +1477,7 @@ impl<'probe> TriCore<'probe> {
             Some((status, group)) => (Some(status), Some(group)),
             None => (None, None),
         };
-        let (mut dbgsr, stm, mut pc) = match status {
+        let (mut dbgsr, stm, mut pc, boot_halt) = match status {
             Some(status) => status,
             None => self.read_status()?,
         };
@@ -1470,6 +1501,7 @@ impl<'probe> TriCore<'probe> {
             }
         }
         let halted = ocds::is_halted(dbgsr);
+        self.note_boot_halt(!halted && boot_halt);
         // A core halted at both checks that ran in between: the halt group or another session
         // ran it, and it halted again before this check (at its own breakpoint, for example).
         // Its debug status or PC are not those of the halt seen last.
@@ -1552,9 +1584,28 @@ impl<'probe> TriCore<'probe> {
         Ok(())
     }
 
+    /// Notes whether the core is in boot halt, and tells the user once.
+    fn note_boot_halt(&mut self, boot_halt: bool) {
+        self.state.boot_halt = boot_halt;
+        if boot_halt && !std::mem::replace(&mut self.state.boot_halt_noted, true) {
+            let notice = format!(
+                "TriCore core {} is in boot halt (SYSCON.BHALT): the application has not started \
+                 it. It shows as sleeping and runs no code until the application starts it.",
+                self.core()
+            );
+            tracing::info!("{notice}");
+            self.state.notices.push(notice);
+        }
+    }
+
     fn halt_core(&mut self, timeout: Duration) -> Result<(), TriCoreError> {
         if self.update_halted()? {
             return self.halt_group_members();
+        }
+        // A core in boot halt runs no code: there is nothing to stop, and it takes no halt
+        // request. It stays as it is.
+        if self.state.boot_halt {
+            return Ok(());
         }
         self.state.last_action = LastAction::Halt;
         self.write_csfr(ocds::DBGSR, ocds::DBGSR_HALT)?;
@@ -1565,9 +1616,6 @@ impl<'probe> TriCore<'probe> {
                 return self.halt_group_members();
             }
             if start.elapsed() > timeout {
-                if self.read_csfr(registers::CSFR_SYSCON)? & registers::SYSCON_BHALT != 0 {
-                    return Err(TriCoreError::CoreInBootHalt(self.core()));
-                }
                 let dbgsr = self.dbgsr()?;
                 return Err(TriCoreError::CoreDidNotHalt {
                     core: self.core(),
@@ -1621,6 +1669,9 @@ impl<'probe> TriCore<'probe> {
     fn step_core(&mut self) -> Result<(), TriCoreError> {
         let dbgsr = self.dbgsr()?;
         if !ocds::is_halted(dbgsr) {
+            if self.state.boot_halt {
+                return Err(TriCoreError::CoreInBootHalt(self.core()));
+            }
             return Err(TriCoreError::NotHalted(self.core()));
         }
         self.take_triggers()?;
@@ -2467,6 +2518,8 @@ impl CoreInterface for TriCore<'_> {
             Ok(CoreStatus::Halted(
                 self.state.halt_reason.unwrap_or(HaltReason::Unknown),
             ))
+        } else if self.state.boot_halt {
+            Ok(CoreStatus::Sleeping)
         } else {
             Ok(CoreStatus::Running)
         }

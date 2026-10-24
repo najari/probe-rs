@@ -2003,6 +2003,14 @@ impl DebugAdapter {
         let core_index = core_data.core_index;
         core_data.invalidate_stack_frame_cache();
         let cpu_info = backend.halt(core_index, Duration::from_millis(500)).await?;
+        // A core can take a halt without halting: an AURIX core that the application has not
+        // started yet (boot halt) runs no code and stays as it is. Report that instead of a stop
+        // whose stack trace the core then refuses.
+        let status = backend.status(core_index).await?;
+        if status == CoreStatus::Sleeping {
+            let description = status.short_long_status(backend, None, false).await.1;
+            return Err(anyhow!("Core {core_index} was not paused: {description}"));
+        }
         let new_status = CoreStatus::Halted(HaltReason::Request);
         let description = new_status
             .short_long_status(backend, Some(cpu_info.pc), false)

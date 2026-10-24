@@ -357,7 +357,8 @@ pub enum TriCoreError {
         dbgsr: u32,
     },
 
-    /// Core {0} is in boot halt (SYSCON.BHALT): the application has not started it.
+    /// Core {0} is in boot halt (SYSCON.BHALT): the application has not started it, it cannot
+    /// be stepped.
     CoreInBootHalt(u8),
 
     /// Core {core} did not start running (DBGSR = {dbgsr:#010x}).

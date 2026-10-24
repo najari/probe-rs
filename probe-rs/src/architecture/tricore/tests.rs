@@ -269,6 +269,46 @@ fn core<'a>(bus: &'a mut FakeBus, state: &'a mut TriCoreCoreState) -> TriCore<'a
 }
 
 #[test]
+fn a_core_in_boot_halt_sleeps_and_is_left_alone() {
+    // The application has not started the core: SYSCON.BHALT is set, DBGSR reads as running.
+    let mut bus = FakeBus::new();
+    bus.set_word(
+        CSFR_BASE + registers::CSFR_SYSCON as u32,
+        registers::SYSCON_BHALT,
+    );
+    let mut state = TriCoreCoreState::new();
+    let mut cpu = core(&mut bus, &mut state);
+    assert_eq!(cpu.status().unwrap(), CoreStatus::Sleeping);
+    // A halt succeeds at once, without a halt request; a run leaves the core as it is.
+    cpu.halt(Duration::from_millis(100)).unwrap();
+    assert_eq!(cpu.status().unwrap(), CoreStatus::Sleeping);
+    cpu.run().unwrap();
+    assert!(matches!(
+        cpu.step(),
+        Err(Error::TriCore(TriCoreError::CoreInBootHalt(0)))
+    ));
+    drop(cpu);
+    assert!(
+        !bus.write_words()
+            .iter()
+            .any(|&(address, _)| address == CSFR_BASE + ocds::DBGSR as u32),
+        "no DBGSR write"
+    );
+    let notices = state.take_notices();
+    assert!(
+        notices.len() == 1 && notices[0].contains("boot halt"),
+        "{notices:?}"
+    );
+
+    // The application starts the core: it runs.
+    bus.set_word(CSFR_BASE + registers::CSFR_SYSCON as u32, 0);
+    assert_eq!(
+        core(&mut bus, &mut state).status().unwrap(),
+        CoreStatus::Running
+    );
+}
+
+#[test]
 fn halt_writes_dbgsr_and_reports_a_request() {
     let mut bus = FakeBus::new();
     let mut state = TriCoreCoreState::new();
@@ -670,6 +710,7 @@ fn a_batch_read_during_a_pause_keeps_the_members_to_run() {
     let exevt = bus.word(CSFR_BASE + ocds::EXEVT as u32);
     state.set_prefetched(Some(StatusSnapshot {
         stm: None,
+        boot_halt: Vec::new(),
         cores: vec![
             (0, 0x0000, trc, exevt, 0x8000_0100, 0x0002),
             (
