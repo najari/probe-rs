@@ -11,7 +11,8 @@ use crate::cmd::dap_server::{
     debug_adapter::dap::{
         adapter::{DebugAdapter, get_arguments},
         core_routing::{
-            FAN_OUT, data_breakpoints_of_core, merge_data_breakpoints, merge_responses,
+            FAN_OUT, data_breakpoints_of_core, instruction_breakpoints_of_core,
+            merge_data_breakpoints, merge_instruction_breakpoints, merge_responses,
         },
         dap_types::{
             Capabilities, DisconnectResponse, Event, ExitedEventBody, InitializeRequestArguments,
@@ -288,15 +289,21 @@ impl Debugger {
         };
         let mut status = DebugSessionStatus::Continue(Duration::ZERO);
         let mut responses = Vec::new();
-        // The data breakpoints of each core, and where they stand in the request.
-        let mut data_breakpoint_slots = HashMap::new();
+        // The data or instruction breakpoints of each core, and where they stand in the request.
+        let mut breakpoint_slots = HashMap::new();
         for core in cores {
-            let core_request = if request.command == "setDataBreakpoints" {
-                let (core_request, slots) = data_breakpoints_of_core(request, core, focus);
-                data_breakpoint_slots.insert(core, slots);
-                core_request
-            } else {
-                request.clone()
+            let core_request = match request.command.as_str() {
+                "setDataBreakpoints" => {
+                    let (core_request, slots) = data_breakpoints_of_core(request, core, focus);
+                    breakpoint_slots.insert(core, slots);
+                    core_request
+                }
+                "setInstructionBreakpoints" => {
+                    let (core_request, slots) = instruction_breakpoints_of_core(request, core);
+                    breakpoint_slots.insert(core, slots);
+                    core_request
+                }
+                _ => request.clone(),
             };
             {
                 let mut routing = debug_adapter.routing();
@@ -315,10 +322,12 @@ impl Debugger {
             responses.extend(captured.into_iter().map(|response| (core, response)));
         }
 
-        let merged = if request.command == "setDataBreakpoints" {
-            merge_data_breakpoints(request, responses, &data_breakpoint_slots)
-        } else {
-            merge_responses(&request.command, responses)
+        let merged = match request.command.as_str() {
+            "setDataBreakpoints" => merge_data_breakpoints(request, responses, &breakpoint_slots),
+            "setInstructionBreakpoints" => {
+                merge_instruction_breakpoints(request, responses, &breakpoint_slots)
+            }
+            _ => merge_responses(&request.command, responses),
         };
         if let Some(response) = merged {
             debug_adapter

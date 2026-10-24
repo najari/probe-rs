@@ -207,6 +207,11 @@ impl CoreRouting {
             "stackTrace" => {
                 for frame in array(body, "stackFrames") {
                     note(frame.get("id"));
+                    // A `disassemble` or instruction breakpoint at the frame's instruction
+                    // pointer goes to the core of the frame.
+                    if let Value::Object(object) = frame {
+                        tag(object, "instructionPointerReference");
+                    }
                 }
             }
             "scopes" => {
@@ -327,7 +332,7 @@ pub(crate) fn merge_responses(
     {
         return Some(failure.clone());
     }
-    if !matches!(command, "setBreakpoints" | "setInstructionBreakpoints") {
+    if command != "setBreakpoints" {
         return Some(first);
     }
 
@@ -337,58 +342,143 @@ pub(crate) fn merge_responses(
         .collect::<Vec<_>>();
     let per_core = succeeded
         .iter()
-        .map(|(core, r)| {
-            let breakpoints = r
-                .body
-                .as_ref()
-                .and_then(|b| b.get("breakpoints"))
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            (*core, breakpoints)
-        })
+        .map(|(core, r)| (*core, breakpoints_of(r)))
         .collect::<Vec<_>>();
     let count = per_core.iter().map(|(_, b)| b.len()).max().unwrap_or(0);
     let merged = (0..count)
         .map(|i| {
-            let verified_on = per_core
-                .iter()
-                .filter(|(_, b)| {
-                    b.get(i)
-                        .and_then(|bp| bp.get("verified"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                })
-                .map(|(core, _)| *core)
-                .collect::<Vec<_>>();
-            let source = per_core
-                .iter()
-                .find(|(core, _)| verified_on.first() == Some(core))
-                .or_else(|| per_core.first())
-                .and_then(|(_, b)| b.get(i))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let mut breakpoint = source;
-            if !verified_on.is_empty()
-                && let Value::Object(object) = &mut breakpoint
-            {
-                let cores = verified_on
+            merge_breakpoint(
+                per_core
                     .iter()
-                    .map(usize::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let message = object
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(|m| format!("{m} (cores {cores})"))
-                    .unwrap_or_else(|| format!("Set on cores {cores}"));
-                object.insert("message".to_string(), Value::String(message));
-            }
-            breakpoint
+                    .filter_map(|(core, b)| Some((*core, b.get(i)?.clone())))
+                    .collect(),
+            )
         })
         .collect::<Vec<_>>();
 
     let mut response = succeeded.first().map(|(_, r)| r.clone()).unwrap_or(first);
+    response.body = Some(serde_json::json!({ "breakpoints": merged }));
+    Some(response)
+}
+
+/// The `breakpoints` of a breakpoint response.
+fn breakpoints_of(response: &Response) -> Vec<Value> {
+    response
+        .body
+        .as_ref()
+        .and_then(|b| b.get("breakpoints"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// One breakpoint from the answers of the cores that were asked to set it: the first core that
+/// verified it gives the entry, and its message names the cores that took it.
+fn merge_breakpoint(per_core: Vec<(usize, Value)>) -> Value {
+    let verified_on = per_core
+        .iter()
+        .filter(|(_, bp)| bp.get("verified").and_then(Value::as_bool).unwrap_or(false))
+        .map(|(core, _)| *core)
+        .collect::<Vec<_>>();
+    let mut breakpoint = per_core
+        .iter()
+        .find(|(core, _)| verified_on.first() == Some(core))
+        .or_else(|| per_core.first())
+        .map(|(_, bp)| bp.clone())
+        .unwrap_or(Value::Null);
+    if !verified_on.is_empty()
+        && let Value::Object(object) = &mut breakpoint
+    {
+        let cores = verified_on
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = object
+            .get("message")
+            .and_then(Value::as_str)
+            .map(|m| format!("{m} (cores {cores})"))
+            .unwrap_or_else(|| format!("Set on cores {cores}"));
+        object.insert("message".to_string(), Value::String(message));
+    }
+    breakpoint
+}
+
+/// The `setInstructionBreakpoints` request of one core: the breakpoints whose instruction
+/// reference names the core, or no core (those go to every core), with the suffix taken off,
+/// and the position of each in the request.
+pub(crate) fn instruction_breakpoints_of_core(
+    request: &Request,
+    core: usize,
+) -> (Request, Vec<usize>) {
+    let mut request = request.clone();
+    let mut slots = Vec::new();
+    if let Some(Value::Object(arguments)) = request.arguments.as_mut()
+        && let Some(Value::Array(breakpoints)) = arguments.get_mut("breakpoints")
+    {
+        let mut kept = Vec::new();
+        for (slot, mut breakpoint) in std::mem::take(breakpoints).into_iter().enumerate() {
+            let mut of_core = true;
+            if let Some(Value::String(reference)) = breakpoint.get_mut("instructionReference") {
+                let (address, suffix) = split_core(reference);
+                if let Some(suffix) = suffix {
+                    of_core = suffix == core;
+                    *reference = address.to_string();
+                }
+            }
+            if of_core {
+                slots.push(slot);
+                kept.push(breakpoint);
+            }
+        }
+        *breakpoints = kept;
+    }
+    (request, slots)
+}
+
+/// One `setInstructionBreakpoints` response from the responses of the cores: each breakpoint
+/// back at its position in the request, merged from the cores that were asked to set it.
+pub(crate) fn merge_instruction_breakpoints(
+    request: &Request,
+    responses: Vec<(usize, Response)>,
+    slots: &HashMap<usize, Vec<usize>>,
+) -> Option<Response> {
+    let count = request
+        .arguments
+        .as_ref()
+        .and_then(|a| a.get("breakpoints"))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if responses.iter().all(|(_, r)| !r.success) {
+        return responses.into_iter().next().map(|(_, r)| r);
+    }
+    let mut per_slot = vec![Vec::new(); count];
+    let mut base = None;
+    for (core, response) in responses.into_iter().filter(|(_, r)| r.success) {
+        for (breakpoint, &slot) in breakpoints_of(&response)
+            .into_iter()
+            .zip(slots.get(&core).into_iter().flatten())
+        {
+            if let Some(entries) = per_slot.get_mut(slot) {
+                entries.push((core, breakpoint));
+            }
+        }
+        base.get_or_insert(response);
+    }
+    let merged = per_slot
+        .into_iter()
+        .map(|entries| {
+            if entries.is_empty() {
+                serde_json::json!({
+                    "verified": false,
+                    "message": "The instruction reference names no core of this session",
+                })
+            } else {
+                merge_breakpoint(entries)
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut response = base?;
     response.body = Some(serde_json::json!({ "breakpoints": merged }));
     Some(response)
 }
@@ -811,6 +901,79 @@ mod tests {
         assert_eq!(breakpoints[0]["id"], 11);
         assert_eq!(breakpoints[1]["id"], 10);
         assert_eq!(breakpoints[2]["id"], 12);
+    }
+
+    #[test]
+    fn a_frame_names_its_core_in_its_instruction_pointer() {
+        let mut routing = routing(&[0, 1, 2]);
+        routing.set_current(Some(1));
+        let mut stack = response(
+            "stackTrace",
+            true,
+            json!({ "stackFrames": [{ "id": 11, "instructionPointerReference": "0x8003a552" }] }),
+        );
+        routing.observe_response(&mut stack);
+        let reference =
+            stack.body.unwrap()["stackFrames"][0]["instructionPointerReference"].clone();
+        assert_eq!(reference, "0x8003a552@1");
+
+        // A disassembly there goes to that core, without the suffix.
+        let (core, routed) = routing.route(&request(
+            "disassemble",
+            json!({ "memoryReference": reference, "instructionOffset": -24, "instructionCount": 80 }),
+        ));
+        assert_eq!(core, Some(1));
+        assert_eq!(routed.arguments.unwrap()["memoryReference"], "0x8003a552");
+    }
+
+    #[test]
+    fn instruction_breakpoints_go_to_the_core_of_their_reference_or_to_every_core() {
+        let request = request(
+            "setInstructionBreakpoints",
+            json!({ "breakpoints": [
+                { "instructionReference": "0x8021c028@1", "offset": 8 },
+                { "instructionReference": "0x8021c030" },
+                { "instructionReference": "0x8021c040@7" }
+            ] }),
+        );
+        let (core1, slots1) = instruction_breakpoints_of_core(&request, 1);
+        assert_eq!(slots1, vec![0, 1]);
+        let breakpoints = &core1.arguments.as_ref().unwrap()["breakpoints"];
+        assert_eq!(breakpoints[0]["instructionReference"], "0x8021c028");
+        assert_eq!(breakpoints[0]["offset"], 8);
+        let (core0, slots0) = instruction_breakpoints_of_core(&request, 0);
+        assert_eq!(slots0, vec![1]);
+        assert_eq!(
+            core0.arguments.as_ref().unwrap()["breakpoints"][0]["instructionReference"],
+            "0x8021c030"
+        );
+
+        let slots = HashMap::from([(0, slots0), (1, slots1)]);
+        let responses = vec![
+            (
+                0,
+                response(
+                    "setInstructionBreakpoints",
+                    true,
+                    json!({ "breakpoints": [{ "id": 20, "verified": true }] }),
+                ),
+            ),
+            (
+                1,
+                response(
+                    "setInstructionBreakpoints",
+                    true,
+                    json!({ "breakpoints": [{ "id": 10, "verified": true }, { "id": 21, "verified": true }] }),
+                ),
+            ),
+        ];
+        let merged = merge_instruction_breakpoints(&request, responses, &slots).unwrap();
+        let breakpoints = &merged.body.unwrap()["breakpoints"];
+        assert_eq!(breakpoints[0]["id"], 10);
+        assert_eq!(breakpoints[0]["message"], "Set on cores 1");
+        assert_eq!(breakpoints[1]["id"], 20);
+        assert_eq!(breakpoints[1]["message"], "Set on cores 0, 1");
+        assert_eq!(breakpoints[2]["verified"], false);
     }
 
     #[test]

@@ -1227,12 +1227,16 @@ impl DebugAdapter {
             core_data
                 .breakpoints
                 .retain(|ab| !matches!(ab.breakpoint_type, BreakpointType::InstructionBreakpoint));
+            // The breakpoint is `offset` bytes from the reference (VS Code's disassembly view
+            // gives the reference it disassembled from and the offset of the instruction).
             let parsed: Vec<Option<u64>> = requested
                 .iter()
                 .map(|rb| {
                     MemoryAddress::try_from(rb.instruction_reference.as_str())
                         .ok()
-                        .map(|MemoryAddress(addr)| addr)
+                        .and_then(|MemoryAddress(addr)| {
+                            addr.checked_add_signed(rb.offset.unwrap_or(0))
+                        })
                 })
                 .collect();
             (parsed, clear_addrs)
