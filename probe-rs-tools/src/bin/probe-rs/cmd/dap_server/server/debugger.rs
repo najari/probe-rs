@@ -995,10 +995,12 @@ impl Debugger {
                             "Performance counters of core {core_index} count from {} ({start:#010x}) to {} ({stop:#010x}).",
                             window.start, window.stop
                         ),
-                        Err(error) => format!("`perfWindow` is not available: {error}"),
+                        Err(error) => {
+                            format!("`perfWindow` of core {core_index} is not available: {error}")
+                        }
                     },
                     (Err(error), _) | (_, Err(error)) => {
-                        format!("`perfWindow` is ignored: {error}")
+                        format!("`perfWindow` of core {core_index} is ignored: {error}")
                     }
                 };
                 debug_adapter.log_to_console(message);
