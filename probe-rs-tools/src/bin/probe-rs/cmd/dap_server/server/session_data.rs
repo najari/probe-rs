@@ -299,12 +299,13 @@ impl SessionData {
         Ok(data.handle)
     }
 
-    /// The first RTT-enabled core configuration that matches a core of the
-    /// target, together with the server-side `RttClient` of that core.
-    async fn rtt_core<'config>(
+    /// Every RTT-enabled core configuration that matches a core of the
+    /// target, each with the server-side `RttClient` of its core.
+    async fn rtt_cores<'config>(
         &mut self,
         config: &'config SessionConfig,
-    ) -> Result<Option<(&'config CoreConfig, Key<RttClient>)>, DebuggerError> {
+    ) -> Result<Vec<(&'config CoreConfig, Key<RttClient>)>, DebuggerError> {
+        let mut cores = Vec::new();
         for core_config in config.core_configs.iter() {
             if !core_config.rtt_config.enabled {
                 continue;
@@ -321,19 +322,28 @@ impl SessionData {
                 .ensure_rtt_client(cd_idx, &core_config.rtt_config)
                 .await?;
 
-            return Ok(Some((core_config, rtt_key)));
+            cores.push((core_config, rtt_key));
         }
 
-        Ok(None)
+        Ok(cores)
     }
 
-    /// The server-side `RttClient` of the debugged core, or `None` when RTT is
-    /// disabled.
+    /// The server-side `RttClient` for a program download, or `None` when RTT
+    /// is disabled. It is the client of the core that runs `program_binary`;
+    /// without a match (or when the path is unknown) it is the first RTT core's.
     pub(crate) async fn rtt_client(
         &mut self,
         config: &SessionConfig,
+        program_binary: Option<&Path>,
     ) -> Result<Option<Key<RttClient>>, DebuggerError> {
-        Ok(self.rtt_core(config).await?.map(|(_, rtt_key)| rtt_key))
+        let cores = self.rtt_cores(config).await?;
+        let chosen = cores
+            .iter()
+            .find(|(core_config, _)| {
+                same_program(core_config.program_binary.as_deref(), program_binary)
+            })
+            .or_else(|| cores.first());
+        Ok(chosen.map(|(_, rtt_key)| *rtt_key))
     }
 
     /// Tell the RTT client which program the target holds, so that it knows
@@ -345,34 +355,33 @@ impl SessionData {
         &mut self,
         config: &SessionConfig,
     ) -> Result<(), DebuggerError> {
-        let Some((core_config, rtt_key)) = self.rtt_core(config).await? else {
-            return Ok(());
-        };
-        let Some(program_binary) = core_config.program_binary.clone() else {
-            return Ok(());
-        };
+        for (core_config, rtt_key) in self.rtt_cores(config).await? {
+            let Some(program_binary) = core_config.program_binary.clone() else {
+                continue;
+            };
 
-        // An image that probe-rs cannot load also cannot have written the
-        // control block, thus a failure here leaves clearing enabled.
-        if let Err(error) = self
-            .backend
-            .session_interface()
-            .build_flash_loader(
-                program_binary,
-                config.flashing_config.format_options.clone(),
-                None,
-                false,
-                Some(rtt_key),
-            )
-            .await
-        {
-            tracing::warn!("Failed to inspect the program binary for RTT: {error}");
+            // An image that probe-rs cannot load also cannot have written the
+            // control block, thus a failure here leaves clearing enabled.
+            if let Err(error) = self
+                .backend
+                .session_interface()
+                .build_flash_loader(
+                    program_binary,
+                    config.flashing_config.format_options.clone(),
+                    None,
+                    false,
+                    Some(rtt_key),
+                )
+                .await
+            {
+                tracing::warn!("Failed to inspect the program binary for RTT: {error}");
+            }
         }
 
         Ok(())
     }
 
-    /// Clear the stale RTT control block of the debugged core.
+    /// Clear the stale RTT control block of every RTT core of the session.
     ///
     /// This should be called while the core is halted, before a reset, to wipe
     /// stale RTT data from a previous debug session. After reset, the firmware
@@ -384,16 +393,16 @@ impl SessionData {
         &mut self,
         config: &SessionConfig,
     ) -> Result<(), DebuggerError> {
-        let Some(rtt_key) = self.rtt_client(config).await? else {
-            return Ok(());
-        };
+        for (_, rtt_key) in self.rtt_cores(config).await? {
+            self.backend
+                .session_interface()
+                .clear_rtt_control_block(rtt_key)
+                .await
+                .map_err(rpc_err)
+                .map_err(DebuggerError::ProbeRs)?;
+        }
 
-        self.backend
-            .session_interface()
-            .clear_rtt_control_block(rtt_key)
-            .await
-            .map_err(rpc_err)
-            .map_err(DebuggerError::ProbeRs)
+        Ok(())
     }
 
     /// Recompute source breakpoint addresses after a restart that flashed a
@@ -1142,4 +1151,44 @@ fn initialize_core_data(
         core_data_vec.push(core_data);
     }
     Ok(core_data_vec)
+}
+
+/// Whether two program paths name the same file (compared as given first, then
+/// canonicalized, because a launch configuration and an upload spell paths differently).
+fn same_program(a: Option<&Path>, b: Option<&Path>) -> bool {
+    let (Some(a), Some(b)) = (a, b) else {
+        return false;
+    };
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_program;
+    use std::path::Path;
+
+    #[test]
+    fn same_program_needs_both_paths() {
+        assert!(!same_program(None, None));
+        assert!(!same_program(Some(Path::new("a.elf")), None));
+        assert!(!same_program(None, Some(Path::new("a.elf"))));
+    }
+
+    #[test]
+    fn same_program_matches_one_file_spelled_two_ways() {
+        let dir = std::env::temp_dir().join("probe_rs_same_program");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let elf = dir.join("a.elf");
+        std::fs::write(&elf, b"x").unwrap();
+        std::fs::write(dir.join("b.elf"), b"x").unwrap();
+
+        assert!(same_program(Some(&elf), Some(&elf)));
+        assert!(same_program(
+            Some(&elf),
+            Some(&dir.join("sub").join("..").join("a.elf"))
+        ));
+        assert!(!same_program(Some(&elf), Some(&dir.join("b.elf"))));
+        // A path that does not exist only matches itself.
+        assert!(!same_program(Some(&elf), Some(&dir.join("missing.elf"))));
+    }
 }

@@ -1307,8 +1307,11 @@ impl Debugger {
         type ProgressState = HashMap<Operation, ProgressBarState>;
 
         // The backend clears the stale control block of this client between
-        // building the image and writing it.
-        let rtt_client = session_data.rtt_client(config).await?;
+        // building the image and writing it. It is the client of the core that
+        // runs the image.
+        let rtt_client = session_data
+            .rtt_client(config, Some(upload.canonical_path.as_path()))
+            .await?;
 
         let mut flash_progress_state = ProgressState::default();
         let describe_op = |operation| match operation {
