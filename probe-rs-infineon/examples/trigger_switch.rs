@@ -272,6 +272,12 @@ fn main() -> Result<()> {
             dump(&mut session)
         }
         ["try", trc, exevt] => try_routing(&mut session, parse(trc)?, parse(exevt)?),
+        ["write", address, value] => {
+            let (address, value) = (parse(address)?, parse(value)?);
+            write(&mut session, address, value)?;
+            println!("{address:#010x} = {:#010x}", read(&mut session, address)?);
+            Ok(())
+        }
         ["mask"] => {
             // The writable bits of CBS_TRC0-2: all ones written, read back, put back.
             for core in 0..3 {
