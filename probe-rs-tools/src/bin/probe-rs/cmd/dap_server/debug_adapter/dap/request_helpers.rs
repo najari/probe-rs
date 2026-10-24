@@ -156,20 +156,24 @@ pub(crate) fn disassemble_target_memory(
             };
         }
 
-        if read_error.is_some() {
+        if let Some(read_error) = &read_error {
             // If we can't read data at a given address, then create
-            // an "invalid instruction" record, and keep trying.
+            // an "invalid instruction" record, and keep trying. DAP marks such filler as
+            // `invalid`; the read error goes to the log, not into every row.
+            tracing::debug!(
+                "Cannot read the instruction at {instruction_pointer:#010X}: {read_error:?}"
+            );
             disassembled_instructions.push(DisassembledInstruction {
                 address: format!("{instruction_pointer:#010X}"),
                 column: None,
                 end_column: None,
                 end_line: None,
-                instruction: format!("<instruction address not readable : {read_error:?}>"),
+                instruction: "<not readable>".to_owned(),
                 instruction_bytes: None,
                 line: None,
                 location: None,
                 symbol: None,
-                presentation_hint: None,
+                presentation_hint: Some("invalid".to_owned()),
             });
             instruction_pointer += min_instruction_size;
             continue 'instruction_loop;
@@ -200,7 +204,7 @@ pub(crate) fn disassemble_target_memory(
                         line: None,
                         location: None,
                         symbol: None,
-                        presentation_hint: None,
+                        presentation_hint: Some("invalid".to_owned()),
                     });
                     code_buffer_le = code_buffer_le
                         .split_at(min_instruction_size as usize)
