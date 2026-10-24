@@ -55,8 +55,9 @@ pub mod ocds {
     /// `DBGSR` write: set `HALT` (halt).
     pub const DBGSR_HALT: u32 = 0x6;
 
-    /// `TRnEVT` value of an instruction (PC) breakpoint: break before make, halt.
-    pub const TRIG_EVT_IP: u32 = 0x0000_101A;
+    /// `TRnEVT` value of an instruction (PC) breakpoint: break before make, halt, with a
+    /// break-out pulse (`BOD` = 0), which halts the other halt group members.
+    pub const TRIG_EVT_IP: u32 = 0x0000_100A;
 
     /// Whether a `TRnEVT` value halts the core when the trigger fires (`EVTA` = 010b).
     pub fn is_halt_trigger(evt: u32) -> bool {
@@ -125,9 +126,10 @@ pub mod ocds {
         0,
         0,
     ];
-    /// The [`SWEVT`] value of the debug init: a `DEBUG` instruction halts the core, break before
-    /// make (the PC stays at the instruction).
-    pub const SWEVT_HALT: u32 = 0x2A;
+    /// The [`SWEVT`] value of a session: a `DEBUG` instruction halts the core, break before make
+    /// (the PC stays at the instruction), with a break-out pulse for the halt group. (The debug
+    /// init of the reference writes 0x2A: `SUSP` set, which gives no pulse.)
+    pub const SWEVT_HALT: u32 = 0x0A;
 
     /// `DBGSR.EVTSRC` after a halt by a `DEBUG` instruction.
     pub const EVTSRC_SWEVT: u32 = 2;
@@ -139,7 +141,9 @@ pub mod ocds {
 
     /// `TRnEVT` of a data watchpoint without the access bits: address input (`TYP` = 0), halt,
     /// no break-out pulse, break after make, and `SUSP` set so that the halt can be told from
-    /// the halt group's break-in that follows it (see [`halted_by_suspend_event`]).
+    /// the halt group's break-in that follows it (see [`halted_by_suspend_event`]). An event
+    /// with `SUSP` gives no break-out pulse: the other members halt when the session sees this
+    /// halt (`halt_group_members`).
     pub const TRIG_EVT_DATA: u32 = 0x32;
     /// `TRnEVT.ALD`: trigger on loads.
     pub const TRIG_EVT_LOAD: u32 = 1 << 28;
@@ -267,20 +271,31 @@ pub mod ocds {
     pub const CBS_TRC0: u32 = 0xF000_0420;
     /// The trigger switch line that connects the cores of the halt group.
     pub const HALT_GROUP_LINE: u32 = 7;
-    /// The `HALT` (halt state to a line, bits 3:0) and `BRKIN` (a line to the core break-in,
-    /// bits 23:20) fields of `CBS_TRCn`.
-    pub const TRC_HALT_BRKIN: u32 = 0x00F0_000F;
-    /// `HALT` and `BRKIN` of a halt group member: both on [`HALT_GROUP_LINE`].
-    pub const TRC_HALT_GROUP: u32 = HALT_GROUP_LINE | (HALT_GROUP_LINE << 20);
+    /// The fields of `CBS_TRCn` that the halt group uses: `HALT` (the halt state to a line, bits
+    /// 3:0), `BRKOUT` (the break-out pulse of a debug event to a line, bits 7:4) and `BRKIN` (a
+    /// line to the core break-in, bits 23:20). Bits 0-8 and 20-27 are writable on the TC275.
+    pub const TRC_HALT_BRKIN: u32 = 0x00F0_00FF;
+    /// `BRKOUT` and `BRKIN` of a halt group member: both on [`HALT_GROUP_LINE`].
+    ///
+    /// The line carries break-out pulses, not the halt state: a core in boot halt after an
+    /// application reset (CPU1 and CPU2 until CPU0 starts them) would hold a halt state line
+    /// active, and its break-in would halt CPU0 in its start-up software, which leaves the
+    /// device without debug access. A break-in reacts to the edge, so a pulse halts the members
+    /// that run, whatever the others do.
+    pub const TRC_HALT_GROUP: u32 = (HALT_GROUP_LINE << 4) | (HALT_GROUP_LINE << 20);
+    /// The `HALT` routing of earlier versions (the halt state on the line).
+    const TRC_HALT_STATE_GROUP: u32 = HALT_GROUP_LINE | (HALT_GROUP_LINE << 20);
 
     /// The address of `CBS_TRCn` for CPU `core_index`.
     pub fn trc(core_index: u8) -> u32 {
         CBS_TRC0 + 4 * core_index as u32
     }
 
-    /// Whether a `CBS_TRCn` value puts the core in the halt group.
+    /// Whether a `CBS_TRCn` value puts the core in the halt group (also the halt state routing
+    /// that an earlier version left).
     pub fn in_halt_group(trc: u32) -> bool {
-        trc & TRC_HALT_BRKIN == TRC_HALT_GROUP
+        let fields = trc & TRC_HALT_BRKIN;
+        fields == TRC_HALT_GROUP || fields == TRC_HALT_STATE_GROUP
     }
 }
 
@@ -1522,8 +1537,16 @@ impl<'probe> TriCore<'probe> {
         // would forget the members that ran with this core, so the next run would not run them.
         // This core is read last in the group request: if it still runs there, the peers were
         // read while it ran.
+        // The members seen running add up until the next run of this core: a member that halted
+        // since (a pause in its session halts it first and the others a moment later, by
+        // software: a halt request gives no break-out pulse) ran with this core all the same.
+        // Members halted at their own breakpoints are left out when this core runs.
         if !halted && ocds::is_running(group.own_dbgsr) {
-            self.state.running_peers = group.running_members();
+            for core in group.running_members() {
+                if !self.state.running_peers.contains(&core) {
+                    self.state.running_peers.push(core);
+                }
+            }
         }
         Ok(())
     }
@@ -1978,10 +2001,16 @@ impl<'probe> TriCore<'probe> {
             }
             // Joining while this core is halted halts the members that run now (a debugger halts
             // the core when it attaches): note them, so that the next run of this core runs them
-            // again.
+            // again. A halt request gives no break-out pulse, so they are halted here (with the
+            // halt state routing of earlier versions the line did it). A member left running
+            // while this one is halted can miss its watchdog service (an SMU reset).
             self.note_running_peers()?;
             let csfr_base = self.options.csfr_base as u32;
-            self.write_group_routing(core, csfr_base)
+            self.write_group_routing(core, csfr_base)?;
+            if ocds::is_halted(self.dbgsr()?) {
+                self.halt_group_members()?;
+            }
+            Ok(())
         } else if let Some((saved_trc, saved_exevt)) = self.state.halt_group.take() {
             let trc = self.bus().read_u32(AddressMap::Target, trc_address)?;
             let restored = (trc & !ocds::TRC_HALT_BRKIN) | (saved_trc & ocds::TRC_HALT_BRKIN);

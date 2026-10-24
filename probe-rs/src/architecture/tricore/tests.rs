@@ -377,10 +377,10 @@ fn step_runs_one_instruction_and_restores_breakpoints() {
     let writes = bus.write_words();
     let last_init = writes
         .iter()
-        .rposition(|&(address, value)| address == CSFR_BASE + 0xFD10 && value == 0x2A)
+        .rposition(|&(address, value)| address == CSFR_BASE + 0xFD10 && value == ocds::SWEVT_HALT)
         .unwrap();
     assert!(writes[last_init..].contains(&(CSFR_BASE + 0xF000 + 4 + 8 * 3, 0x8000_0200)));
-    assert!(writes[last_init..].contains(&(CSFR_BASE + 0xF000 + 8 * 3, 0x101A)));
+    assert!(writes[last_init..].contains(&(CSFR_BASE + 0xF000 + 8 * 3, ocds::TRIG_EVT_IP)));
     // The step trap accumulator bit was discarded.
     assert_eq!(bus.trig_acc, 0);
 }
@@ -444,7 +444,8 @@ fn the_halt_group_routes_the_core_and_puts_the_registers_back() {
         .set_halt_group(true)
         .unwrap();
     assert!(state.in_halt_group());
-    assert_eq!(bus.word(ocds::trc(0)), 0x0070_0107);
+    // BRKOUT and BRKIN on line 7, the halt state on no line; bit 8 stays.
+    assert_eq!(bus.word(ocds::trc(0)), 0x0070_0170);
     assert_eq!(bus.word(CSFR_BASE + 0xFD08), 0x12);
 
     group_core(&mut bus, &mut state)
@@ -453,6 +454,22 @@ fn the_halt_group_routes_the_core_and_puts_the_registers_back() {
     assert!(!state.in_halt_group());
     assert_eq!(bus.word(ocds::trc(0)), 0x0000_0102);
     assert_eq!(bus.word(CSFR_BASE + 0xFD08), 0);
+}
+
+#[test]
+fn the_halt_state_routing_of_an_earlier_version_counts_as_the_group() {
+    let mut bus = FakeBus::new();
+    bus.set_word(ocds::trc(0), 0x0070_0107);
+    let mut state = TriCoreCoreState::new();
+    group_core(&mut bus, &mut state)
+        .set_halt_group(true)
+        .unwrap();
+    assert_eq!(bus.word(ocds::trc(0)), 0x0070_0170);
+    group_core(&mut bus, &mut state)
+        .set_halt_group(false)
+        .unwrap();
+    // Left to the reset values: no halt state on line 7 any more.
+    assert_eq!(bus.word(ocds::trc(0)), 0x0000_0100);
 }
 
 #[test]
@@ -776,6 +793,40 @@ fn a_run_that_halts_at_once_runs_the_members_again_next_time() {
         bus.set_word(PEER_DBGSR, 0x0003);
         bus.halted = true;
     }
+}
+
+#[test]
+fn joining_while_halted_halts_the_members_that_run() {
+    let mut bus = FakeBus::new();
+    bus.set_word(ocds::trc(1), ocds::TRC_HALT_GROUP);
+    bus.set_word(PEER_DBGSR, 0x0001);
+    bus.halted = true;
+    let mut state = TriCoreCoreState::new();
+    group_core(&mut bus, &mut state)
+        .set_halt_group(true)
+        .unwrap();
+    assert!(bus.write_words().contains(&(PEER_DBGSR, ocds::DBGSR_HALT)));
+}
+
+#[test]
+fn a_member_paused_before_this_core_halts_runs_with_it_again() {
+    let mut bus = FakeBus::new();
+    bus.set_word(ocds::trc(1), ocds::TRC_HALT_GROUP);
+    let mut state = TriCoreCoreState::new();
+    group_core(&mut bus, &mut state)
+        .set_halt_group(true)
+        .unwrap();
+    // Both run.
+    bus.set_word(PEER_DBGSR, 0x0001);
+    group_core(&mut bus, &mut state).status().unwrap();
+    // A pause in CPU1's session halts CPU1 first (no pulse), CPU0 a moment later.
+    bus.set_word(PEER_DBGSR, 0x0003);
+    group_core(&mut bus, &mut state).status().unwrap();
+    bus.halted = true;
+    group_core(&mut bus, &mut state).status().unwrap();
+    bus.writes.clear();
+    group_core(&mut bus, &mut state).run().unwrap();
+    assert!(bus.write_words().contains(&(PEER_DBGSR, ocds::DBGSR_RUN)));
 }
 
 #[test]
