@@ -1,7 +1,7 @@
 ---
-source: probe-rs/src/bin/probe-rs/cmd/dap_server/debug_adapter/protocol.rs
+source: probe-rs-tools/src/bin/probe-rs/cmd/dap_server/debug_adapter/protocol.rs
 expression: output_str
 ---
-Content-Length: 151
+Content-Length: 126
 
-{"body":{"category":"console","group":"probe-rs-debug","output":"\nReceived DAP Request sequence #3 : test\n"},"event":"output","seq":1,"type":"event"}
+{"body":{"category":"console","output":"\nReceived DAP Request sequence #3 : test\n"},"event":"output","seq":1,"type":"event"}

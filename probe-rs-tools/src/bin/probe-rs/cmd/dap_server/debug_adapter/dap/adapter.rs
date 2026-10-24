@@ -154,10 +154,9 @@ impl DebugAdapter {
             )
             .await
         {
-            Ok(cpu_info) => Ok(Some(format!(
-                "Core stopped at address {:#010x}",
-                cpu_info.pc
-            ))),
+            // The DAP pause response has no body (strict clients such as Zed reject one).
+            // The stopped event already reports where the core stopped.
+            Ok(_) => Ok(None::<()>),
             Err(error) => Err(&DebuggerError::Other(anyhow!("{error}"))),
         };
 

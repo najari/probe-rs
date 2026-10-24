@@ -271,7 +271,8 @@ where
             line: None,
             column: None,
             data: None,
-            group: Some("probe-rs-debug".to_owned()),
+            // DAP allows only "start", "startCollapsed" or "end" here; Zed drops other values.
+            group: None,
             location_reference: None,
         }) {
             Ok(event_body) => event_body,

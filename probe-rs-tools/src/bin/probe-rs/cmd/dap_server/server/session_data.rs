@@ -576,13 +576,20 @@ impl SessionData {
                     .await
             }
         };
+        // Tell the client when this halt leaves every core halted (the last core of an all-stop).
+        // A client may keep only the state of the last `stopped` event (Zed does), so the other
+        // cores would otherwise look as if they still ran.
+        let all_halted = self
+            .core_data
+            .iter()
+            .all(|core| core.last_known_status.is_halted());
         let event_body = Some(StoppedEventBody {
             reason: reason.to_string(),
             description: Some(description),
             thread_id: Some(core_index as i64),
             preserve_focus_hint: Some(false),
             text: None,
-            all_threads_stopped: Some(debug_adapter.all_cores_halted),
+            all_threads_stopped: Some(all_halted),
             hit_breakpoint_ids: None,
         });
         debug_adapter.send_event("stopped", event_body)?;

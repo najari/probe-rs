@@ -1749,7 +1749,6 @@ mod test {
                 "output",
                 Some(json!({
                     "category": "console",
-                    "group": "probe-rs-debug",
                     "output":  msg
                 })),
             );
@@ -2073,7 +2072,7 @@ mod test {
                 line: None,
                 column: None,
                 data: None,
-                group: Some("probe-rs-debug".to_owned()),
+                group: None,
                 location_reference: None,
             }),
         );
@@ -2234,7 +2233,7 @@ mod test {
                 line: None,
                 column: None,
                 data: None,
-                group: Some("probe-rs-debug".to_owned()),
+                group: None,
                 location_reference: None,
             }),
         );

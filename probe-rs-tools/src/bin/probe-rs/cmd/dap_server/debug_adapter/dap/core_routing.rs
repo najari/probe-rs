@@ -11,7 +11,7 @@
 //! they are.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -47,6 +47,8 @@ pub(crate) struct CoreRouting {
     references: HashMap<i64, usize>,
     /// The core of the last `stopped` event.
     focus: Option<usize>,
+    /// The cores that reported a halt and have not run since.
+    halted: HashSet<usize>,
     /// While a request goes to several cores: its command and the responses collected.
     captured: Option<(String, Vec<Response>)>,
 }
@@ -72,6 +74,12 @@ impl CoreRouting {
         self.cores = cores;
         self.references.clear();
         self.focus = None;
+        self.halted.clear();
+    }
+
+    /// Whether every configured core reported a halt and has not run since.
+    fn all_halted(&self) -> bool {
+        self.cores.iter().all(|core| self.halted.contains(core))
     }
 
     pub(crate) fn cores(&self) -> &[usize] {
@@ -161,6 +169,15 @@ impl CoreRouting {
         let Some(core) = self.current else {
             return;
         };
+        // A core that continues or steps runs until its next `stopped` event.
+        if response.success
+            && matches!(
+                response.command.as_str(),
+                "continue" | "next" | "stepIn" | "stepOut" | "stepBack" | "reverseContinue"
+            )
+        {
+            self.halted.remove(&core);
+        }
         let Some(body) = response.body.as_mut() else {
             return;
         };
@@ -217,8 +234,11 @@ impl CoreRouting {
         }
     }
 
-    /// Notes the core of a `stopped` event. With several cores, each core reports its own halt,
-    /// so an event never claims that all threads stopped or continued.
+    /// Notes the core of a `stopped` event. With several cores, each core reports its own halt:
+    /// an event claims that all threads stopped only when it leaves every core halted (the last
+    /// core of an all-stop), and never that all threads continued. A client may keep only the
+    /// state of the last `stopped` event (Zed does), so the earlier cores would look as if they
+    /// still ran.
     fn observe_event(&mut self, event_type: &str, body: &mut Option<Value>) {
         if !self.is_multi_core() {
             return;
@@ -226,6 +246,10 @@ impl CoreRouting {
         let Some(Value::Object(body)) = body.as_mut() else {
             return;
         };
+        let thread = body
+            .get("threadId")
+            .and_then(Value::as_i64)
+            .and_then(|thread| usize::try_from(thread).ok());
         match event_type {
             "stopped" => {
                 // A core that the halt group stopped (`external`) did not stop on its own: the
@@ -234,12 +258,19 @@ impl CoreRouting {
                 let by_group = body.get("reason").and_then(Value::as_str) == Some("external");
                 if by_group {
                     body.insert("preserveFocusHint".to_string(), Value::Bool(true));
-                } else if let Some(thread) = body.get("threadId").and_then(Value::as_i64) {
-                    self.focus = usize::try_from(thread).ok().or(self.focus);
+                } else if thread.is_some() {
+                    self.focus = thread.or(self.focus);
                 }
-                body.insert("allThreadsStopped".to_string(), Value::Bool(false));
+                if let Some(thread) = thread {
+                    self.halted.insert(thread);
+                }
+                let all = thread.is_some() && self.all_halted();
+                body.insert("allThreadsStopped".to_string(), Value::Bool(all));
             }
             "continued" => {
+                if let Some(thread) = thread {
+                    self.halted.remove(&thread);
+                }
                 body.insert("allThreadsContinued".to_string(), Value::Bool(false));
             }
             _ => {}
@@ -588,6 +619,34 @@ mod tests {
         ));
         assert_eq!(core, Some(2));
         assert_eq!(routed.arguments.unwrap()["memoryReference"], "0x7000a004");
+    }
+
+    #[test]
+    fn the_stop_that_leaves_every_core_halted_says_so() {
+        let mut routing = routing(&[0, 1, 2]);
+        let stop = |routing: &mut CoreRouting, reason: &str, thread: i64| {
+            let mut body = Some(json!({ "reason": reason, "threadId": thread }));
+            routing.observe_event("stopped", &mut body);
+            body.unwrap()["allThreadsStopped"].clone()
+        };
+        // An all-stop: the core that hit its breakpoint, then the cores the group stopped.
+        assert_eq!(stop(&mut routing, "breakpoint", 0), false);
+        assert_eq!(stop(&mut routing, "external", 1), false);
+        assert_eq!(stop(&mut routing, "external", 2), true);
+
+        // A continue lets its core run: the next halt of another core leaves it out.
+        routing.set_current(Some(0));
+        let mut resumed = response("continue", true, json!({}));
+        routing.observe_response(&mut resumed);
+        assert_eq!(stop(&mut routing, "pause", 1), false);
+        assert_eq!(stop(&mut routing, "breakpoint", 0), true);
+
+        // So does a `continued` event, and its body never claims that every thread runs.
+        let mut continued = Some(json!({ "threadId": 2, "allThreadsContinued": true }));
+        routing.observe_event("continued", &mut continued);
+        assert_eq!(continued.unwrap()["allThreadsContinued"], false);
+        assert_eq!(stop(&mut routing, "pause", 1), false);
+        assert_eq!(stop(&mut routing, "step", 2), true);
     }
 
     #[test]
