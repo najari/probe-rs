@@ -192,6 +192,14 @@ impl DeviceConfig {
             .find(|m| m.name.eq_ignore_ascii_case("ProgramFlash"))
     }
 
+    /// The DFLASH (`DataFlash`). Its logical sectors do not include the UCBs, which the device
+    /// files list apart.
+    pub fn data_flash(&self) -> Option<&Memory> {
+        self.memories
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case("DataFlash"))
+    }
+
     /// Whether the device file describes a device with these IDs.
     pub fn matches(&self, jtag_id: u32, chip_id: Option<u32>) -> Option<MatchQuality> {
         if !self.jtag_ids.contains(&jtag_id) {

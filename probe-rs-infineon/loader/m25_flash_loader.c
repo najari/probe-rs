@@ -1,5 +1,5 @@
 /*
- * m25_flash_loader.c - M25-4b: our own AURIX PFLASH flash loader.
+ * m25_flash_loader.c - M25-4b: our own AURIX PFLASH flash loader (TC27x: also DF0).
  *
  * Runs on CPU0 from PSPR (linked at 0x70100000), driven by the host (TCF agent)
  * through a mailbox in DSPR at 0x7000F000.  Built per device:
@@ -212,9 +212,47 @@ static u32 erase_sectors(u32 sector_addr, u32 count)
     return err;
 }
 
+#ifdef TC27X
+/* DF0 (0xAF000000..0xAF05FFFF): 8-byte pages; the host sends 32-byte units */
+#define DFLASH_PAGE_SIZE 8u
+
+static int is_dflash(u32 addr)
+{
+    return (addr & 0xFF000000u) == 0xAF000000u;
+}
+
+/* one 8-byte DFLASH page */
+static u32 program_dflash_page(u32 page_addr, const u32 *src)
+{
+    u32 err;
+    flash_cmd(0xFA);                                  /* clear status */
+    flash_cmd(0x5D);                                  /* enter page mode (DFLASH) */
+    wait_unbusy();
+    load_page(src[0], src[1]);
+    flash_cmd2(page_addr, 0u, 0xA0u, 0xAAu);          /* write page */
+    wait_unbusy();
+    err = flash_errors();
+    flash_cmd(0xF0);                                  /* reset to read mode */
+    return err;
+}
+#endif
+
 static u32 program_one_page(u32 page_addr, const u32 *src)
 {
     u32 err;
+#ifdef TC27X
+    if (is_dflash(page_addr)) {
+        /* a 32-byte unit is four DFLASH pages */
+        u32 i;
+        for (i = 0u; i < PFLASH_PAGE_SIZE / DFLASH_PAGE_SIZE; i++) {
+            err = program_dflash_page(page_addr + i * DFLASH_PAGE_SIZE, src + 2u * i);
+            if (err != 0u) {
+                return err;
+            }
+        }
+        return 0u;
+    }
+#endif
     flash_cmd(0xFA);                                  /* clear status */
     if ((page_addr & 0xFF000000u) == 0xA0000000u)
         flash_cmd(0x50);                              /* enter page mode (PFLASH) */

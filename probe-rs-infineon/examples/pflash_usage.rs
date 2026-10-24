@@ -1,5 +1,6 @@
-//! Shows which PFLASH sectors hold data (read only): for each logical sector, the number of
-//! written (readable) pages. Runs of erased sectors are printed as one line.
+//! Shows which PFLASH and DFLASH sectors hold data (read only): for each logical sector, the
+//! number of written pages (readable PFLASH pages, DFLASH pages that are not all zero). Runs of
+//! erased sectors are printed as one line.
 //!
 //! ```text
 //! cargo run -p probe-rs-infineon --example pflash_usage
@@ -29,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{start:#010x}..{end:#010x}  erased");
         }
     };
-    for sector in device.sectors() {
+    for sector in device.sectors().into_iter().chain(device.dflash_sectors()) {
         let pages = read_pages(&mut core, sector.base, sector.size as usize)?;
         let written = pages.iter().filter(|p| p.is_some()).count();
         if written == 0 {

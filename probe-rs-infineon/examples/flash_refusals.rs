@@ -1,6 +1,7 @@
 //! PRD test T-12: the flash sequence refuses invalid requests before the loader runs a flash
 //! command. It starts the loader, asks for an unaligned erase, an erase and a program outside
-//! the PFLASH, and stops the loader again. No flash is changed.
+//! the PFLASH, an unaligned erase in the DFLASH, erases after the DFLASH and in a UCB, and
+//! stops the loader again. No flash is changed.
 //!
 //! ```text
 //! cargo run -p probe-rs-infineon --example flash_refusals
@@ -29,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let after = (last.base + last.size) as u64;
 
     flash.prepare_flash(&mut session)?;
-    let cases: [(String, Result<(), probe_rs::Error>); 4] = [
+    let cases: [(String, Result<(), probe_rs::Error>); 6] = [
         (
             format!("erase inside a sector ({inside:#010x})"),
             flash.erase_sector(&mut session, inside),
@@ -39,8 +40,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             flash.erase_sector(&mut session, after),
         ),
         (
-            "erase in DFLASH (0xAF000000)".to_string(),
-            flash.erase_sector(&mut session, 0xAF00_0000),
+            "erase inside a DFLASH sector (0xAF000010)".to_string(),
+            flash.erase_sector(&mut session, 0xAF00_0010),
+        ),
+        (
+            "erase after the DFLASH (0xAF060000)".to_string(),
+            flash.erase_sector(&mut session, 0xAF06_0000),
+        ),
+        (
+            "erase in a UCB (0xAF100000)".to_string(),
+            flash.erase_sector(&mut session, 0xAF10_0000),
         ),
         (
             format!("program after the PFLASH ({:#010x})", after - 0x2000_0000),

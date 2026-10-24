@@ -1,4 +1,5 @@
-//! AURIX program flash (PFLASH) programming, for the TC27x and the TC36x.
+//! AURIX program flash (PFLASH) programming, for the TC27x and the TC36x, and data flash
+//! (DFLASH) programming for the TC27x.
 //!
 //! A small loader (`loader/m25_flash_loader.c`) runs on CPU0 from PSPR and executes the flash
 //! command sequences; the host drives it through a mailbox in DSPR. The command sequences are
@@ -9,6 +10,12 @@
 //! pages are 32 bytes on both. An erased TC27x page does not read as a value: it fails with an
 //! uncorrectable ECC error. So the flash is read page by page, and a page that can not be read
 //! is erased.
+//!
+//! The TC27x DFLASH (DF0, 0xAF000000, 384 KiB) has 48 logical sectors of 8 KiB and pages of
+//! 8 bytes. The host handles it in 32-byte units like the PFLASH, and the loader writes each
+//! unit as four pages. Erased DFLASH reads as 0 without an error, so a page of zeros counts as
+//! erased: it is not written, and reads back as erased. The UCBs (0xAF100000) are not part of
+//! the map and are never written.
 //!
 //! A sector the image touches is erased and the image's pages are written, the rest of a
 //! partly written page is 0 (the erased value in the target description). Bytes the image does
@@ -116,6 +123,26 @@ pub fn tc36x_sectors() -> Vec<Sector> {
         .collect()
 }
 
+/// The 48 logical sectors of 8 KiB of the TC27x DFLASH (DF0).
+pub fn tc27x_dflash_sectors() -> Vec<Sector> {
+    (0..48)
+        .map(|i| Sector {
+            base: DFLASH_BASE + i * 0x2000,
+            size: 0x2000,
+        })
+        .collect()
+}
+
+/// The start of the DFLASH (DF0).
+pub const DFLASH_BASE: u32 = 0xAF00_0000;
+/// The start of the UCBs, which the flash programming never writes.
+const UCB_BASE: u32 = 0xAF10_0000;
+
+/// Whether `address` is in the data flash address range (below the UCBs).
+pub fn is_dflash(address: u32) -> bool {
+    (DFLASH_BASE..UCB_BASE).contains(&address)
+}
+
 /// A device that a flash loader of probe-rs programs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashDevice {
@@ -178,11 +205,20 @@ impl FlashDevice {
         }
     }
 
-    /// The built-in sector map.
+    /// The built-in PFLASH sector map.
     pub fn sectors(self) -> Vec<Sector> {
         match self {
             Self::Tc27x => tc27x_sectors(),
             Self::Tc36x => tc36x_sectors(),
+        }
+    }
+
+    /// The built-in DFLASH sector map: empty where the loader does not program the DFLASH.
+    pub fn dflash_sectors(self) -> Vec<Sector> {
+        match self {
+            Self::Tc27x => tc27x_dflash_sectors(),
+            // The TC3xx loader waits for the PFLASH banks only.
+            Self::Tc36x => Vec::new(),
         }
     }
 }
@@ -279,20 +315,23 @@ fn find_page(pages: &[FlashPage], address: u64) -> Option<&FlashPage> {
 }
 
 /// The pages of a sector once it is written: the patched pages, with 0 in the bytes a patch
-/// does not set, and erased pages elsewhere.
+/// does not set, and erased pages elsewhere. In the DFLASH a page of zeros is erased.
 pub fn sector_image(sector: Sector, patches: &BTreeMap<u32, PagePatch>) -> Vec<PageImage> {
+    let dflash = is_dflash(sector.base);
     (0..sector.size as usize / PAGE)
         .map(|index| {
             let address = sector.base + (index * PAGE) as u32;
             patches
                 .get(&address)
                 .map(|patch| patch.map(|byte| byte.unwrap_or(0)))
+                .filter(|page| !(dflash && *page == [0; PAGE]))
         })
         .collect()
 }
 
 /// Reads `size` bytes of flash at `address` page by page: a page that can not be read (an
-/// erased page) is `None`. Large reads are tried first and split only where they fail.
+/// erased PFLASH page) or a DFLASH page of zeros is `None`. Large reads are tried first and
+/// split only where they fail.
 pub fn read_pages(
     memory: &mut dyn MemoryInterface,
     address: u32,
@@ -324,6 +363,13 @@ pub fn read_pages(
         }
     }
     walk(memory, address, address, size, 0x1000, &mut pages);
+    if is_dflash(address) {
+        for page in &mut pages {
+            if *page == Some([0; PAGE]) {
+                *page = None;
+            }
+        }
+    }
     Ok(pages)
 }
 
@@ -337,15 +383,17 @@ struct SavedState {
 /// SCU_CHIPID, which tells the device step and variant apart.
 const SCU_CHIPID: u64 = 0xF003_6140;
 
-/// The PFLASH sectors of the connected device.
+/// The flash sectors of the connected device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashMap {
     /// The device.
     pub device: FlashDevice,
     /// Where the map comes from: an AURIX Flasher device file, or the built-in map.
     pub source: String,
-    /// The logical sectors.
+    /// The logical PFLASH sectors.
     pub sectors: Vec<Sector>,
+    /// The logical DFLASH sectors; empty where the loader does not program the DFLASH.
+    pub dflash: Vec<Sector>,
     /// The bases of the sectors that must not be written.
     pub restricted: BTreeSet<u32>,
 }
@@ -357,6 +405,7 @@ impl FlashMap {
             device,
             source: format!("the built-in {} map", device.name()),
             sectors: device.sectors(),
+            dflash: device.dflash_sectors(),
             restricted: BTreeSet::new(),
         }
     }
@@ -418,16 +467,53 @@ impl FlashMap {
                 config.file.display()
             );
         }
+        // The DFLASH sectors of the file, for a device whose DFLASH the loader programs. Only
+        // sectors in the DFLASH range count (never a UCB); a file without them leaves the
+        // built-in map.
+        let builtin_dflash = device.dflash_sectors();
+        let dflash_config = config
+            .data_flash()
+            .filter(|_| !builtin_dflash.is_empty())
+            .map(|m| {
+                m.sectors
+                    .iter()
+                    .filter(|s| s.size > 0 && is_dflash(s.base) && is_dflash(s.base + s.size - 1))
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .filter(|sectors| !sectors.is_empty());
+        let dflash = match &dflash_config {
+            Some(config_sectors) => {
+                let dflash = config_sectors
+                    .iter()
+                    .map(|s| Sector {
+                        base: s.base,
+                        size: s.size,
+                    })
+                    .collect::<Vec<_>>();
+                if dflash != builtin_dflash {
+                    tracing::warn!(
+                        "The DFLASH map of {name} differs from the built-in {} map; using {}",
+                        device.name(),
+                        config.file.display()
+                    );
+                }
+                dflash
+            }
+            None => builtin_dflash,
+        };
         Ok(Self {
             device,
             source: format!("{name} ({})", config.file.display()),
             restricted: pflash
                 .sectors
                 .iter()
+                .chain(dflash_config.iter().flatten())
                 .filter(|s| s.restricted)
                 .map(|s| s.base)
                 .collect(),
             sectors,
+            dflash,
         })
     }
 
@@ -435,8 +521,17 @@ impl FlashMap {
         let uncached = to_uncached(address);
         let sector = u32::try_from(uncached)
             .ok()
-            .and_then(|a| sector_at(&self.sectors, a))
-            .ok_or_else(|| other(format!("{address:#010x} is not in the PFLASH")))?;
+            .and_then(|a| sector_at(&self.sectors, a).or_else(|| sector_at(&self.dflash, a)))
+            .ok_or_else(|| {
+                other(if u32::try_from(uncached).is_ok_and(is_dflash) && self.dflash.is_empty() {
+                    format!(
+                        "{address:#010x} is in the DFLASH, which probe-rs programs on the TC27x \
+                         only"
+                    )
+                } else {
+                    format!("{address:#010x} is not in the PFLASH or the DFLASH")
+                })
+            })?;
         if self.restricted.contains(&sector.base) {
             return Err(other(format!(
                 "sector {:#010x} is restricted in {}",
@@ -570,9 +665,10 @@ impl AurixFlash {
             )));
         }
         tracing::info!(
-            "PFLASH map: {} ({} sectors; JTAG ID {jtag_id:#010x}, chip ID {})",
+            "Flash map: {} ({} PFLASH and {} DFLASH sectors; JTAG ID {jtag_id:#010x}, chip ID {})",
             map.source,
             map.sectors.len(),
+            map.dflash.len(),
             chip_id.map_or("?".into(), |c| format!("{c:#010x}"))
         );
         *self.map.lock().unwrap_or_else(|e| e.into_inner()) = Some(map);
@@ -1128,6 +1224,109 @@ mod tests {
     }
 
     #[test]
+    fn the_tc27x_dflash_has_48_sectors_of_8_kib_and_no_ucb() {
+        let sectors = tc27x_dflash_sectors();
+        assert_eq!(sectors.len(), 48);
+        assert_eq!(sectors[0].base, 0xAF00_0000);
+        assert_eq!(sectors.last().unwrap().base + 0x2000, 0xAF06_0000);
+        let map = FlashMap::builtin(FlashDevice::Tc27x);
+        assert_eq!(
+            map.sector(0xAF00_2010).unwrap(),
+            Sector {
+                base: 0xAF00_2000,
+                size: 0x2000
+            }
+        );
+        // PFLASH sectors are still found, the UCBs and the end of DF0 are not flash.
+        assert_eq!(map.sector(0x8021_C000).unwrap().base, 0xA021_C000);
+        for address in [0xAF06_0000u64, 0xAF10_0000, 0xAF10_0400] {
+            let error = map.sector(address).unwrap_err().to_string();
+            assert!(error.contains("not in the PFLASH or the DFLASH"), "{error}");
+        }
+        assert!(is_dflash(0xAF05_FFFF) && !is_dflash(0xAF10_0000) && !is_dflash(0xA000_0000));
+    }
+
+    #[test]
+    fn the_tc36x_dflash_is_refused() {
+        let map = FlashMap::builtin(FlashDevice::Tc36x);
+        assert!(map.dflash.is_empty());
+        let error = map.sector(0xAF00_0000).unwrap_err().to_string();
+        assert!(error.contains("on the TC27x only"), "{error}");
+    }
+
+    #[test]
+    fn dflash_pages_of_zeros_are_erased() {
+        let sector = Sector {
+            base: 0xAF00_2000,
+            size: 0x2000,
+        };
+        let mut patches = BTreeMap::new();
+        patches.insert(sector.base, [Some(0); PAGE]);
+        let mut patch = [None; PAGE];
+        patch[3] = Some(0x5A);
+        patches.insert(sector.base + PAGE as u32, patch);
+
+        let image = sector_image(sector, &patches);
+        assert_eq!(image.len(), 256);
+        assert_eq!(image[0], None);
+        let mut expected = [0; PAGE];
+        expected[3] = 0x5A;
+        assert_eq!(image[1], Some(expected));
+        assert_eq!(image.iter().filter(|p| p.is_some()).count(), 1);
+
+        // In the PFLASH a page of zeros is data.
+        let pflash = Sector {
+            base: 0xA021_C000,
+            size: 0x4000,
+        };
+        let mut patches = BTreeMap::new();
+        patches.insert(pflash.base, [Some(0); PAGE]);
+        assert_eq!(sector_image(pflash, &patches)[0], Some([0; PAGE]));
+    }
+
+    #[test]
+    fn the_dflash_map_comes_from_the_device_file() {
+        let dir = device_dir(
+            "TC27x_dflash",
+            "flax_TC2xx.hex",
+            "0x401DA083",
+            &builtin_runs(),
+        );
+        // Add a DataFlash memory: two sectors (the second restricted) and a UCB-range sector,
+        // which is ignored.
+        let file = dir.join("TC27x_dflash.json");
+        let json = std::fs::read_to_string(&file).unwrap().replace(
+            "] } ] }",
+            r#"] },
+               { "memoryName": "DataFlash", "memoryStartAddress": "0xAF000000",
+                 "memoryEndAddress": "0xAF003FFF", "logicalSectors": [
+                   { "sectorStartAddress": "0xAF000000", "sectorSize": "0x2000", "restricted": false },
+                   { "sectorStartAddress": "0xAF002000", "sectorSize": "0x2000", "restricted": true },
+                   { "sectorStartAddress": "0xAF100000", "sectorSize": "0x400", "restricted": false } ] } ] }"#,
+        );
+        std::fs::write(&file, json).unwrap();
+        let map = FlashMap::for_device(std::slice::from_ref(&dir), 0x401D_A083, None).unwrap();
+        assert_eq!(map.dflash.len(), 2);
+        assert_eq!(map.sector(0xAF00_0100).unwrap().base, 0xAF00_0000);
+        let error = map.sector(0xAF00_2000).unwrap_err().to_string();
+        assert!(error.contains("restricted"), "{error}");
+        assert!(map.sector(0xAF10_0000).is_err());
+        assert!(map.sector(0xAF00_4000).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // A file without a DataFlash memory keeps the built-in DFLASH map.
+        let dir = device_dir(
+            "TC27x_no_dflash",
+            "flax_TC2xx.hex",
+            "0x401DA083",
+            &builtin_runs(),
+        );
+        let map = FlashMap::for_device(std::slice::from_ref(&dir), 0x401D_A083, None).unwrap();
+        assert_eq!(map.dflash, tc27x_dflash_sectors());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn chips_and_jtag_ids_name_their_flash_device() {
         assert_eq!(FlashDevice::for_chip("TC275"), Some(FlashDevice::Tc27x));
         assert_eq!(FlashDevice::for_chip("TC36x"), Some(FlashDevice::Tc36x));
@@ -1146,8 +1345,8 @@ mod tests {
     fn the_loaders_are_the_reviewed_builds() {
         // A change of a loader binary must be deliberate: rebuild with loader/build.ps1 and
         // update this check.
-        // TC27x SHA-256 9E16F30D38DCF1FCDC3E1C663A67577605999AA5B5B146770D4F2F7380377BC4.
-        assert_eq!(LOADER_TC27X.len(), 946);
+        // TC27x SHA-256 E564ED00516DBA8357654AD5B86F7D827C4B11D38008970A7DEBA13D41034E15.
+        assert_eq!(LOADER_TC27X.len(), 1118);
         // TC3xx SHA-256 437DC5BC82ACCE13FD6EA751EF35D6CC852C541308FE7C4675F68F2EAC85164C.
         assert_eq!(LOADER_TC3XX.len(), 966);
     }

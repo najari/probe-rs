@@ -215,6 +215,17 @@ variants:
     - cpu1
     - cpu2
     is_alias: true
+  # Data flash DF0 (not cached), 8 KiB logical sectors. The UCBs (0xAF100000) are not in the
+  # map and are never written.
+  - !Nvm
+    name: DFLASH0
+    range:
+      start: 0xaf000000
+      end: 0xaf060000
+    cores:
+    - cpu0
+    - cpu1
+    - cpu2
   # Scratchpad RAMs, global addresses.
   - !Ram
     name: DSPR0
@@ -270,6 +281,7 @@ variants:
   flash_algorithms:
   - tc27x-pflash
   - tc27x-pflash-uncached
+  - tc27x-dflash
 flash_algorithms:
 - name: tc27x-pflash
   description: TC27x PFLASH (cached addresses), host-side programming with a RAM loader
@@ -337,5 +349,21 @@ flash_algorithms:
       address: 0x2a0000
     - size: 0x40000
       address: 0x300000
+  cores:
+  - cpu0
+- name: tc27x-dflash
+  description: TC27x DFLASH (DF0), host-side programming with a RAM loader
+  default: true
+  flash_properties:
+    address_range:
+      start: 0xaf000000
+      end: 0xaf060000
+    page_size: 0x2000
+    erased_byte_value: 0x0
+    program_page_timeout: 10000
+    erase_sector_timeout: 30000
+    sectors:
+    - size: 0x2000
+      address: 0x0
   cores:
   - cpu0
