@@ -238,6 +238,91 @@ impl DebugAdapter {
         }
     }
 
+    /// The custom `readRanges` request: several memory ranges read in one request, each on its
+    /// own, so a range that cannot be read (a hole in a peripheral's registers) does not take
+    /// the others with it. A view of peripheral registers that are only read word by word (the
+    /// GTM's MCS channels) needs a few dozen small ranges at each refresh.
+    ///
+    /// Arguments: `{ "ranges": [{ "address", "count" }, ...] }` (count in bytes). Response
+    /// body: `{ "ranges": [{ "address", "data"? (base64), "error"? }, ...] }`, in order.
+    pub(crate) async fn read_ranges(
+        &mut self,
+        session_data: &mut SessionData,
+        core_index: usize,
+        request: &Request,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct Range {
+            address: u64,
+            count: usize,
+        }
+        #[derive(serde::Deserialize)]
+        struct ReadRangesArguments {
+            ranges: Vec<Range>,
+        }
+        #[derive(Debug, serde::Serialize)]
+        struct RangeData {
+            address: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            data: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<String>,
+        }
+        #[derive(Debug, serde::Serialize)]
+        struct ReadRangesBody {
+            ranges: Vec<RangeData>,
+        }
+        /// More than a view needs, little enough that one request stays short.
+        const MAX_RANGES: usize = 256;
+        const MAX_BYTES: usize = 64 * 1024;
+
+        let arguments: ReadRangesArguments = get_arguments(self, request)?;
+        let total: usize = arguments.ranges.iter().map(|r| r.count).sum();
+        if arguments.ranges.len() > MAX_RANGES || total > MAX_BYTES {
+            return self.send_response::<()>(
+                request,
+                Err(&DebuggerError::UserMessage(format!(
+                    "readRanges: at most {MAX_RANGES} ranges and {MAX_BYTES} bytes in one request"
+                ))),
+            );
+        }
+        let mut ranges = Vec::with_capacity(arguments.ranges.len());
+        for range in arguments.ranges {
+            // Word aligned ranges are read as 32-bit words: some peripheral registers take no
+            // other access. Each range is read whole or not at all.
+            let read = if range.address % 4 == 0 && range.count % 4 == 0 {
+                session_data
+                    .backend
+                    .read_memory_32(core_index, range.address, range.count / 4)
+                    .await
+                    .map(|words| {
+                        words
+                            .iter()
+                            .flat_map(|w| w.to_le_bytes())
+                            .collect::<Vec<_>>()
+                    })
+            } else {
+                session_data
+                    .backend
+                    .read_memory_8(core_index, range.address, range.count)
+                    .await
+            };
+            ranges.push(match read {
+                Ok(bytes) => RangeData {
+                    address: format!("{:#010x}", range.address),
+                    data: Some(base64_engine::STANDARD.encode(&bytes)),
+                    error: None,
+                },
+                Err(error) => RangeData {
+                    address: format!("{:#010x}", range.address),
+                    data: None,
+                    error: Some(error.to_string()),
+                },
+            });
+        }
+        self.send_response(request, Ok(Some(ReadRangesBody { ranges })))
+    }
+
     pub(crate) async fn write_memory(
         &mut self,
         session_data: &mut SessionData,

@@ -242,6 +242,20 @@ impl RpcBackend {
             .map_err(rpc_err)
     }
 
+    /// `count` 32-bit words at `address`, each read as one 32-bit access (peripheral registers
+    /// that only take word accesses).
+    pub(crate) async fn read_memory_32(
+        &self,
+        core_index: usize,
+        address: u64,
+        count: usize,
+    ) -> Result<Vec<u32>, Error> {
+        self.core(core_index)
+            .read_memory_32(address, count)
+            .await
+            .map_err(rpc_err)
+    }
+
     pub(crate) async fn read_bytes(
         &self,
         core_index: usize,

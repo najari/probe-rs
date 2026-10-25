@@ -416,6 +416,11 @@ impl Debugger {
                     .write_memory(session_data, core_index, request)
                     .await?;
             }
+            "readRanges" => {
+                debug_adapter
+                    .read_ranges(session_data, core_index, request)
+                    .await?;
+            }
             "pause" => {
                 debug_adapter
                     .pause(session_data, core_index, request)
