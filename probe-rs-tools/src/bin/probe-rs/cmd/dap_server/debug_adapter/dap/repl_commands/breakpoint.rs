@@ -182,6 +182,7 @@ async fn create_breakpoint<'a>(
     core_data.breakpoints.push(ActiveBreakpoint {
         breakpoint_type,
         address,
+        condition: None,
     });
 
     let body = serde_json::to_value(BreakpointEventBody {

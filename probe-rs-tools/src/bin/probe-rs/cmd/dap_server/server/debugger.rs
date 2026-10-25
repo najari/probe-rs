@@ -48,6 +48,11 @@ fn dap_capabilities() -> Capabilities {
         // `setDataBreakpoints` reports each one as not verified.
         supports_data_breakpoints: Some(true),
         supports_data_breakpoint_bytes: Some(true),
+        // The server checks a condition, hit count or log message at a halt and runs the core
+        // again when it is not met (see `server::condition`); the core stops each time.
+        supports_conditional_breakpoints: Some(true),
+        supports_hit_conditional_breakpoints: Some(true),
+        supports_log_points: Some(true),
         supports_stepping_granularity: Some(true),
         // A step moves its core only; a `continue` with `singleThread` leaves the other cores of
         // the session halted (see `DebugAdapter::continue`).

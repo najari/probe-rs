@@ -945,6 +945,21 @@ impl RpcBackend {
         Ok(Self::evaluate_response_body(wire))
     }
 
+    /// The value of a variable or register by name in the top frame of the last unwind of the
+    /// halted core ([`Self::unwind_stack`]), as the debugger shows it.
+    pub(crate) async fn evaluate_name(
+        &mut self,
+        core_index: usize,
+        name: &str,
+    ) -> Result<String, Error> {
+        let wire = self
+            .session_interface()
+            .evaluate(core_index as u32, None, name.to_string())
+            .await
+            .map_err(rpc_err)?;
+        Ok(wire.result)
+    }
+
     /// Read global variables by name without halting the core.
     pub(crate) async fn live_watch(
         &mut self,

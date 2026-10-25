@@ -1,6 +1,7 @@
 use super::{
+    condition::{self, BreakpointCondition, Values, Verdict},
     configuration::{self, CoreConfig, SessionConfig},
-    core_data::{ChannelNames, CoreData},
+    core_data::{ChannelNames, ConditionSlot, CoreData},
 };
 use crate::cmd::dap_server::debug_adapter::dap::dap_types::PromptKind;
 use crate::cmd::dap_server::server::debug_rtt;
@@ -27,7 +28,7 @@ use probe_rs_rpc::breakpoints::SourceBreakpointLocation;
 use probe_rs_rpc::format::FormatKind;
 use probe_rs_rpc::rtt_client::ScanRegion as WireScanRegion;
 use probe_rs_rpc_client::{ResolvedUpload, RpcClient, SessionInterface};
-use std::{any::Any, env::set_current_dir, path::Path};
+use std::{any::Any, collections::HashMap, env::set_current_dir, path::Path};
 use time::UtcOffset;
 
 use crate::util::rtt::RttConfig;
@@ -57,6 +58,19 @@ pub(crate) enum SourceLocationScope {
 pub struct ActiveBreakpoint {
     pub(crate) breakpoint_type: BreakpointType,
     pub(crate) address: u64,
+    /// The condition, hit count and log message, checked at a halt here before the client is
+    /// told (see [`SessionData::check_breakpoint_halts`]).
+    pub(crate) condition: Option<BreakpointCondition>,
+}
+
+/// What the breakpoint conditions make of a halt of a core.
+struct HaltCheck {
+    /// The client is told; otherwise the core runs again.
+    stop: bool,
+    /// Why it stops although a condition was not met.
+    note: Option<String>,
+    /// The lines of the log points.
+    lines: Vec<String>,
 }
 
 /// DAP-session state and per-core display metadata.
@@ -413,12 +427,13 @@ impl SessionData {
         &mut self,
         core_index: usize,
     ) -> Result<(), DebuggerError> {
-        let (old_addrs, pending) = {
+        let (old_addrs, pending, conditions) = {
             let Some(core_data) = self.core_data_opt(core_index) else {
                 return Ok(());
             };
             let mut old_addrs: Vec<u64> = Vec::new();
             let mut pending: Vec<(Box<Source>, SourceLocation)> = Vec::new();
+            let mut conditions: Vec<Option<BreakpointCondition>> = Vec::new();
             for bp in &core_data.breakpoints {
                 let BreakpointType::SourceBreakpoint {
                     source,
@@ -429,8 +444,10 @@ impl SessionData {
                 };
                 old_addrs.push(bp.address);
                 pending.push((source.clone(), loc.clone()));
+                // A restart counts the hits from 0 again.
+                conditions.push(bp.condition.as_ref().map(BreakpointCondition::restarted));
             }
-            (old_addrs, pending)
+            (old_addrs, pending, conditions)
         };
         if old_addrs.is_empty() {
             return Ok(());
@@ -452,9 +469,16 @@ impl SessionData {
             .await
             .map_err(DebuggerError::ProbeRs)?;
         let mut to_set = Vec::with_capacity(resolved.len());
-        for ((source, location), result) in pending.into_iter().zip(resolved) {
+        for (((source, location), condition), result) in
+            pending.into_iter().zip(conditions).zip(resolved)
+        {
             match result {
-                Ok(verified) => to_set.push((verified.address, source, verified.source_location)),
+                Ok(verified) => to_set.push((
+                    verified.address,
+                    source,
+                    verified.source_location,
+                    condition,
+                )),
                 Err(error) => {
                     return Err(DebuggerError::Other(anyhow!(
                         "Failed to recompute breakpoint at {location:?} in {source:?}. Error: {error}"
@@ -471,14 +495,14 @@ impl SessionData {
                 !matches!(&bp.breakpoint_type, BreakpointType::SourceBreakpoint { .. })
             });
         }
-        let set_addrs: Vec<u64> = to_set.iter().map(|(a, _, _)| *a).collect();
+        let set_addrs: Vec<u64> = to_set.iter().map(|(a, _, _, _)| *a).collect();
         let set_results = self
             .backend
             .set_hw_breakpoints(core_index, set_addrs)
             .await
             .map_err(DebuggerError::ProbeRs)?;
         if let Ok(core_data) = self.core_data_mut(core_index) {
-            for (i, (addr, source, loc)) in to_set.into_iter().enumerate() {
+            for (i, (addr, source, loc, condition)) in to_set.into_iter().enumerate() {
                 if set_results.get(i).is_some_and(|result| result.is_ok()) {
                     core_data.breakpoints.push(ActiveBreakpoint {
                         breakpoint_type: BreakpointType::SourceBreakpoint {
@@ -486,6 +510,7 @@ impl SessionData {
                             location: SourceLocationScope::Specific(loc),
                         },
                         address: addr,
+                        condition,
                     });
                 }
             }
@@ -562,7 +587,7 @@ impl SessionData {
             }
         }
 
-        let (reason, description) = match &entry {
+        let (reason, mut description) = match &entry {
             Some(entry) => (
                 "entry",
                 format!(
@@ -576,6 +601,11 @@ impl SessionData {
                     .await
             }
         };
+        // Why a breakpoint with a condition stopped although the condition was not met.
+        if let Some(note) = self.core_data[cd_idx].stop_note.take() {
+            debug_adapter.log_to_console(format!("Core {core_index}: breakpoint {note}"));
+            description = format!("{description} (breakpoint {note})");
+        }
         // Tell the client when this halt leaves every core halted (the last core of an all-stop).
         // A client may keep only the state of the last `stopped` event (Zed does), so the other
         // cores would otherwise look as if they still ran.
@@ -595,6 +625,298 @@ impl SessionData {
         debug_adapter.send_event("stopped", event_body)?;
         tracing::trace!("Notified DAP client that the core halted: {:?}", status);
         Ok(())
+    }
+
+    /// What the conditions of the breakpoints that a new halt is at make of it; `None` when the
+    /// halt is reported as it is: it is not at a breakpoint, or at one without a condition.
+    ///
+    /// A breakpoint halt is at the breakpoints at the PC. A watchpoint halt does not say which
+    /// watchpoint it was, so it is at all the data breakpoints of the core.
+    async fn check_halt(&mut self, cd_idx: usize, status: CoreStatus) -> Option<HaltCheck> {
+        let core_index = self.core_data[cd_idx].core_index;
+        let pc = match status {
+            CoreStatus::Halted(HaltReason::Watchpoint) => None,
+            CoreStatus::Halted(HaltReason::Breakpoint(cause))
+                if !matches!(cause, BreakpointCause::Semihosting(_)) =>
+            {
+                Some(self.backend.program_counter(core_index).await?)
+            }
+            // In a halt group, a core whose trigger was removed after it fired shows the halt
+            // of the group: it is only checked against the removed breakpoints. (A removed
+            // watchpoint leaves no address to tell such a core from the others of the group.)
+            CoreStatus::Halted(HaltReason::External) => {
+                if self.core_data[cd_idx].removed_conditions.is_empty() {
+                    return None;
+                }
+                let pc = self.backend.program_counter(core_index).await?;
+                let core_data = &self.core_data[cd_idx];
+                let stale = core_data.removed_conditions.contains(&pc);
+                let here = core_data.breakpoints.iter().any(|bp| bp.address == pc);
+                return (stale && !here).then(|| HaltCheck {
+                    stop: false,
+                    note: None,
+                    lines: Vec::new(),
+                });
+            }
+            _ => return None,
+        };
+        let core_data = &self.core_data[cd_idx];
+        // Every breakpoint there must have a condition: one without stops the core anyway.
+        let slots: Vec<ConditionSlot> = match pc {
+            Some(pc) => {
+                let entry = core_data.entry_breakpoint.as_ref();
+                if entry.is_some_and(|entry| entry.armed && entry.address == pc) {
+                    return None;
+                }
+                core_data
+                    .breakpoints
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, bp)| bp.address == pc)
+                    .map(|(i, bp)| bp.condition.as_ref().map(|_| ConditionSlot::Breakpoint(i)))
+                    .collect::<Option<_>>()?
+            }
+            None => core_data
+                .data_breakpoints
+                .iter()
+                .enumerate()
+                .map(|(i, bp)| bp.condition.as_ref().map(|_| ConditionSlot::Data(i)))
+                .collect::<Option<_>>()?,
+        };
+        if slots.is_empty() {
+            // At a breakpoint with a condition that was removed before this poll saw the halt.
+            // A watchpoint halt shows as a breakpoint halt once its watchpoint is gone.
+            let removed = match pc {
+                Some(pc) => {
+                    core_data.removed_conditions.contains(&pc) || core_data.removed_data_condition
+                }
+                None => core_data.removed_data_condition,
+            };
+            return removed.then(|| HaltCheck {
+                stop: false,
+                note: None,
+                lines: Vec::new(),
+            });
+        }
+
+        let mut names: Vec<String> = Vec::new();
+        for slot in &slots {
+            for name in core_data.condition(*slot).map(BreakpointCondition::names)? {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        // Only global variables, as found at an earlier hit of this code breakpoint: they are
+        // read without the frame of the halt, which takes the longest.
+        let globals_only = pc.is_some()
+            && slots.iter().all(|slot| {
+                core_data
+                    .condition(*slot)
+                    .and_then(BreakpointCondition::needs_frame)
+                    == Some(false)
+            });
+        let mut values = Values::default();
+        if names.is_empty() {
+            // A hit count alone.
+        } else if globals_only {
+            match self.backend.live_watch(core_index, names.clone()).await {
+                Ok(read) => {
+                    for read in read {
+                        let value = match read.value {
+                            Some(value) => condition::evaluated(value),
+                            None => Err(read.error.unwrap_or_default()),
+                        };
+                        values.insert(&read.expression, value);
+                    }
+                }
+                Err(error) => {
+                    for name in &names {
+                        values.insert(name, Err(error.to_string()));
+                    }
+                }
+            }
+        } else {
+            // The frame of the halt, for its local variables and registers.
+            match self.backend.unwind_stack(core_index, 1).await {
+                Ok(frames) => {
+                    for name in &names {
+                        let value = self
+                            .backend
+                            .evaluate_name(core_index, name)
+                            .await
+                            .map_err(|error| error.to_string())
+                            .and_then(condition::evaluated);
+                        values.insert(name, value);
+                    }
+                    // The first hit tells whether later ones can do without the frame.
+                    let unknown = slots.iter().any(|slot| {
+                        self.core_data[cd_idx]
+                            .condition(*slot)
+                            .is_some_and(|c| c.needs_frame().is_none())
+                    });
+                    if pc.is_some()
+                        && unknown
+                        && let Some(frame) = frames.first()
+                        && let Some(needs_frame) = self
+                            .names_need_frame(core_index, i64::from(frame.id) as u32, &names)
+                            .await
+                    {
+                        for slot in &slots {
+                            if let Some(condition) = self.core_data[cd_idx].condition_mut(*slot) {
+                                condition.set_needs_frame(needs_frame);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    for name in &names {
+                        values.insert(name, Err(format!("no stack frame: {error}")));
+                    }
+                }
+            }
+        }
+
+        let mut check = HaltCheck {
+            stop: false,
+            note: None,
+            lines: Vec::new(),
+        };
+        for slot in slots {
+            let Some(condition) = self.core_data[cd_idx].condition_mut(slot) else {
+                continue;
+            };
+            match condition.check(&values) {
+                Verdict::Stop(note) => {
+                    check.stop = true;
+                    check.note = check.note.or(note);
+                }
+                Verdict::Run(line) => check.lines.extend(line),
+            }
+        }
+        Some(check)
+    }
+
+    /// Whether one of `names` needs the frame of the halt (top frame `frame_id`, just unwound):
+    /// it is not a global variable (a register, or no variable), or a local variable of the
+    /// frame has the name. `None` when it cannot be told.
+    async fn names_need_frame(
+        &mut self,
+        core_index: usize,
+        frame_id: u32,
+        names: &[String],
+    ) -> Option<bool> {
+        let globals = self
+            .backend
+            .live_watch(core_index, names.to_vec())
+            .await
+            .ok()?;
+        let mut locals = Vec::new();
+        for scope in self.backend.scopes(core_index, frame_id).await.ok()? {
+            if scope.presentation_hint.as_deref() == Some("locals") {
+                let reference = u32::try_from(scope.variables_reference).ok()?;
+                let variables = self
+                    .backend
+                    .variables(core_index, reference, None)
+                    .await
+                    .ok()?;
+                locals.extend(variables.into_iter().map(|variable| variable.name));
+            }
+        }
+        Some(names.iter().any(|name| {
+            let global = globals
+                .iter()
+                .any(|read| &read.expression == name && read.value.is_some());
+            !global || locals.contains(name)
+        }))
+    }
+
+    /// Checks the breakpoint conditions of the new halts in `statuses` before any of them is
+    /// reported. A core whose halt does not meet them runs again, with no event for the client.
+    ///
+    /// With all-stop, the cores halt together: one that stops keeps the others halted, and a run
+    /// lets go the cores that the group halted. The halts these cores show in `statuses` are then
+    /// old, and their status is left as the client knows it for this poll; a halt lasts until a
+    /// run, so one that came since is seen at the next poll.
+    ///
+    /// Returns whether a core runs again: it may soon halt at the breakpoint again, so the next
+    /// poll should come without the usual pause.
+    async fn check_breakpoint_halts(
+        &mut self,
+        session_config: &SessionConfig,
+        debug_adapter: &mut DebugAdapter,
+        statuses: &mut HashMap<usize, CoreStatus>,
+    ) -> bool {
+        let mut checks = Vec::new();
+        for cd_idx in 0..self.core_data.len() {
+            let core_data = &self.core_data[cd_idx];
+            let Some(&status) = statuses.get(&core_data.core_index) else {
+                continue;
+            };
+            if status == core_data.last_known_status {
+                continue;
+            }
+            if let Some(check) = self.check_halt(cd_idx, status).await {
+                checks.push((cd_idx, check));
+            }
+        }
+        // This poll saw each halt from before the removals.
+        for core_data in &mut self.core_data {
+            if statuses.contains_key(&core_data.core_index) {
+                core_data.removed_conditions.clear();
+                core_data.removed_data_condition = false;
+            }
+        }
+        if checks.is_empty() {
+            return false;
+        }
+
+        let all_stop = session_config.all_stop;
+        let any_stop = checks.iter().any(|(_, check)| check.stop);
+        let mut ran = false;
+        for (cd_idx, check) in checks {
+            for line in check.lines {
+                debug_adapter.log_point(&line);
+            }
+            let core_data = &mut self.core_data[cd_idx];
+            if check.stop {
+                core_data.stop_note = check.note;
+                continue;
+            }
+            if all_stop && any_stop {
+                core_data.stop_note = Some(
+                    "condition not met, the core stays halted with the cores that stopped"
+                        .to_string(),
+                );
+                continue;
+            }
+            let core_index = core_data.core_index;
+            match self.backend.run(core_index).await {
+                Ok(()) => {
+                    let core_data = &mut self.core_data[cd_idx];
+                    core_data.invalidate_stack_frame_cache();
+                    core_data.last_known_status = CoreStatus::Running;
+                    statuses.insert(core_index, CoreStatus::Running);
+                    ran = true;
+                }
+                Err(error) => {
+                    self.core_data[cd_idx].stop_note = Some(format!(
+                        "condition not met, but the core did not run: {error}"
+                    ));
+                }
+            }
+        }
+        if all_stop && ran {
+            for core_data in &self.core_data {
+                if let Some(status) = statuses.get_mut(&core_data.core_index)
+                    && status.is_halted()
+                    && *status != core_data.last_known_status
+                {
+                    *status = core_data.last_known_status;
+                }
+            }
+        }
+        ran
     }
 
     /// Update `last_known_status` and emit the appropriate DAP event for a
@@ -824,6 +1146,13 @@ impl SessionData {
         } else {
             None
         };
+        if let Some(statuses) = batch.as_mut()
+            && self
+                .check_breakpoint_halts(session_config, debug_adapter, statuses)
+                .await
+        {
+            suggest_delay_required = false;
+        }
 
         for core_config in session_config.core_configs.iter() {
             // Fetch status via the backend before `attach_core` so the
@@ -845,7 +1174,16 @@ impl SessionData {
                 status
             } else if debug_adapter.configuration_is_done() {
                 match self.backend.status(core_index).await {
-                    Ok(status) => status,
+                    Ok(status) => {
+                        let mut statuses = HashMap::from([(core_index, status)]);
+                        if self
+                            .check_breakpoint_halts(session_config, debug_adapter, &mut statuses)
+                            .await
+                        {
+                            suggest_delay_required = false;
+                        }
+                        statuses.remove(&core_index).unwrap_or(status)
+                    }
                     Err(error) => {
                         let err = DebuggerError::from(error);
                         let _ = debug_adapter.show_error_message(&err);
@@ -1109,6 +1447,9 @@ fn build_core_data(
         stack_frames_valid: false,
         breakpoints: vec![],
         data_breakpoints: vec![],
+        stop_note: None,
+        removed_conditions: vec![],
+        removed_data_condition: false,
         rtt_scan_ranges: WireScanRegion::Ranges(vec![]),
         rtt_connection: None,
         defmt_state: None,

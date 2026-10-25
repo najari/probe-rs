@@ -13,8 +13,9 @@ use crate::cmd::dap_server::{
         protocol::{BoxedAdapter, ProtocolAdapter, ProtocolHelper, hide_file_payloads},
     },
     server::{
+        condition::BreakpointCondition,
         configuration::ConsoleLog,
-        core_data::CoreData,
+        core_data::{CoreData, DataBreakpoint as CoreDataBreakpoint},
         session_data::{ActiveBreakpoint, BreakpointType, SessionData, SourceLocationScope},
     },
 };
@@ -886,7 +887,7 @@ impl DebugAdapter {
                 })
                 .map(|ab| ab.address)
                 .collect();
-            core_data.breakpoints.retain(|ab| {
+            core_data.retain_breakpoints(|ab| {
                 !matches!(
                     &ab.breakpoint_type,
                     BreakpointType::SourceBreakpoint { source: bp_source, .. }
@@ -915,6 +916,17 @@ impl DebugAdapter {
                 }
             })
             .collect();
+        // The condition, hit count and log message of each; one that cannot be read is not set.
+        let conditions: Vec<Result<Option<BreakpointCondition>, String>> = requested_bps
+            .iter()
+            .map(|bp| {
+                BreakpointCondition::new(
+                    bp.condition.as_deref(),
+                    bp.hit_condition.as_deref(),
+                    bp.log_message.as_deref(),
+                )
+            })
+            .collect();
         let resolved = match session_data
             .backend
             .resolve_source_breakpoints(Some(core_index), locations)
@@ -922,7 +934,11 @@ impl DebugAdapter {
         {
             Ok(resolved) => resolved
                 .into_iter()
-                .map(|result| {
+                .zip(&conditions)
+                .map(|(result, condition)| {
+                    if let Err(error) = condition {
+                        return Err(format!("Breakpoint not set: {error}"));
+                    }
                     result.map_err(|error| {
                         format!(
                             "Cannot set breakpoint here. Try reducing compile time-, and link time-, optimization in your build configuration, or choose a different source location: {error}"
@@ -964,7 +980,7 @@ impl DebugAdapter {
             .map_err(|e| DebuggerError::Other(anyhow!("Failed to set breakpoints: {e}")))?;
 
         let mut created_breakpoints: Vec<Breakpoint> = Vec::with_capacity(requested_bps.len());
-        let mut to_cache: Vec<(u64, SourceLocation)> = Vec::new();
+        let mut to_cache: Vec<(u64, SourceLocation, Option<BreakpointCondition>)> = Vec::new();
         let mut set_idx = 0;
         for (i, bp) in requested_bps.iter().enumerate() {
             match &resolved[i] {
@@ -988,7 +1004,8 @@ impl DebugAdapter {
                     let set_result = set_results.get(set_idx);
                     set_idx += 1;
                     if matches!(set_result, Some(Ok(()))) {
-                        to_cache.push((*address, source_location.clone()));
+                        let condition = conditions[i].clone().ok().flatten();
+                        to_cache.push((*address, source_location.clone(), condition));
                         created_breakpoints.push(Breakpoint {
                             column: source_location.column.map(|col| match col {
                                 ColumnType::LeftEdge => 0_i64,
@@ -1035,13 +1052,14 @@ impl DebugAdapter {
 
         // Update the client-side breakpoint cache.
         if let Ok(core_data) = session_data.core_data_mut(core_index) {
-            for (address, source_location) in to_cache {
+            for (address, source_location, condition) in to_cache {
                 core_data.breakpoints.push(ActiveBreakpoint {
                     breakpoint_type: BreakpointType::SourceBreakpoint {
                         source: Box::new(source.clone()),
                         location: SourceLocationScope::Specific(source_location),
                     },
                     address,
+                    condition,
                 });
             }
         }
@@ -1132,9 +1150,15 @@ impl DebugAdapter {
         let arguments: SetDataBreakpointsArguments = get_arguments(self, request)?;
         let previous = match session_data.core_data_mut(core_index) {
             Err(error) => return self.send_response::<()>(request, Err(&error)),
-            Ok(core_data) => std::mem::take(&mut core_data.data_breakpoints),
+            Ok(core_data) => {
+                let previous = std::mem::take(&mut core_data.data_breakpoints);
+                if previous.iter().any(|bp| bp.condition.is_some()) {
+                    core_data.removed_data_condition = true;
+                }
+                previous
+            }
         };
-        for address in previous {
+        for CoreDataBreakpoint { address, .. } in previous {
             if let Err(error) = session_data
                 .backend
                 .clear_watchpoint(core_index, address)
@@ -1162,16 +1186,20 @@ impl DebugAdapter {
                     probe_rs_rpc::core_ops::WireWatchpointAccess::Write
                 }
             };
-            let result = match parsed {
-                None => Err(format!("Invalid data ID {:?}", data_breakpoint.data_id)),
-                Some(_) if data_breakpoint.condition.is_some() => {
-                    Err("Conditions on data breakpoints are not supported".to_string())
-                }
-                Some((address, len)) => session_data
+            let condition = BreakpointCondition::new(
+                data_breakpoint.condition.as_deref(),
+                data_breakpoint.hit_condition.as_deref(),
+                None,
+            )
+            .map_err(|error| format!("Data breakpoint not set: {error}"));
+            let result = match (parsed, condition) {
+                (None, _) => Err(format!("Invalid data ID {:?}", data_breakpoint.data_id)),
+                (Some(_), Err(error)) => Err(error),
+                (Some((address, len)), Ok(condition)) => session_data
                     .backend
                     .set_watchpoint(core_index, address, len, access)
                     .await
-                    .map(|()| address)
+                    .map(|()| CoreDataBreakpoint { address, condition })
                     .map_err(|error| error.to_string()),
             };
             breakpoints.push(Breakpoint {
@@ -1190,8 +1218,8 @@ impl DebugAdapter {
                 verified: result.is_ok(),
                 reason: None,
             });
-            if let Ok(address) = result {
-                set.push(address);
+            if let Ok(data_breakpoint) = result {
+                set.push(data_breakpoint);
             }
         }
         if let Ok(core_data) = session_data.core_data_mut(core_index) {
@@ -1211,6 +1239,12 @@ impl DebugAdapter {
     ) -> Result<()> {
         let arguments: SetInstructionBreakpointsArguments = get_arguments(self, request)?;
         let requested: Vec<InstructionBreakpoint> = arguments.breakpoints;
+        let conditions: Vec<Result<Option<BreakpointCondition>, String>> = requested
+            .iter()
+            .map(|rb| {
+                BreakpointCondition::new(rb.condition.as_deref(), rb.hit_condition.as_deref(), None)
+            })
+            .collect();
 
         // Parse memory references and collect existing instruction bps to clear.
         let (parsed, clear_addrs) = {
@@ -1224,14 +1258,17 @@ impl DebugAdapter {
                 .filter(|ab| matches!(ab.breakpoint_type, BreakpointType::InstructionBreakpoint))
                 .map(|ab| ab.address)
                 .collect();
-            core_data
-                .breakpoints
-                .retain(|ab| !matches!(ab.breakpoint_type, BreakpointType::InstructionBreakpoint));
+            core_data.retain_breakpoints(|ab| {
+                !matches!(ab.breakpoint_type, BreakpointType::InstructionBreakpoint)
+            });
             // The breakpoint is `offset` bytes from the reference (VS Code's disassembly view
             // gives the reference it disassembled from and the offset of the instruction).
+            // One whose condition cannot be read is not set.
             let parsed: Vec<Option<u64>> = requested
                 .iter()
-                .map(|rb| {
+                .zip(&conditions)
+                .map(|(rb, condition)| {
+                    condition.as_ref().ok()?;
                     MemoryAddress::try_from(rb.instruction_reference.as_str())
                         .ok()
                         .and_then(|MemoryAddress(addr)| {
@@ -1268,7 +1305,7 @@ impl DebugAdapter {
             });
 
         let mut breakpoints: Vec<Breakpoint> = Vec::with_capacity(requested.len());
-        let mut to_cache: Vec<u64> = Vec::new();
+        let mut to_cache: Vec<(u64, Option<BreakpointCondition>)> = Vec::new();
         let mut set_idx = 0;
         for (i, rb) in requested.iter().enumerate() {
             match parsed[i] {
@@ -1279,10 +1316,13 @@ impl DebugAdapter {
                     id: None,
                     instruction_reference: Some(rb.instruction_reference.clone()),
                     line: None,
-                    message: Some(format!(
-                        "Invalid memory reference specified: {:?}",
-                        rb.instruction_reference
-                    )),
+                    message: Some(match &conditions[i] {
+                        Err(error) => format!("Breakpoint not set: {error}"),
+                        Ok(_) => format!(
+                            "Invalid memory reference specified: {:?}",
+                            rb.instruction_reference
+                        ),
+                    }),
                     offset: None,
                     source: None,
                     verified: false,
@@ -1292,7 +1332,7 @@ impl DebugAdapter {
                     let set_result = set_results.get(set_idx);
                     set_idx += 1;
                     if matches!(set_result, Some(Ok(()))) {
-                        to_cache.push(memory_reference);
+                        to_cache.push((memory_reference, conditions[i].clone().ok().flatten()));
                     }
                     let source_location = if matches!(set_result, Some(Ok(()))) {
                         source_locations.get(set_idx - 1).cloned().flatten()
@@ -1312,10 +1352,11 @@ impl DebugAdapter {
         }
 
         if let Ok(core_data) = session_data.core_data_mut(core_index) {
-            for address in to_cache {
+            for (address, condition) in to_cache {
                 core_data.breakpoints.push(ActiveBreakpoint {
                     breakpoint_type: BreakpointType::InstructionBreakpoint,
                     address,
+                    condition,
                 });
             }
         }
@@ -1856,6 +1897,23 @@ impl DebugAdapter {
 
     pub fn log_to_console(&mut self, message: impl AsRef<str>) -> bool {
         self.adapter.log_to_console(message.as_ref())
+    }
+
+    /// A line of a log point, sent as program output (category `stdout`) apart from the
+    /// debugger's own messages: a client may fold repeated messages, but every hit counts.
+    pub fn log_point(&mut self, line: &str) -> bool {
+        let body = OutputEventBody {
+            output: format!("{line}\n"),
+            category: Some("stdout".to_owned()),
+            variables_reference: None,
+            source: None,
+            line: None,
+            column: None,
+            data: None,
+            group: None,
+            location_reference: None,
+        };
+        self.send_event("output", Some(body)).is_ok()
     }
 
     /// Send a custom "probe-rs-show-message" event to the MS DAP Client.

@@ -1,3 +1,5 @@
+/// The condition, hit count and log message of a breakpoint.
+pub(crate) mod condition;
 /// All the shared options that control the behaviour of the debugger.
 pub(crate) mod configuration;
 /// The data structures borrowed from the [`session_data::SessionData`], that applies to a specific core.

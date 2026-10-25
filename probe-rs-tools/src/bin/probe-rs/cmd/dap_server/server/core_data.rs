@@ -1,6 +1,6 @@
 use std::any::Any;
 
-use super::session_data;
+use super::{condition::BreakpointCondition, session_data};
 use crate::cmd::dap_server::debug_adapter::dap::repl_commands::ReplCommand;
 use crate::rpc::{Key, RttClient};
 use probe_rs_rpc::rtt_client::ScanRegion as WireScanRegion;
@@ -33,8 +33,18 @@ pub struct CoreData {
     /// [`Self::replace_stack_frame_cache`], cleared by [`Self::invalidate_stack_frame_cache`]).
     pub stack_frames_valid: bool,
     pub breakpoints: Vec<session_data::ActiveBreakpoint>,
-    /// The addresses of the data breakpoints set with `setDataBreakpoints`.
-    pub data_breakpoints: Vec<u64>,
+    /// The data breakpoints set with `setDataBreakpoints`.
+    pub data_breakpoints: Vec<DataBreakpoint>,
+    /// Why the halt that a breakpoint condition let stop is reported as it is (a condition that
+    /// could not be checked). The `stopped` event adds it to its description, then clears it.
+    pub stop_note: Option<String>,
+    /// The addresses of the breakpoints with a condition that were removed since the last poll.
+    /// The core may have halted at one before it was removed, and the poll has not checked that
+    /// halt yet: the core runs on, as it would have without a breakpoint there.
+    pub removed_conditions: Vec<u64>,
+    /// A data breakpoint with a condition was removed since the last poll (the same for a
+    /// watchpoint halt).
+    pub removed_data_condition: bool,
     pub rtt_scan_ranges: WireScanRegion,
     pub rtt_connection: Option<debug_rtt::RttConnection>,
     /// defmt data of the program binary, parsed on the first RTT attach.
@@ -52,6 +62,24 @@ pub struct CoreData {
     pub test_data: Box<dyn Any>,
     /// The `entryFunction` of a `launch`, run to after each reset.
     pub entry_breakpoint: Option<EntryBreakpoint>,
+}
+
+/// Where the condition of a breakpoint of a core is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConditionSlot {
+    /// The breakpoint at this index of [`CoreData::breakpoints`].
+    Breakpoint(usize),
+    /// The data breakpoint at this index of [`CoreData::data_breakpoints`].
+    Data(usize),
+}
+
+/// A data breakpoint (watchpoint) of a core.
+#[derive(Clone, Debug)]
+pub struct DataBreakpoint {
+    pub address: u64,
+    /// The condition and hit count. A watchpoint halt does not say which watchpoint it was, so
+    /// each data breakpoint of the core is checked at one.
+    pub condition: Option<BreakpointCondition>,
 }
 
 /// A temporary breakpoint on the entry function, set after a reset and removed when hit.
@@ -83,6 +111,40 @@ pub(crate) fn function_address(elf: &[u8], name: &str) -> Result<u64, String> {
 }
 
 impl CoreData {
+    pub(crate) fn condition(&self, slot: ConditionSlot) -> Option<&BreakpointCondition> {
+        match slot {
+            ConditionSlot::Breakpoint(i) => self.breakpoints.get(i)?.condition.as_ref(),
+            ConditionSlot::Data(i) => self.data_breakpoints.get(i)?.condition.as_ref(),
+        }
+    }
+
+    pub(crate) fn condition_mut(
+        &mut self,
+        slot: ConditionSlot,
+    ) -> Option<&mut BreakpointCondition> {
+        match slot {
+            ConditionSlot::Breakpoint(i) => self.breakpoints.get_mut(i)?.condition.as_mut(),
+            ConditionSlot::Data(i) => self.data_breakpoints.get_mut(i)?.condition.as_mut(),
+        }
+    }
+
+    /// Keeps the breakpoints for which `keep` is true, and the addresses of the removed ones that
+    /// had a condition in [`Self::removed_conditions`].
+    pub(crate) fn retain_breakpoints(
+        &mut self,
+        mut keep: impl FnMut(&session_data::ActiveBreakpoint) -> bool,
+    ) {
+        let mut removed = Vec::new();
+        self.breakpoints.retain(|bp| {
+            let kept = keep(bp);
+            if !kept && bp.condition.is_some() {
+                removed.push(bp.address);
+            }
+            kept
+        });
+        self.removed_conditions.extend(removed);
+    }
+
     pub(crate) fn invalidate_stack_frame_cache(&mut self) {
         self.stack_frames.clear();
         self.stack_frames_valid = false;
@@ -124,6 +186,9 @@ fn stack_frame_display_cache_is_invalidated_before_replacement() {
         stack_frames_valid: true,
         breakpoints: vec![],
         data_breakpoints: vec![],
+        stop_note: None,
+        removed_conditions: vec![],
+        removed_data_condition: false,
         rtt_scan_ranges: WireScanRegion::Ranges(vec![]),
         rtt_connection: None,
         defmt_state: None,
