@@ -84,7 +84,11 @@ pub struct RttConnection {
 impl RttConnection {
     /// Poll all available channels through RPC and transmit data to the DAP
     /// client. Returns `true` if at least one channel had data.
-    pub async fn process_rtt_data_remote(&mut self, debug_adapter: &mut DebugAdapter) -> bool {
+    pub async fn process_rtt_data_remote(
+        &mut self,
+        debug_adapter: &mut DebugAdapter,
+        core_index: usize,
+    ) -> bool {
         // Only poll channels with an open client window; draining a closed
         // channel would drop target buffers prematurely.
         let windowed: Vec<u32> = self
@@ -128,7 +132,7 @@ impl RttConnection {
             };
 
             at_least_one_channel_had_data |=
-                debugger_rtt_channel.process_bytes(debug_adapter, &bytes);
+                debugger_rtt_channel.process_bytes(debug_adapter, core_index, &bytes);
         }
         at_least_one_channel_had_data
     }
@@ -153,9 +157,16 @@ pub(crate) struct DebuggerRttChannel {
 impl DebuggerRttChannel {
     /// Decode already-fetched `bytes` for this channel and forward them.
     /// Returns whether any data was emitted.
-    pub(crate) fn process_bytes(&mut self, debug_adapter: &mut DebugAdapter, bytes: &[u8]) -> bool {
+    pub(crate) fn process_bytes(
+        &mut self,
+        debug_adapter: &mut DebugAdapter,
+        core_index: usize,
+        bytes: &[u8],
+    ) -> bool {
         match self.channel_data_format.process(bytes).ok().flatten() {
-            Some(data) => debug_adapter.rtt_output(self.channel_number, data.to_string()),
+            Some(data) => {
+                debug_adapter.rtt_output(core_index, self.channel_number, data.to_string())
+            }
             _ => false,
         }
     }

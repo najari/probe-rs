@@ -977,6 +977,17 @@ mod tests {
     }
 
     #[test]
+    fn an_rtt_window_goes_to_the_core_it_names() {
+        // A client opens the RTT channel of the core the channel's event named.
+        let routing = routing(&[0, 1, 2]);
+        let (core, _) = routing.route(&request(
+            "rttWindowOpened",
+            json!({ "channelNumber": 0, "windowIsOpen": true, "core": 1 }),
+        ));
+        assert_eq!(core, Some(1));
+    }
+
+    #[test]
     fn a_request_to_every_core_fails_when_one_core_fails() {
         let responses = vec![
             (0, response("configurationDone", true, Value::Null)),

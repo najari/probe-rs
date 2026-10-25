@@ -1864,9 +1864,16 @@ impl DebugAdapter {
         self.adapter.show_message(severity, message)
     }
 
+    /// The core to name in an RTT event of `core_index`: in a session of several cores each core
+    /// has its own channels, numbered from 0; with one core the events stay as they were.
+    fn rtt_core(&self, core_index: usize) -> Option<usize> {
+        self.routing().is_multi_core().then_some(core_index)
+    }
+
     /// Send a custom `probe-rs-rtt-channel-config` event to the MS DAP Client, to create a window for a specific RTT channel.
     pub fn rtt_window(
         &mut self,
+        core_index: usize,
         channel_number: u32,
         channel_name: String,
         data_format: DataFormat,
@@ -1875,6 +1882,7 @@ impl DebugAdapter {
             channel_number,
             channel_name,
             data_format,
+            core: self.rtt_core(core_index),
         }) else {
             return false;
         };
@@ -1883,12 +1891,19 @@ impl DebugAdapter {
             .is_ok()
     }
 
-    /// Send a custom `probe-rs-rtt-channel-config` event to the MS DAP Client, to create a window for a specific RTT channel.
-    pub fn open_prompt(&mut self, kind: PromptKind, name: &str, handle: u32) -> bool {
+    /// Send a custom `probe-rs-create-prompt` event to the MS DAP Client, to create a prompt for a specific RTT down channel.
+    pub fn open_prompt(
+        &mut self,
+        core_index: usize,
+        kind: PromptKind,
+        name: &str,
+        handle: u32,
+    ) -> bool {
         let Ok(event_body) = serde_json::to_value(CreatePromptEventBody {
             prompt_kind: kind,
             prompt_name: name.to_string(),
             prompt_handle: handle,
+            core: self.rtt_core(core_index),
         }) else {
             return false;
         };
@@ -1898,10 +1913,11 @@ impl DebugAdapter {
     }
 
     /// Send a custom `probe-rs-rtt-data` event to the MS DAP Client, to
-    pub fn rtt_output(&mut self, channel_number: u32, rtt_data: String) -> bool {
+    pub fn rtt_output(&mut self, core_index: usize, channel_number: u32, rtt_data: String) -> bool {
         let Ok(event_body) = serde_json::to_value(RttDataEventBody {
             channel_number,
             data: rtt_data,
+            core: self.rtt_core(core_index),
         }) else {
             return false;
         };

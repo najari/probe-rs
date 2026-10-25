@@ -660,6 +660,7 @@ impl SessionData {
 
         let mut defmt_data = self.core_data[cd_idx].defmt_state.clone();
         let use_auto_formats = rtt_config.channels.is_empty();
+        let core_index = self.core_data[cd_idx].core_index;
 
         let mut build_up_channel = |debug_adapter: &mut DebugAdapter,
                                     number: u32,
@@ -712,7 +713,7 @@ impl SessionData {
 
             let data_format = DataFormat::from(&channel_data_format);
 
-            debug_adapter.rtt_window(number, channel_name.to_string(), data_format);
+            debug_adapter.rtt_window(core_index, number, channel_name.to_string(), data_format);
 
             Ok(debug_rtt::DebuggerRttChannel {
                 channel_number: number,
@@ -761,7 +762,7 @@ impl SessionData {
         self.core_data[cd_idx].defmt_state = defmt_data;
 
         for (number, name) in &down_channels {
-            debug_adapter.open_prompt(PromptKind::Rtt, name, *number);
+            debug_adapter.open_prompt(core_index, PromptKind::Rtt, name, *number);
         }
 
         self.core_data[cd_idx].rtt_connection = Some(debug_rtt::RttConnection {
@@ -892,7 +893,9 @@ impl SessionData {
             // channel/display metadata.
             if rtt_enabled {
                 if let Some(core_rtt) = self.core_data[cd_idx].rtt_connection.as_mut() {
-                    let had_data = core_rtt.process_rtt_data_remote(debug_adapter).await;
+                    let had_data = core_rtt
+                        .process_rtt_data_remote(debug_adapter, core_index)
+                        .await;
                     if had_data {
                         suggest_delay_required = false;
                     }
@@ -930,7 +933,7 @@ impl SessionData {
                             path,
                             format,
                         } => {
-                            debug_adapter.rtt_window(handle, path, format);
+                            debug_adapter.rtt_window(core_index, handle, path, format);
                         }
                         crate::cmd::dap_server::backend::SemihostingUiEvent::LogToConsole(msg) => {
                             debug_adapter.log_to_console(msg);
@@ -939,7 +942,7 @@ impl SessionData {
                             handle,
                             data,
                         } => {
-                            debug_adapter.rtt_output(handle, data);
+                            debug_adapter.rtt_output(core_index, handle, data);
                         }
                     }
                 }

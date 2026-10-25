@@ -45,6 +45,10 @@ pub struct RttChannelEventBody {
     pub channel_number: u32,
     pub channel_name: String,
     pub data_format: DataFormat,
+    /// The core of the channel, in a session of several cores (each core has its own RTT
+    /// control block and channel numbers). A client names it in `rttWindowOpened` (`core`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core: Option<usize>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -59,6 +63,9 @@ pub struct CreatePromptEventBody {
     pub prompt_kind: PromptKind,
     pub prompt_name: String,
     pub prompt_handle: u32,
+    /// The core of the prompt's channel, in a session of several cores.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core: Option<usize>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
@@ -67,6 +74,9 @@ pub struct RttDataEventBody {
     pub channel_number: u32,
     /// RTT output
     pub data: String,
+    /// The core of the channel, in a session of several cores.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core: Option<usize>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
