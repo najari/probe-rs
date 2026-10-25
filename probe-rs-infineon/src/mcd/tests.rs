@@ -29,6 +29,12 @@ struct Fake {
     /// The memory spaces of every core: (id, name, type). Transactions must use the first that
     /// is not registers, a cache or virtual, or 0 without one.
     spaces: Vec<(u32, &'static str, u32)>,
+    running: bool,
+    /// The core stopped since the last state query.
+    stopped_event: bool,
+    /// The triggers: (ID, address).
+    triggers: Vec<(u32, u64)>,
+    next_trigger: u32,
 }
 
 impl Fake {
@@ -258,10 +264,13 @@ unsafe extern "C" fn execute_txlist(
         if tx.access_width != 0 {
             assert_eq!(tx.access_width as u32, tx.num_bytes);
         }
-        let address = tx.addr.address;
-        if tx.addr.mem_space_id != with(|s| s.device_space()) {
+        let address = if tx.addr.mem_space_id == REGISTER_SPACE {
+            REGISTER_BASE + tx.addr.address
+        } else if tx.addr.mem_space_id == with(|s| s.device_space()) {
+            tx.addr.address
+        } else {
             return fail(MCD_ERR_TXLIST_TX, "unknown memory space");
-        }
+        };
         if tx.access_type == MCD_TX_AT_R {
             if (address..address + data.len() as u64).contains(&BAD_ADDRESS) {
                 return fail(
@@ -303,6 +312,188 @@ unsafe extern "C" fn rst(_core: *const mcd_core_st, class: u32, halt: mcd_bool_t
     0
 }
 
+/// The memory space of the fake's registers.
+const REGISTER_SPACE: u32 = 5;
+/// Where the fake keeps register `address` in its memory.
+const REGISTER_BASE: u64 = 1 << 40;
+/// The fake's registers: (name, address, bits).
+const REGISTERS: [(&str, u64, u32); 3] =
+    [("PC", 0xFE08, 32), ("D0", 0xFF00, 32), ("E0", 0xFF00, 64)];
+
+fn fake_pc() -> u64 {
+    with(|s| {
+        (0..4).fold(0, |n, i| {
+            n | u64::from(*s.memory.get(&(REGISTER_BASE + 0xFE08 + i)).unwrap_or(&0)) << (8 * i)
+        })
+    })
+}
+
+fn set_fake_pc(pc: u64) {
+    with(|s| {
+        for i in 0..4 {
+            s.memory
+                .insert(REGISTER_BASE + 0xFE08 + i, (pc >> (8 * i)) as u8);
+        }
+    });
+}
+
+unsafe extern "C" fn qry_state(
+    _core: *const mcd_core_st,
+    state: *mut mcd_core_state_st,
+) -> mcd_return_et {
+    // A running core with a trigger stops at it at once.
+    let hit = with(|s| {
+        let hit = s.running.then(|| s.triggers.first().copied()).flatten();
+        if hit.is_some() {
+            s.running = false;
+            s.stopped_event = true;
+        }
+        hit
+    });
+    if let Some((_, address)) = hit {
+        set_fake_pc(address);
+    }
+    let state = unsafe { &mut *state };
+    with(|s| {
+        state.state = if s.running {
+            MCD_CORE_STATE_RUNNING
+        } else {
+            MCD_CORE_STATE_DEBUG
+        };
+        state.event = if std::mem::take(&mut s.stopped_event) {
+            MCD_CORE_EVENT_STOPPED
+        } else {
+            0
+        };
+        state.trig_id = hit.map_or(0, |(id, _)| id);
+        set_c_string(&mut state.info_str, b"fake core");
+    });
+    0
+}
+
+unsafe extern "C" fn run_core(_core: *const mcd_core_st, global: mcd_bool_t) -> mcd_return_et {
+    #[allow(clippy::useless_conversion)]
+    let global = u32::from(global);
+    with(|s| {
+        s.running = true;
+        s.calls.push(format!("run {global}"));
+    });
+    0
+}
+
+unsafe extern "C" fn stop_core(_core: *const mcd_core_st, global: mcd_bool_t) -> mcd_return_et {
+    #[allow(clippy::useless_conversion)]
+    let global = u32::from(global);
+    with(|s| {
+        s.running = false;
+        s.stopped_event = true;
+        s.calls.push(format!("stop {global}"));
+    });
+    0
+}
+
+unsafe extern "C" fn step_core(
+    _core: *const mcd_core_st,
+    _global: mcd_bool_t,
+    step_type: u32,
+    count: u32,
+) -> mcd_return_et {
+    assert_eq!(step_type, MCD_CORE_STEP_TYPE_INSTR);
+    if with(|s| s.running) {
+        return fail(0x1000, "the core runs");
+    }
+    set_fake_pc(fake_pc() + 4 * u64::from(count));
+    0
+}
+
+unsafe extern "C" fn qry_reg_groups(
+    _core: *const mcd_core_st,
+    start: u32,
+    count: *mut u32,
+    out: *mut mcd_register_group_st,
+) -> mcd_return_et {
+    let mut group: mcd_register_group_st = zeroed();
+    group.reg_group_id = 1;
+    set_c_string(&mut group.reg_group_name, b"Core registers");
+    group.n_registers = REGISTERS.len() as u32;
+    unsafe { answer(&[group], start, count, out) }
+}
+
+unsafe extern "C" fn qry_reg_map(
+    _core: *const mcd_core_st,
+    group: u32,
+    start: u32,
+    count: *mut u32,
+    out: *mut mcd_register_info_st,
+) -> mcd_return_et {
+    if group != 1 {
+        return fail(0x1300, "no such register group");
+    }
+    let registers = REGISTERS.map(|(name, address, bits)| {
+        let mut info: mcd_register_info_st = zeroed();
+        info.addr.address = address;
+        info.addr.mem_space_id = REGISTER_SPACE;
+        info.reg_group_id = 1;
+        set_c_string(&mut info.regname, name.as_bytes());
+        info.regsize = bits;
+        info
+    });
+    unsafe { answer(&registers, start, count, out) }
+}
+
+unsafe extern "C" fn qry_trig_info(
+    _core: *const mcd_core_st,
+    info: *mut mcd_trig_info_st,
+) -> mcd_return_et {
+    let info = unsafe { &mut *info };
+    info.type_ = MCD_TRIG_TYPE_IP | MCD_TRIG_TYPE_RW;
+    info.action = MCD_TRIG_ACTION_DBG_DEBUG;
+    info.trig_number = 8;
+    0
+}
+
+unsafe extern "C" fn create_trig(
+    _core: *const mcd_core_st,
+    trig: *mut std::ffi::c_void,
+    id: *mut u32,
+) -> mcd_return_et {
+    let trigger = unsafe { &mut *trig.cast::<mcd_trig_simple_core_st>() };
+    assert_eq!(
+        trigger.struct_size as usize,
+        size_of::<mcd_trig_simple_core_st>()
+    );
+    assert_eq!(trigger.type_, MCD_TRIG_TYPE_IP);
+    assert_eq!(trigger.action, MCD_TRIG_ACTION_DBG_DEBUG);
+    let address = trigger.addr_start.address;
+    let new = with(|s| {
+        s.next_trigger += 1;
+        s.triggers.push((s.next_trigger, address));
+        s.calls.push(format!("create_trig {address:#x}"));
+        s.next_trigger
+    });
+    unsafe { *id = new };
+    0
+}
+
+unsafe extern "C" fn remove_trig(_core: *const mcd_core_st, id: u32) -> mcd_return_et {
+    let found = with(|s| {
+        let before = s.triggers.len();
+        s.triggers.retain(|(t, _)| *t != id);
+        s.calls.push(format!("remove_trig {id}"));
+        s.triggers.len() < before
+    });
+    if found {
+        0
+    } else {
+        fail(0x2000, "no such trigger")
+    }
+}
+
+unsafe extern "C" fn activate_trig_set(_core: *const mcd_core_st) -> mcd_return_et {
+    with(|s| s.calls.push("activate_trig_set".into()));
+    0
+}
+
 const FUNCTIONS: McdFunctions = McdFunctions {
     initialize,
     exit,
@@ -319,6 +510,22 @@ const FUNCTIONS: McdFunctions = McdFunctions {
     execute_txlist,
     qry_rst_classes,
     rst,
+    run_control: Some(McdRunFunctions {
+        qry_state,
+        run: run_core,
+        stop: stop_core,
+        step: step_core,
+    }),
+    registers: Some(McdRegisterFunctions {
+        qry_reg_groups,
+        qry_reg_map,
+    }),
+    triggers: Some(McdTriggerFunctions {
+        qry_trig_info,
+        create_trig,
+        remove_trig,
+        activate_trig_set,
+    }),
 };
 
 /// Sets up a fresh fake library and a probe for it, with `config` as in a selector.
@@ -639,4 +846,118 @@ fn the_inventory_lists_every_core_and_closes_again() {
     assert_eq!(with(|s| s.calls.last().cloned()).as_deref(), Some("exit"));
     // The probe still attaches afterwards (and the bad pick of its own target shows then).
     assert!(probe.attach().is_err());
+}
+
+#[test]
+fn the_core_runs_stops_and_steps_through_the_library() {
+    let (_guard, mut probe) = probe("");
+    assert!(matches!(probe.core_state(), Err(McdError::NotConnected)));
+    probe.attach().unwrap();
+    assert!(probe.has_run_control());
+    let state = probe.core_state().unwrap();
+    assert_eq!(state.execution, McdExecution::Debug);
+    assert!(state.execution.is_stopped());
+    assert_eq!(state.info, "fake core");
+
+    probe.run_core(false).unwrap();
+    assert_eq!(probe.core_state().unwrap().execution, McdExecution::Running);
+    // Stepping a running core is the library's error.
+    let error = messages(&probe.step_instructions(1).unwrap_err());
+    assert!(error.contains("the core runs"), "{error}");
+    probe.stop_core(false).unwrap();
+    let state = probe.core_state().unwrap();
+    assert!(state.stopped_since());
+    assert!(!probe.core_state().unwrap().stopped_since());
+    assert_eq!(with(|s| s.calls[3..].to_vec()), ["run 0", "stop 0"]);
+
+    // The registers of the library's map, in their memory space.
+    let groups = probe.register_groups().unwrap();
+    assert_eq!(
+        groups,
+        [McdRegisterGroup {
+            id: 1,
+            name: "Core registers".into(),
+            registers: 3
+        }]
+    );
+    let pc = probe.find_register("pc").unwrap();
+    assert_eq!(
+        (pc.name.as_str(), pc.address, pc.space, pc.bits),
+        ("PC", 0xFE08, 5, 32)
+    );
+    probe.write_register_u64(&pc, 0x8000_0100).unwrap();
+    probe.step_instructions(3).unwrap();
+    assert_eq!(probe.read_register_u64(&pc).unwrap(), 0x8000_010C);
+    assert_eq!(probe.read_register(&pc).unwrap(), [0x0C, 0x01, 0x00, 0x80]);
+    let e0 = probe.find_register("E0").unwrap();
+    probe
+        .write_register_u64(&e0, 0x1122_3344_5566_7788)
+        .unwrap();
+    assert_eq!(probe.read_register_u64(&e0).unwrap(), 0x1122_3344_5566_7788);
+    let d0 = probe.find_register("D0").unwrap();
+    assert_eq!(probe.read_register_u64(&d0).unwrap(), 0x5566_7788);
+    assert!(probe.find_register("A99").is_err());
+    // The device memory is not the registers.
+    assert_eq!(probe.read_u32(AddressMap::Target, 0xFE08).unwrap(), 0);
+}
+
+#[test]
+fn breakpoints_are_triggers_that_stop_the_core() {
+    let (_guard, mut probe) = probe("");
+    probe.attach().unwrap();
+    let info = probe.trigger_info().unwrap();
+    assert_eq!(info.count, 8);
+    assert_ne!(info.types & MCD_TRIG_TYPE_IP, 0);
+
+    let id = probe.set_breakpoint(0x8021_C04E).unwrap();
+    probe.run_core(false).unwrap();
+    let state = probe.core_state().unwrap();
+    assert_eq!(state.execution, McdExecution::Debug);
+    assert_eq!(state.trigger, id);
+    assert!(state.stopped_since());
+    let pc = probe.find_register("PC").unwrap();
+    assert_eq!(probe.read_register_u64(&pc).unwrap(), 0x8021_C04E);
+
+    probe.remove_trigger(id).unwrap();
+    assert!(probe.remove_trigger(id).is_err());
+    probe.run_core(false).unwrap();
+    assert_eq!(probe.core_state().unwrap().execution, McdExecution::Running);
+    assert_eq!(
+        with(|s| s
+            .calls
+            .iter()
+            .filter(|c| c.contains("trig"))
+            .cloned()
+            .collect::<Vec<_>>()),
+        [
+            "create_trig 0x8021c04e",
+            "activate_trig_set",
+            "remove_trig 1",
+            "activate_trig_set",
+            "remove_trig 1",
+        ]
+    );
+}
+
+#[test]
+fn a_library_without_run_control_says_so() {
+    let functions = McdFunctions {
+        run_control: None,
+        registers: None,
+        triggers: None,
+        ..FUNCTIONS
+    };
+    let (_guard, mut probe) = probe_with("", functions);
+    probe.attach().unwrap();
+    assert!(!probe.has_run_control());
+    for error in [
+        probe.core_state().unwrap_err(),
+        probe.register_groups().unwrap_err(),
+        probe.set_breakpoint(0x8000_0000).unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("has no"), "{error}");
+    }
+    // The bus works as before.
+    probe.write_u32(AddressMap::Target, 0x7000_0000, 9).unwrap();
+    assert_eq!(probe.read_u32(AddressMap::Target, 0x7000_0000).unwrap(), 9);
 }

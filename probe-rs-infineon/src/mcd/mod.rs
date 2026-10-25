@@ -2,10 +2,10 @@
 //!
 //! Debug tools for AURIX often ship an MCD API v1.1 implementation as a shared library (for
 //! example `mcdxdas.dll` of the Infineon DAS installation, or `mcd_tas.dll`, an MCD library
-//! over a TAS server). This probe loads such a library at run time and uses it for memory
-//! transactions and reset only. Everything else (run control, breakpoints, stepping) is done by
-//! the TriCore core implementation of probe-rs through the OCDS registers, exactly as with the
-//! TAS probe.
+//! over a TAS server). This probe loads such a library at run time. As a probe of a probe-rs
+//! session it uses the library for memory transactions and reset only: everything else (run
+//! control, breakpoints, stepping) is done by the TriCore core implementation of probe-rs
+//! through the OCDS registers, exactly as with the TAS probe.
 //!
 //! The library is not part of probe-rs; it is loaded from the path in the selector, or from the
 //! environment variable `PROBE_RS_MCD_DLL` when the selector has no path:
@@ -36,7 +36,13 @@
 //!
 //! The transactions use the first memory space that the library reports for the core and that
 //! holds neither registers nor a cache (`Code and Data`, id 0, for the Infineon libraries).
+//!
+//! Besides the bus, the probe can control its core through the library ([`control`]): its
+//! state, run, stop and step, the registers of the library's register map, and breakpoints as
+//! MCD triggers. That is the way to cores whose debug registers probe-rs does not know. The
+//! `mcd_core` example drives a core this way.
 
+pub mod control;
 pub mod ffi;
 
 use std::{
@@ -57,6 +63,7 @@ use probe_rs::{
     },
 };
 
+pub use control::{McdCoreState, McdExecution, McdRegister, McdRegisterGroup, McdTriggerInfo};
 use ffi::McdFunctions;
 
 use crate::tas::TAS_VID;
@@ -282,6 +289,8 @@ pub enum McdError {
     },
     /// The probe is not connected to a core.
     NotConnected,
+    /// The MCD library has no {0} functions.
+    NotSupported(&'static str),
 }
 
 impl probe_rs::probe::ProbeError for McdError {}

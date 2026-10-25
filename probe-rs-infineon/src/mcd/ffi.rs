@@ -1,13 +1,13 @@
 //! The parts of the MCD (Multi-Core Debug) API v1.1 that the MCD probe uses.
 //!
 //! The types and constants are transcribed from the SPRINT MCD API header `mcd_api.h`
-//! (version 1.1). Only the functions for connecting, memory spaces, memory transactions, reset
-//! and error information are declared. The original copyright notice and license are
-//! reproduced below, as the license requires.
+//! (version 1.1). Only the functions for connecting, memory spaces, memory transactions, reset,
+//! error information, execution control, register maps and simple triggers are declared. The
+//! original copyright notice and license are reproduced below, as the license requires.
 //!
 //! Modification notice: this file is a partial Rust translation of `mcd_api.h` and
 //! `mcd_types.h`, made by the probe-rs contributors on 2026-10-23 (memory spaces added on
-//! 2026-10-24).
+//! 2026-10-24; execution control, register maps and simple triggers added on 2026-10-26).
 //!
 //! ```text
 //! Copyright (c) 2008, ARM Ltd., Infineon Technologies, NXP Semiconductors,
@@ -90,6 +90,29 @@ pub const MCD_MEM_SPACE_IS_CACHE: u32 = 0x08;
 pub const MCD_TX_AT_R: u32 = 1;
 pub const MCD_TX_AT_W: u32 = 2;
 pub const MCD_TX_OPT_DEFAULT: u32 = 0;
+
+pub const MCD_REG_NAME_LEN: usize = 32;
+pub const MCD_REG_TYPE_SIMPLE: u32 = 0;
+pub const MCD_REG_TYPE_COMPOUND: u32 = 1;
+pub const MCD_REG_TYPE_PARTIAL: u32 = 2;
+
+pub const MCD_CORE_STATE_UNKNOWN: u32 = 0;
+pub const MCD_CORE_STATE_RUNNING: u32 = 1;
+pub const MCD_CORE_STATE_HALTED: u32 = 2;
+pub const MCD_CORE_STATE_DEBUG: u32 = 3;
+
+pub const MCD_CORE_EVENT_STOPPED: u32 = 0x10;
+
+pub const MCD_CORE_STEP_TYPE_CYCLES: u32 = 1;
+pub const MCD_CORE_STEP_TYPE_INSTR: u32 = 2;
+
+pub const MCD_TRIG_TYPE_IP: u32 = 0x01;
+pub const MCD_TRIG_TYPE_READ: u32 = 0x02;
+pub const MCD_TRIG_TYPE_WRITE: u32 = 0x04;
+pub const MCD_TRIG_TYPE_RW: u32 = 0x08;
+pub const MCD_TRIG_OPT_DEFAULT: u32 = 0x00;
+pub const MCD_TRIG_OPT_IMPL_HARDWARE: u32 = 0x01;
+pub const MCD_TRIG_ACTION_DBG_DEBUG: u32 = 0x01;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -200,6 +223,67 @@ pub struct mcd_txlist_st {
     pub num_tx_ok: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct mcd_register_group_st {
+    pub reg_group_id: u32,
+    pub reg_group_name: [c_char; MCD_REG_NAME_LEN],
+    pub n_registers: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct mcd_register_info_st {
+    pub addr: mcd_addr_st,
+    pub reg_group_id: u32,
+    pub regname: [c_char; MCD_REG_NAME_LEN],
+    /// The size in bits.
+    pub regsize: u32,
+    pub core_mode_mask_read: u32,
+    pub core_mode_mask_write: u32,
+    pub has_side_effects_read: mcd_bool_t,
+    pub has_side_effects_write: mcd_bool_t,
+    pub reg_type: u32,
+    pub hw_thread_id: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct mcd_core_state_st {
+    pub state: u32,
+    pub event: u32,
+    pub hw_thread_id: u32,
+    pub trig_id: u32,
+    pub stop_str: [c_char; MCD_INFO_STR_LEN],
+    pub info_str: [c_char; MCD_INFO_STR_LEN],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct mcd_trig_info_st {
+    pub type_: u32,
+    pub option: u32,
+    pub action: u32,
+    pub trig_number: u32,
+    pub state_number: u32,
+    pub counter_number: u32,
+    pub sw_breakpoints: mcd_bool_t,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct mcd_trig_simple_core_st {
+    pub struct_size: u32,
+    pub type_: u32,
+    pub option: u32,
+    pub action: u32,
+    pub action_param: u32,
+    pub modified: mcd_bool_t,
+    pub state_mask: u32,
+    pub addr_start: mcd_addr_st,
+    pub addr_range: u64,
+}
+
 pub type mcd_initialize_f = unsafe extern "C" fn(
     version_req: *const mcd_api_version_st,
     impl_info: *mut mcd_impl_version_info_st,
@@ -253,6 +337,69 @@ pub type mcd_rst_f = unsafe extern "C" fn(
     rst_and_halt: mcd_bool_t,
 ) -> mcd_return_et;
 
+pub type mcd_qry_state_f =
+    unsafe extern "C" fn(core: *const mcd_core_st, state: *mut mcd_core_state_st) -> mcd_return_et;
+pub type mcd_run_f =
+    unsafe extern "C" fn(core: *const mcd_core_st, global: mcd_bool_t) -> mcd_return_et;
+pub type mcd_stop_f =
+    unsafe extern "C" fn(core: *const mcd_core_st, global: mcd_bool_t) -> mcd_return_et;
+pub type mcd_step_f = unsafe extern "C" fn(
+    core: *const mcd_core_st,
+    global: mcd_bool_t,
+    step_type: u32,
+    n_steps: u32,
+) -> mcd_return_et;
+pub type mcd_qry_reg_groups_f = unsafe extern "C" fn(
+    core: *const mcd_core_st,
+    start_index: u32,
+    num_reg_groups: *mut u32,
+    reg_groups: *mut mcd_register_group_st,
+) -> mcd_return_et;
+pub type mcd_qry_reg_map_f = unsafe extern "C" fn(
+    core: *const mcd_core_st,
+    reg_group_id: u32,
+    start_index: u32,
+    num_regs: *mut u32,
+    reg_info: *mut mcd_register_info_st,
+) -> mcd_return_et;
+pub type mcd_qry_trig_info_f = unsafe extern "C" fn(
+    core: *const mcd_core_st,
+    trig_info: *mut mcd_trig_info_st,
+) -> mcd_return_et;
+pub type mcd_create_trig_f = unsafe extern "C" fn(
+    core: *const mcd_core_st,
+    trig: *mut c_void,
+    trig_id: *mut u32,
+) -> mcd_return_et;
+pub type mcd_remove_trig_f =
+    unsafe extern "C" fn(core: *const mcd_core_st, trig_id: u32) -> mcd_return_et;
+pub type mcd_activate_trig_set_f = unsafe extern "C" fn(core: *const mcd_core_st) -> mcd_return_et;
+
+/// The execution control functions of an MCD library.
+#[derive(Debug, Clone, Copy)]
+pub struct McdRunFunctions {
+    pub qry_state: mcd_qry_state_f,
+    pub run: mcd_run_f,
+    pub stop: mcd_stop_f,
+    pub step: mcd_step_f,
+}
+
+/// The register map functions of an MCD library.
+#[derive(Debug, Clone, Copy)]
+pub struct McdRegisterFunctions {
+    pub qry_reg_groups: mcd_qry_reg_groups_f,
+    pub qry_reg_map: mcd_qry_reg_map_f,
+}
+
+/// The trigger functions of an MCD library.
+#[derive(Debug, Clone, Copy)]
+pub struct McdTriggerFunctions {
+    pub qry_trig_info: mcd_qry_trig_info_f,
+    pub create_trig: mcd_create_trig_f,
+    pub remove_trig: mcd_remove_trig_f,
+    pub activate_trig_set: mcd_activate_trig_set_f,
+}
+
 /// The MCD functions the probe calls.
 #[derive(Debug, Clone, Copy)]
 pub struct McdFunctions {
@@ -272,6 +419,12 @@ pub struct McdFunctions {
     pub execute_txlist: mcd_execute_txlist_f,
     pub qry_rst_classes: mcd_qry_rst_classes_f,
     pub rst: mcd_rst_f,
+    /// Optional: the core control of [`crate::mcd::McdProbe`] needs them, the bus does not.
+    pub run_control: Option<McdRunFunctions>,
+    /// Optional, as `run_control`.
+    pub registers: Option<McdRegisterFunctions>,
+    /// Optional, as `run_control`.
+    pub triggers: Option<McdTriggerFunctions>,
 }
 
 impl McdFunctions {
@@ -285,6 +438,28 @@ impl McdFunctions {
         // SAFETY: the caller guarantees the signatures; the pointers are only used while the
         // library stays loaded, which the owner of `McdFunctions` ensures.
         unsafe {
+            let run_control = (|| {
+                Some(McdRunFunctions {
+                    qry_state: *library.get(b"mcd_qry_state_f\0").ok()?,
+                    run: *library.get(b"mcd_run_f\0").ok()?,
+                    stop: *library.get(b"mcd_stop_f\0").ok()?,
+                    step: *library.get(b"mcd_step_f\0").ok()?,
+                })
+            })();
+            let registers = (|| {
+                Some(McdRegisterFunctions {
+                    qry_reg_groups: *library.get(b"mcd_qry_reg_groups_f\0").ok()?,
+                    qry_reg_map: *library.get(b"mcd_qry_reg_map_f\0").ok()?,
+                })
+            })();
+            let triggers = (|| {
+                Some(McdTriggerFunctions {
+                    qry_trig_info: *library.get(b"mcd_qry_trig_info_f\0").ok()?,
+                    create_trig: *library.get(b"mcd_create_trig_f\0").ok()?,
+                    remove_trig: *library.get(b"mcd_remove_trig_f\0").ok()?,
+                    activate_trig_set: *library.get(b"mcd_activate_trig_set_f\0").ok()?,
+                })
+            })();
             Ok(Self {
                 initialize: *library.get(b"mcd_initialize_f\0")?,
                 exit: *library.get(b"mcd_exit_f\0")?,
@@ -301,6 +476,9 @@ impl McdFunctions {
                 execute_txlist: *library.get(b"mcd_execute_txlist_f\0")?,
                 qry_rst_classes: *library.get(b"mcd_qry_rst_classes_f\0")?,
                 rst: *library.get(b"mcd_rst_f\0")?,
+                run_control,
+                registers,
+                triggers,
             })
         }
     }
@@ -357,6 +535,14 @@ mod tests {
         assert_eq!(size_of::<mcd_txlist_st>(), 16);
         assert_eq!(size_of::<mcd_server_st>(), 24);
         assert_eq!(size_of::<mcd_core_st>(), 16);
+        assert_eq!(size_of::<mcd_register_group_st>(), 40);
+        assert_eq!(size_of::<mcd_register_info_st>(), 88);
+        assert_eq!(offset_of!(mcd_register_info_st, regsize), 60);
+        assert_eq!(offset_of!(mcd_register_info_st, reg_type), 80);
+        assert_eq!(size_of::<mcd_core_state_st>(), 528);
+        assert_eq!(size_of::<mcd_trig_info_st>(), 28);
+        assert_eq!(size_of::<mcd_trig_simple_core_st>(), 64);
+        assert_eq!(offset_of!(mcd_trig_simple_core_st, addr_start), 32);
     }
 
     #[test]

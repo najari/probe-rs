@@ -36,6 +36,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 name = "mcd_list"
 required-features = ["mcd"]
 
+[[example]]
+name = "mcd_core"
+required-features = ["mcd"]
+
 [build-dependencies]
 probe-rs-target = { workspace = true, features = ["bincode"] }
 
