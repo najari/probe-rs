@@ -262,8 +262,11 @@ impl Debugger {
                 ))));
             };
             let core_index = target_core_config.core_index;
+            // A client that names the core anyway (`0x7000a004@0`, as it does in a session of
+            // several cores) gets the same answer: the suffix is taken off.
+            let (_, routed) = debug_adapter.routing().route(request);
             return self
-                .dispatch(session_data, debug_adapter, core_index, request)
+                .dispatch(session_data, debug_adapter, core_index, &routed)
                 .await;
         }
         if FAN_OUT.contains(&request.command.as_str()) {
