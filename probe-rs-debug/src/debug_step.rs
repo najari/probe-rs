@@ -55,6 +55,20 @@ impl SteppingMode {
         let origin_program_counter = program_counter;
         let mut return_address = core.read_core_reg(core.return_address().id())?.try_into()?;
 
+        if let (SteppingMode::OverStatement, Some(debug_info)) = (self, debug_info) {
+            // Follow the instructions, so that branches back (loops) stop where they go.
+            if let Some(stepped) =
+                step_over_statement(core, debug_info, program_counter, return_address)?
+            {
+                return Ok(stepped);
+            }
+            // A long statement: from where it got to, as below.
+            program_counter = core
+                .read_core_reg(core.program_counter().id())?
+                .try_into()?;
+            return_address = core.read_core_reg(core.return_address().id())?.try_into()?;
+        }
+
         // Sometimes the target program_counter is at a location where the debug_info program row data does not contain valid statements for halt points.
         // When DebugError::NoValidHaltLocation happens, we will step to the next instruction and try again(until we can reasonably expect to have passed out of an epilogue), before giving up.
         let mut target_address: Option<u64> = None;
@@ -333,6 +347,71 @@ impl SteppingMode {
                 message: "Could not determine valid halt locations for this request. Please consider using instruction level stepping.".to_string()
         })
     }
+}
+
+/// The instructions a step over follows one by one before it falls back to a breakpoint on the
+/// next statement by address.
+const STEP_OVER_INSTRUCTIONS: usize = 200;
+
+/// How far after the instruction a call instruction's return address can be.
+const MAX_CALL_INSTRUCTION_LEN: u64 = 8;
+
+/// Steps over the current statement by following the instructions, as GDB's `next` does: the
+/// core is stepped one instruction at a time until it reaches the start of a statement (a valid
+/// halt location), so a branch back to the start of a loop stops there, in this call. A call is
+/// run to its return address with a breakpoint.
+///
+/// Returns `None` when the statement takes more than [`STEP_OVER_INSTRUCTIONS`] instructions:
+/// the caller goes on from where the core is now. The breakpoint on the next statement by
+/// address alone misses loops: it is hit only after the loop, or in another call of the
+/// function.
+fn step_over_statement(
+    core: &mut impl CoreInterface,
+    debug_info: &DebugInfo,
+    mut program_counter: u64,
+    mut return_address: u64,
+) -> Result<Option<(CoreStatus, u64)>, DebugError> {
+    for _ in 0..STEP_OVER_INSTRUCTIONS {
+        let before = program_counter;
+        program_counter = core.step()?.pc;
+        let status = core.status()?;
+        if !matches!(
+            status,
+            CoreStatus::Halted(HaltReason::Step | HaltReason::Request)
+        ) {
+            // A breakpoint or anything else that stopped the core: show it.
+            return Ok(Some((status, program_counter)));
+        }
+        let new_return_address: u64 = core.read_core_reg(core.return_address().id())?.try_into()?;
+        let called = new_return_address != return_address
+            && new_return_address > before
+            && new_return_address <= before + MAX_CALL_INSTRUCTION_LEN
+            && program_counter != new_return_address;
+        if called {
+            // Over the call: run to the return address.
+            tracing::debug!(
+                "Step over: call at {before:#010x} to {program_counter:#010x}, running to {new_return_address:#010x}"
+            );
+            let (status, pc) = run_to_address(program_counter, new_return_address, core)?;
+            if pc != new_return_address {
+                // Stopped inside the call (a breakpoint, or it took too long).
+                return Ok(Some((status, pc)));
+            }
+            program_counter = pc;
+            return_address = core.read_core_reg(core.return_address().id())?.try_into()?;
+        } else {
+            return_address = new_return_address;
+        }
+        if VerifiedBreakpoint::for_address(debug_info, program_counter)
+            .is_ok_and(|location| location.address == program_counter)
+        {
+            return Ok(Some((core.status()?, program_counter)));
+        }
+    }
+    tracing::debug!(
+        "Step over: no statement within {STEP_OVER_INSTRUCTIONS} instructions, at {program_counter:#010x}"
+    );
+    Ok(None)
 }
 
 /// Run the target to the desired address. If available, we will use a breakpoint, otherwise we will use single step.
