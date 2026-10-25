@@ -1478,7 +1478,8 @@ impl UnitInfo {
                 .type_name
                 .ident()
                 .is_some_and(|name| name.starts_with('*'))
-            || (matches!(&parent_variable.type_name, VariableType::Pointer(_))
+            // `inner`: a pointer under a modifier (`T *volatile`) is a pointer as well.
+            || (matches!(parent_variable.type_name.inner(), VariableType::Pointer(_))
                 && (matches!(child_variable.type_name, VariableType::Base(_))
                     || matches!(child_variable.type_name, VariableType::Struct(ref type_name) if type_name.ident_stem().starts_with("&str"))
                     || matches!(child_variable.name, VariableName::Named(ref var_name) if var_name.starts_with('*'))

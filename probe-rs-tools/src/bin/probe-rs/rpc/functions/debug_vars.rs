@@ -470,6 +470,180 @@ fn resolve_expression(
     })
 }
 
+/// One step of a path expression after its first name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathStep {
+    /// `.member`
+    Member(String),
+    /// `[index]`
+    Index(u64),
+    /// `->member`
+    Arrow(String),
+}
+
+/// A path expression: the `*`s in front, the first name and the steps, as in `OsTcb[1].state`,
+/// `p->next->state` or `*p`. `None` when the expression is something else (a cast, arithmetic).
+fn parse_path(expression: &str) -> Option<(usize, String, Vec<PathStep>)> {
+    fn name(text: &str) -> Option<(&str, &str)> {
+        let end = text
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(text.len());
+        let (name, rest) = text.split_at(end);
+        (!name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()))
+            .then_some((name, rest))
+    }
+    let mut text = expression.trim();
+    let mut derefs = 0;
+    while let Some(rest) = text.strip_prefix('*') {
+        derefs += 1;
+        text = rest.trim_start();
+    }
+    let (root, mut text) = name(text)?;
+    let mut steps = Vec::new();
+    loop {
+        text = text.trim_start();
+        if text.is_empty() {
+            break;
+        }
+        if let Some(rest) = text.strip_prefix("->") {
+            let (member, rest) = name(rest.trim_start())?;
+            steps.push(PathStep::Arrow(member.to_string()));
+            text = rest;
+        } else if let Some(rest) = text.strip_prefix('.') {
+            let (member, rest) = name(rest.trim_start())?;
+            steps.push(PathStep::Member(member.to_string()));
+            text = rest;
+        } else {
+            let (index, rest) = text.strip_prefix('[')?.split_once(']')?;
+            let index = index.trim();
+            let index = match index
+                .strip_prefix("0x")
+                .or_else(|| index.strip_prefix("0X"))
+            {
+                Some(hex) => u64::from_str_radix(hex, 16).ok()?,
+                None => index.parse().ok()?,
+            };
+            steps.push(PathStep::Index(index));
+            text = rest;
+        }
+    }
+    Some((derefs, root.to_string(), steps))
+}
+
+/// The children of `variable`, read from the target first when they are deferred.
+fn children_of(
+    debug_info: &DebugInfo,
+    core: &mut probe_rs::Core,
+    cache: &mut VariableCache,
+    variable: &mut probe_rs_debug::Variable,
+    frame_info: &StackFrameInfo<'_>,
+) -> Vec<probe_rs_debug::Variable> {
+    if variable.variable_node_type.is_deferred() && !cache.has_children(variable) {
+        // A pointer's value first: its target's members are placed from it (unread, they would
+        // be read at the pointer's own address).
+        variable.extract_value(core, cache);
+        let _ = cache.update_variable(variable);
+        let _ = debug_info.cache_deferred_variables(cache, core, variable, frame_info);
+    }
+    cache
+        .get_children(variable.variable_key())
+        .cloned()
+        .collect()
+}
+
+/// [`resolve_expression`] for a path expression ([`parse_path`]) as well: the first name in
+/// `cache`, then members, array elements and the targets of pointers. The error says which part
+/// could not be found.
+fn resolve_path(
+    debug_info: &DebugInfo,
+    core: &mut probe_rs::Core,
+    cache: &mut VariableCache,
+    expression: &str,
+    frame_info: &StackFrameInfo<'_>,
+) -> Result<WireEvaluateResponse, String> {
+    let Some((derefs, root, steps)) = parse_path(expression) else {
+        return Err(
+            "not supported: only names, a.b, a[n], p->b and *p (no casts or arithmetic)".into(),
+        );
+    };
+    if derefs == 0 && steps.is_empty() {
+        return resolve_expression(debug_info, core, cache, &root, frame_info)
+            .ok_or_else(|| "not a global variable".to_string());
+    }
+    // The root as `resolve_expression` finds it (expanding a deferred cache root first).
+    if resolve_expression(debug_info, core, cache, &root, frame_info).is_none() {
+        return Err(format!("`{root}` is not a global variable"));
+    }
+    let mut current = cache
+        .get_variable_by_name(&VariableName::Named(root.clone()))
+        .ok_or_else(|| format!("`{root}` is not a global variable"))?;
+    let mut path = root;
+    let deref = |current: &mut probe_rs_debug::Variable,
+                 cache: &mut VariableCache,
+                 core: &mut probe_rs::Core,
+                 path: &str|
+     -> Result<probe_rs_debug::Variable, String> {
+        // The target is a child `*name`; a pointer to a struct has the members of its target as
+        // its own children instead.
+        let children = children_of(debug_info, core, cache, current, frame_info);
+        if let Some(target) = children
+            .iter()
+            .find(|child| matches!(&child.name, VariableName::Named(n) if n.starts_with('*')))
+        {
+            return Ok(target.clone());
+        }
+        if children.is_empty() {
+            Err(format!("`{path}` is not a pointer with a target"))
+        } else {
+            Ok(current.clone())
+        }
+    };
+    for step in &steps {
+        current = match step {
+            PathStep::Member(member) | PathStep::Arrow(member) => {
+                let arrow = matches!(step, PathStep::Arrow(_));
+                let mut parent = if arrow {
+                    deref(&mut current, cache, core, &path)?
+                } else {
+                    current
+                };
+                path = format!("{path}{}{member}", if arrow { "->" } else { "." });
+                let found = children_of(debug_info, core, cache, &mut parent, frame_info)
+                    .into_iter()
+                    .find(|child| child.name == VariableName::Named(member.clone()));
+                found.ok_or_else(|| format!("`{path}`: no such member"))?
+            }
+            PathStep::Index(index) => {
+                let index = *index;
+                let found = children_of(debug_info, core, cache, &mut current, frame_info)
+                    .into_iter()
+                    .find(|child| child.name == VariableName::Indexed(index));
+                path = format!("{path}[{index}]");
+                found.ok_or_else(|| format!("`{path}`: no such element"))?
+            }
+        };
+    }
+    for _ in 0..derefs {
+        let target = deref(&mut current, cache, core, &path)?;
+        path = format!("*{path}");
+        current = target;
+    }
+    let (vr, named, indexed) = variable_reference(&current, cache);
+    current.extract_value(core, cache);
+    cache
+        .update_variable(&current)
+        .map_err(|error| error.to_string())?;
+    Ok(WireEvaluateResponse {
+        result: current.to_string(cache),
+        type_: Some(current.type_name()),
+        variables_reference: i64::from(vr),
+        named_variables: Some(named),
+        indexed_variables: Some(indexed),
+        memory_reference: memory_reference(&current.memory_location),
+        byte_size: current.byte_size,
+    })
+}
+
 /// Reads global variables by name without halting the core (a live watch).
 ///
 /// Every request builds a fresh static scope cache, so each value is read from the target now,
@@ -504,18 +678,18 @@ pub async fn live_watch(
         .expressions
         .into_iter()
         .map(|expression| {
-            match resolve_expression(&debug_info, &mut core, &mut cache, &expression, &frame) {
-                Some(response) => WireLiveWatchValue {
+            match resolve_path(&debug_info, &mut core, &mut cache, &expression, &frame) {
+                Ok(response) => WireLiveWatchValue {
                     expression,
                     value: Some(response.result),
                     type_: response.type_,
                     error: None,
                 },
-                None => WireLiveWatchValue {
+                Err(error) => WireLiveWatchValue {
                     expression,
                     value: None,
                     type_: None,
-                    error: Some("not a global variable".to_string()),
+                    error: Some(error),
                 },
             }
         })
@@ -656,5 +830,68 @@ pub async fn evaluate(
         return Ok(resp);
     }
 
+    // A path into the global variables (`OsTcb[1].state`, `p->state`), as `liveWatch` reads it.
+    if parse_path(&request.expression)
+        .is_some_and(|(derefs, _, steps)| derefs > 0 || !steps.is_empty())
+        && let Some(cache) = core_state.static_variables.as_mut()
+    {
+        let (top_base, top_cfa, top_regs) = core_state
+            .stack_frames
+            .first()
+            .map(|f| (f.frame_base, f.canonical_frame_address, f.registers.clone()))
+            .unwrap_or((None, None, DebugRegisters::default()));
+        let frame = StackFrameInfo {
+            registers: &top_regs,
+            frame_base: top_base,
+            canonical_frame_address: top_cfa,
+            caller: None,
+        };
+        return Ok(
+            match resolve_path(&debug_info, &mut core, cache, &request.expression, &frame) {
+                Ok(resp) => resp,
+                Err(error) => WireEvaluateResponse {
+                    result: format!("<{error}>"),
+                    ..invalid()
+                },
+            },
+        );
+    }
+
     Ok(invalid())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PathStep, parse_path};
+
+    #[test]
+    fn path_expressions() {
+        assert_eq!(parse_path("g_ticks"), Some((0, "g_ticks".into(), vec![])));
+        assert_eq!(
+            parse_path("OsTcb[1].state"),
+            Some((
+                0,
+                "OsTcb".into(),
+                vec![PathStep::Index(1), PathStep::Member("state".into())]
+            ))
+        );
+        assert_eq!(
+            parse_path(" * p -> next ->state"),
+            Some((
+                1,
+                "p".into(),
+                vec![
+                    PathStep::Arrow("next".into()),
+                    PathStep::Arrow("state".into())
+                ]
+            ))
+        );
+        assert_eq!(
+            parse_path("a[0x10]"),
+            Some((0, "a".into(), vec![PathStep::Index(16)]))
+        );
+        for unsupported in ["(int)x", "a + 1", "a[i]", "&x", "1x", "a.", "a[1"] {
+            assert_eq!(parse_path(unsupported), None, "{unsupported}");
+        }
+    }
 }

@@ -63,12 +63,18 @@ struct Comparison {
 impl Comparison {
     fn parse(text: &str) -> Result<Self, String> {
         let text = text.trim();
-        let Some((at, symbol, op)) = Op::ALL
-            .iter()
-            .filter_map(|(symbol, op)| text.find(symbol).map(|at| (at, *symbol, *op)))
-            // The first operator in the text; at the same place the longest (they come first).
-            .min_by_key(|(at, _, _)| *at)
-        else {
+        // The first operator in the text, at a place the longest (they come first); the `>` of
+        // `->` (a pointer's member) is none.
+        let bytes = text.as_bytes();
+        let Some((at, symbol, op)) = (0..text.len()).find_map(|at| {
+            if at > 0 && bytes[at] == b'>' && bytes[at - 1] == b'-' {
+                return None;
+            }
+            Op::ALL
+                .iter()
+                .find(|(symbol, _)| text[at..].starts_with(symbol))
+                .map(|(symbol, op)| (at, *symbol, *op))
+        }) else {
             return Err(format!(
                 "`{text}` has no comparison: write `<name> <op> <value>` with ==, !=, <, <=, > or >="
             ));
@@ -501,6 +507,8 @@ mod tests {
         assert!(holds("v >= 2", &[("v", "2")]));
         assert!(!holds("v >= 2", &[("v", "1")]));
         assert!(holds("v==3", &[("v", "3")]));
+        assert!(holds("p->state >= 2", &[("p->state", "2")]));
+        assert!(!holds("p->state>2", &[("p->state", "2")]));
     }
 
     #[test]
