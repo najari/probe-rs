@@ -37,6 +37,10 @@ pub const UNLOCK_HOT_ATTACH: u16 = 0x0001;
 pub const CONNECT_HOT_ATTACH: u16 = 0x0000;
 /// `DEVICE_CONNECT` option: reset the device and keep the cores halted.
 pub const CONNECT_RESET_AND_HALT: u16 = 0x0003;
+/// The server register (address map 15) with the clock of the access hardware in Hz. Infineon's
+/// `tas_perfmeter` sets it under "TAS Access HW Control"; the DAS JTAG adapter of a ShieldBuddy
+/// starts at 400 kHz and takes up to 6 MHz.
+pub const ACC_HW_FREQUENCY: u32 = 0x000C_0100;
 
 const CMD_SERVER_CONNECT: u8 = 0x80;
 const CMD_GET_TARGETS: u8 = 0x86;
@@ -613,6 +617,30 @@ impl Connection {
         let r = self.request(&p)?;
         check_pl1_response(&r, CMD_DEVICE_CONNECT, "DEVICE_CONNECT")?;
         Ok(if r.len() >= 12 { u32_le(&r[8..]) } else { 0 })
+    }
+
+    /// The clock of the access hardware (the JTAG clock of the adapter) in Hz.
+    pub fn access_clock(&mut self, info: &ConInfo) -> Result<u32, TasError> {
+        let mut transfer = [BusTransfer::read(AddressMap::Server, ACC_HW_FREQUENCY, 4)];
+        self.execute(&mut transfer, info)?;
+        transfer[0]
+            .read_u32()
+            .map_err(|error| TasError::Protocol(format!("access hardware clock: {error}")))
+    }
+
+    /// Asks for an access hardware clock of `hz`; returns the clock the hardware took (the
+    /// adapter rounds down to one it has).
+    pub fn set_access_clock(&mut self, hz: u32, info: &ConInfo) -> Result<u32, TasError> {
+        let mut transfer = [BusTransfer::write_u32(
+            AddressMap::Server,
+            ACC_HW_FREQUENCY,
+            hz,
+        )];
+        self.execute(&mut transfer, info)?;
+        transfer[0]
+            .check()
+            .map_err(|error| TasError::Protocol(format!("access hardware clock: {error}")))?;
+        self.access_clock(info)
     }
 
     /// Runs `transfers` as PL0 frames. Stops after the first frame with a failed transfer.

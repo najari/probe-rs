@@ -15,6 +15,7 @@ use super::*;
 
 const TARGET: &str = "DAS JTAG AURDUINO 46YPEADW";
 const JTAG_ID: u32 = 0x401D_A083;
+const START_CLOCK_HZ: u32 = 400_000;
 
 /// What the fake server saw.
 #[derive(Debug, Default)]
@@ -42,6 +43,10 @@ impl FakeServer {
         let server_log = log.clone();
         thread::spawn(move || {
             let mut memory: HashMap<(u8, u32), u8> = HashMap::new();
+            // The access hardware clock the DAS JTAG adapter starts with.
+            for (i, byte) in START_CLOCK_HZ.to_le_bytes().into_iter().enumerate() {
+                memory.insert((15, protocol::ACC_HW_FREQUENCY + i as u32), byte);
+            }
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { return };
                 serve(stream, &mut memory, &server_log, reject_hot_attach);
@@ -417,6 +422,47 @@ fn a_selector_lists_the_server_and_target_it_names() {
 
     let other: DebugProbeSelector = "0483:3748".parse().unwrap();
     assert!(TasFactory.list_probes_filtered(Some(&other)).is_empty());
+}
+
+#[test]
+fn the_speed_sets_the_access_hardware_clock_until_the_probe_is_done() {
+    let server = FakeServer::start(false);
+    let clock = |probe: &mut TasProbe| {
+        probe
+            .read_u32(AddressMap::Server, protocol::ACC_HW_FREQUENCY)
+            .unwrap()
+    };
+
+    // Without a speed the clock is left as it is, and reported.
+    let mut probe = TasProbe::new(server.endpoint(None));
+    assert_eq!(probe.speed_khz(), 0);
+    probe.attach().unwrap();
+    assert_eq!(probe.speed_khz(), 400);
+    probe.detach().unwrap();
+
+    let mut probe = TasProbe::new(server.endpoint(None));
+    assert!(probe.set_speed(0).is_err());
+    assert_eq!(probe.set_speed(6000).unwrap(), 6000);
+    probe.attach().unwrap();
+    assert_eq!(probe.speed_khz(), 6000);
+    assert_eq!(clock(&mut probe), 6_000_000);
+    probe.detach().unwrap();
+
+    // Put back on the detach: the next client finds the clock as it was.
+    let mut probe = TasProbe::new(server.endpoint(None));
+    probe.attach().unwrap();
+    assert_eq!(clock(&mut probe), START_CLOCK_HZ);
+    drop(probe);
+
+    // And when the probe is dropped without a detach.
+    let mut probe = TasProbe::new(server.endpoint(None));
+    probe.set_speed(2000).unwrap();
+    probe.attach().unwrap();
+    assert_eq!(clock(&mut probe), 2_000_000);
+    drop(probe);
+    let mut probe = TasProbe::new(server.endpoint(None));
+    probe.attach().unwrap();
+    assert_eq!(clock(&mut probe), START_CLOCK_HZ);
 }
 
 #[test]

@@ -275,6 +275,13 @@ pub struct TasProbe {
     target_name: String,
     device_type: u32,
     connect_under_reset: bool,
+    /// The interface speed asked for with [`DebugProbe::set_speed`], in kHz.
+    asked_khz: Option<u32>,
+    /// The clock of the access hardware on the current connection, in Hz (0: not known).
+    clock_hz: u32,
+    /// The clock found on connecting, when this probe changed it: put back at the end, so other
+    /// TAS clients find it as it was.
+    original_clock_hz: Option<u32>,
 }
 
 impl TasProbe {
@@ -289,6 +296,56 @@ impl TasProbe {
             target_name: String::new(),
             device_type: 0,
             connect_under_reset: false,
+            asked_khz: None,
+            clock_hz: 0,
+            original_clock_hz: None,
+        }
+    }
+
+    /// Sets the access hardware clock asked for, on a new connection. A clock that cannot be
+    /// read or set only costs speed: the connection stays.
+    fn apply_clock(&mut self, connection: &mut Connection) {
+        self.clock_hz = 0;
+        let found = match connection.access_clock(&self.info) {
+            Ok(hz) => hz,
+            Err(error) => {
+                tracing::debug!("TAS: the access hardware clock cannot be read: {error}");
+                return;
+            }
+        };
+        self.clock_hz = found;
+        let Some(asked) = self.asked_khz.map(|khz| khz.saturating_mul(1000)) else {
+            tracing::debug!("TAS: access hardware clock {found} Hz");
+            return;
+        };
+        if asked == found {
+            return;
+        }
+        match connection.set_access_clock(asked, &self.info) {
+            Ok(now) => {
+                tracing::info!("TAS: access hardware clock {now} Hz (asked {asked}, was {found})");
+                self.clock_hz = now;
+                self.original_clock_hz = Some(found);
+            }
+            Err(error) => {
+                tracing::warn!("TAS: the access hardware clock stays at {found} Hz: {error}");
+            }
+        }
+    }
+
+    /// Puts back the access hardware clock this probe changed.
+    fn restore_clock(&mut self) {
+        let Some(original) = self.original_clock_hz.take() else {
+            return;
+        };
+        let info = self.info.clone();
+        match self.with_connection(|c| c.set_access_clock(original, &info)) {
+            Ok(now) => tracing::debug!("TAS: access hardware clock back at {now} Hz"),
+            Err(error) => {
+                tracing::warn!(
+                    "TAS: the access hardware clock was not put back to {original} Hz: {error}"
+                )
+            }
         }
     }
 
@@ -340,6 +397,8 @@ impl TasProbe {
     }
 
     fn connect(&mut self) -> Result<(), TasError> {
+        // A connection before this one gives the clock back first.
+        self.restore_clock();
         let mut connection =
             Connection::connect(&self.endpoint.host, self.endpoint.port, CONNECT_TIMEOUT)?;
         let server = connection.server_connect(CLIENT_NAME, &user_name())?;
@@ -402,6 +461,7 @@ impl TasProbe {
 
         self.target_name = target.identifier;
         self.disconnect();
+        self.apply_clock(&mut connection);
         let link = Arc::new(Mutex::new(Link {
             connection,
             last_used: Instant::now(),
@@ -410,6 +470,13 @@ impl TasProbe {
         self.keep_alive = Some(KeepAlive::start(link.clone(), self.idle_ping_interval));
         self.link = Some(link);
         Ok(())
+    }
+}
+
+impl Drop for TasProbe {
+    fn drop(&mut self) {
+        // A session may end without a detach.
+        self.restore_clock();
     }
 }
 
@@ -422,13 +489,23 @@ impl DebugProbe for TasProbe {
         "Infineon TAS"
     }
 
+    /// The clock of the access hardware once connected, else the speed asked for (0: the
+    /// server's).
     fn speed_khz(&self) -> u32 {
-        // The TAS server sets the JTAG clock.
-        0
+        match self.clock_hz {
+            0 => self.asked_khz.unwrap_or(0),
+            hz => hz / 1000,
+        }
     }
 
+    /// The access hardware clock to set on connecting. The adapter takes the nearest clock it
+    /// has at or below it (the DAS JTAG adapter: 400 kHz to 6 MHz); the one taken is put back
+    /// when the probe detaches.
     fn set_speed(&mut self, speed_khz: u32) -> Result<u32, DebugProbeError> {
-        tracing::debug!("TAS: the server sets the interface speed, ignoring {speed_khz} kHz");
+        if speed_khz == 0 {
+            return Err(DebugProbeError::UnsupportedSpeed(speed_khz));
+        }
+        self.asked_khz = Some(speed_khz);
         Ok(speed_khz)
     }
 
@@ -445,6 +522,7 @@ impl DebugProbe for TasProbe {
     }
 
     fn detach(&mut self) -> Result<(), probe_rs::Error> {
+        self.restore_clock();
         self.disconnect();
         Ok(())
     }

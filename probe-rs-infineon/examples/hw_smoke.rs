@@ -10,7 +10,9 @@
 //! cargo run -p probe-rs-infineon --example hw_smoke -- path/to/demo_flash.elf
 //! ```
 //!
-//! `PROBE_RS_PROBE` selects another probe, for example the MCD probe (PRD test T-14):
+//! `PROBE_RS_SPEED` sets the interface speed in kHz (for the TAS probe the adapter clock, for
+//! example 6000). `PROBE_RS_PROBE` selects another probe, for example the MCD probe (PRD test
+//! T-14):
 //!
 //! ```text
 //! set PROBE_RS_PROBE=058b:0001:C:\path\to\mcd_tas.dll
@@ -109,8 +111,13 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| "058b:0000".to_string())
         .parse()?;
     println!("probe {selector}");
-    let probe = Lister::new().open(selector)?;
+    let mut probe = Lister::new().open(selector)?;
     println!("{}", probe.get_name());
+    // The interface speed in kHz (the TAS probe sets the adapter clock).
+    if let Ok(speed) = std::env::var("PROBE_RS_SPEED") {
+        probe.set_speed(speed.parse()?)?;
+        println!("speed {speed} kHz");
+    }
     let mut session = probe.attach("TC275", Permissions::default())?;
     let mut report = Report { failed: 0 };
 
