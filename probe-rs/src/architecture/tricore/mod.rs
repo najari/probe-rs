@@ -1089,6 +1089,11 @@ impl<'probe> TriCore<'probe> {
     /// client of the probe, for example the debugger of another core, from running its own
     /// sequence in between.
     fn write_bracketed(&mut self, writes: &[(u32, u32)]) -> Result<(), TriCoreError> {
+        self.write_words_at(writes)
+    }
+
+    /// Writes 32-bit words, `(address, value)`, in order and in one request.
+    fn write_words_at(&mut self, writes: &[(u32, u32)]) -> Result<(), TriCoreError> {
         let mut transfers = writes
             .iter()
             .map(|&(address, value)| BusTransfer::write_u32(AddressMap::Target, address, value))
@@ -1123,11 +1128,31 @@ impl<'probe> TriCore<'probe> {
     /// and breakpoints are enabled, disabled otherwise. The second unit of a watchpoint range
     /// only holds the end address.
     fn write_trigger(&mut self, unit: usize) -> Result<(), TriCoreError> {
-        let (address, evt) = self.trigger_value(unit);
-        if let Some(address) = address {
-            self.write_csfr(Self::trigger_adr(unit), address)?;
+        self.write_triggers([unit])
+    }
+
+    /// Writes the trigger units `units` from the state as [`Self::write_trigger`] does, all in
+    /// one request: over a slow link a step that writes all eight costs one round trip, not
+    /// sixteen.
+    fn write_triggers(
+        &mut self,
+        units: impl IntoIterator<Item = usize>,
+    ) -> Result<(), TriCoreError> {
+        let writes = self.trigger_writes(units);
+        self.write_words_at(&writes)
+    }
+
+    /// The `(address, value)` writes of the trigger units `units` from the state.
+    fn trigger_writes(&self, units: impl IntoIterator<Item = usize>) -> Vec<(u32, u32)> {
+        let mut writes = Vec::new();
+        for unit in units {
+            let (address, evt) = self.trigger_value(unit);
+            if let Some(address) = address {
+                writes.push((self.csfr(Self::trigger_adr(unit)), address));
+            }
+            writes.push((self.csfr(Self::trigger_evt(unit)), evt));
         }
-        self.write_csfr(Self::trigger_evt(unit), evt)
+        writes
     }
 
     /// What [`Self::write_trigger`] writes to a unit: `TRnADR` (`None`: left as it is) and
@@ -1244,20 +1269,16 @@ impl<'probe> TriCore<'probe> {
     /// Rewrites the trigger units in use. The single step sequence reprograms the trigger
     /// window, so the breakpoints and watchpoints are restored after it.
     fn rearm_triggers(&mut self) -> Result<(), TriCoreError> {
-        for unit in 0..ocds::TRIGGER_UNITS {
-            if self.state.unit_used(unit) {
-                self.write_trigger(unit)?;
-            }
-        }
-        Ok(())
+        let used = (0..ocds::TRIGGER_UNITS)
+            .filter(|&unit| self.state.unit_used(unit))
+            .collect::<Vec<_>>();
+        self.write_triggers(used)
     }
 
     /// Rewrites every trigger unit from the state and discards the trigger accumulator. After a
     /// device reset the boot software leaves its own trigger (halt after reset) behind.
     fn reinit_triggers(&mut self) -> Result<(), TriCoreError> {
-        for unit in 0..ocds::TRIGGER_UNITS {
-            self.write_trigger(unit)?;
-        }
+        self.write_triggers(0..ocds::TRIGGER_UNITS)?;
         self.read_csfr(ocds::TRIG_ACC)?;
         self.state.pending_trigger_acc = 0;
         self.state.owns_triggers = true;
@@ -1731,9 +1752,7 @@ impl<'probe> TriCore<'probe> {
             );
             self.write_csfr(ocds::DBGSR, ocds::DBGSR_HALT)?;
         }
-        for unit in 0..ocds::TRIGGER_UNITS {
-            self.write_trigger(unit)?;
-        }
+        self.write_triggers(0..ocds::TRIGGER_UNITS)?;
         if masked {
             let icr = self.read_csfr(registers::CSFR_ICR)?;
             self.write_csfr(registers::CSFR_ICR, icr | ocds::ICR_IE)?;
@@ -1830,13 +1849,12 @@ impl<'probe> TriCore<'probe> {
         // write all of them from the state, the unused ones disabled. A unit left so takes the
         // data comparison from a watchpoint in a higher unit, which then no longer halts the
         // core (measured on the TC275: TR2 and TR4 left at `0x2000`, TR6 watching).
-        for unit in 0..ocds::TRIGGER_UNITS {
-            self.write_trigger(unit)?;
-        }
+        let mut writes = self.trigger_writes(0..ocds::TRIGGER_UNITS);
         // It cleared EXEVT as well, which a halt group member needs to halt on break-in.
         if self.state.halt_group.is_some() {
-            self.write_csfr(ocds::EXEVT, ocds::EXEVT_HALT)?;
+            writes.push((self.csfr(ocds::EXEVT), ocds::EXEVT_HALT));
         }
+        self.write_words_at(&writes)?;
 
         for _ in 0..20 {
             if ocds::is_halted(self.dbgsr()?) {
@@ -2473,11 +2491,7 @@ impl<'probe> TriCore<'probe> {
     fn set_breakpoints_enabled(&mut self, state: bool) -> Result<(), Error> {
         self.take_triggers()?;
         self.state.breakpoints_enabled = state;
-        for unit in 0..ocds::TRIGGER_UNITS {
-            if self.state.unit_used(unit) {
-                self.write_trigger(unit)?;
-            }
-        }
+        self.rearm_triggers()?;
         if state {
             for slot in 0..ocds::BREAKPOINT_SLOTS {
                 if let Some(address) = self.state.slots[slot] {
@@ -2535,9 +2549,7 @@ impl<'probe> TriCore<'probe> {
             unit,
         };
         self.state.watchpoints.push(watchpoint);
-        for unit in (0..ocds::TRIGGER_UNITS).filter(|&u| watchpoint.uses(u)) {
-            self.write_trigger(unit)?;
-        }
+        self.write_triggers((0..ocds::TRIGGER_UNITS).filter(|&u| watchpoint.uses(u)))?;
         Ok(())
     }
 
@@ -2553,9 +2565,7 @@ impl<'probe> TriCore<'probe> {
         };
         self.take_triggers()?;
         let watchpoint = self.state.watchpoints.remove(i);
-        for unit in (0..ocds::TRIGGER_UNITS).filter(|&u| watchpoint.uses(u)) {
-            self.write_trigger(unit)?;
-        }
+        self.write_triggers((0..ocds::TRIGGER_UNITS).filter(|&u| watchpoint.uses(u)))?;
         self.promote_software()
     }
 }
