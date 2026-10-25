@@ -1217,7 +1217,7 @@ impl Variable {
 
     /// The integer that this variable holds, if the location of the variable can be read as an
     /// integer of at most 8 bytes. A pointer holds the address that it refers to.
-    pub(crate) fn integer_value(&self, memory: &mut dyn MemoryInterface) -> Option<u64> {
+    pub fn integer_value(&self, memory: &mut dyn MemoryInterface) -> Option<u64> {
         if matches!(self.type_name.inner(), VariableType::Pointer(_)) {
             return self.pointer_target(memory);
         }

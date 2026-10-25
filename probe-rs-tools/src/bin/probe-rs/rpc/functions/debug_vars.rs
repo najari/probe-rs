@@ -1,8 +1,11 @@
 use postcard_rpc::header::VarHeader;
+use probe_rs::MemoryInterface;
 use probe_rs_debug::{
     DebugInfo, DebugRegisters, ObjectRef, StackFrameInfo, Variable, VariableCache,
-    VariableLocation, VariableName,
+    VariableLocation, VariableName, VariableType,
 };
+
+mod c_expr;
 use probe_rs_rpc::debug_vars::{
     ClearCoreDebugStateRequest, EvaluateRequest, EvaluateResponse, LiveWatchRequest,
     LiveWatchResponse, LoadSvdRequest, LoadSvdResponse, ScopesRequest, ScopesResponse,
@@ -570,6 +573,30 @@ fn resolve_path(
         return resolve_expression(debug_info, core, cache, &root, frame_info)
             .ok_or_else(|| "not a global variable".to_string());
     }
+    let current = resolve_variable(debug_info, core, cache, expression, frame_info)?;
+    let (vr, named, indexed) = variable_reference(&current, cache);
+    Ok(WireEvaluateResponse {
+        result: current.to_string(cache),
+        type_: Some(current.type_name()),
+        variables_reference: i64::from(vr),
+        named_variables: Some(named),
+        indexed_variables: Some(indexed),
+        memory_reference: memory_reference(&current.memory_location),
+        byte_size: current.byte_size,
+    })
+}
+
+/// The variable at a path expression ([`parse_path`]), its value read.
+fn resolve_variable(
+    debug_info: &DebugInfo,
+    core: &mut probe_rs::Core,
+    cache: &mut VariableCache,
+    expression: &str,
+    frame_info: &StackFrameInfo<'_>,
+) -> Result<probe_rs_debug::Variable, String> {
+    let Some((derefs, root, steps)) = parse_path(expression) else {
+        return Err(format!("not supported: `{expression}`"));
+    };
     // The root as `resolve_expression` finds it (expanding a deferred cache root first).
     if resolve_expression(debug_info, core, cache, &root, frame_info).is_none() {
         return Err(format!("`{root}` is not a global variable"));
@@ -628,20 +655,53 @@ fn resolve_path(
         path = format!("*{path}");
         current = target;
     }
-    let (vr, named, indexed) = variable_reference(&current, cache);
     current.extract_value(core, cache);
     cache
         .update_variable(&current)
         .map_err(|error| error.to_string())?;
-    Ok(WireEvaluateResponse {
-        result: current.to_string(cache),
-        type_: Some(current.type_name()),
-        variables_reference: i64::from(vr),
-        named_variables: Some(named),
-        indexed_variables: Some(indexed),
-        memory_reference: memory_reference(&current.memory_location),
-        byte_size: current.byte_size,
-    })
+    Ok(current)
+}
+
+/// The target of a live watch's C expressions ([`c_expr`]): the paths are read as
+/// [`resolve_variable`] reads them, memory through the core.
+struct LiveTarget<'a, 'c> {
+    debug_info: &'a DebugInfo,
+    core: &'a mut probe_rs::Core<'c>,
+    cache: &'a mut VariableCache,
+    frame: &'a StackFrameInfo<'a>,
+}
+
+impl c_expr::Target for LiveTarget<'_, '_> {
+    fn path(&mut self, path: &str) -> Result<c_expr::Leaf, String> {
+        let variable = resolve_variable(self.debug_info, self.core, self.cache, path, self.frame)?;
+        let shown = variable.to_string(self.cache);
+        // A pointer holds an address; a base type, a bit field or an enum the integer in its
+        // bytes (not a float, nor a struct of a few bytes).
+        let integer_type = match variable.type_name.inner() {
+            VariableType::Pointer(_) | VariableType::Enum(_) | VariableType::Bitfield(..) => true,
+            VariableType::Base(name) => !(name.contains("float") || name.contains("double")),
+            _ => false,
+        };
+        let value = c_expr::shown_integer(&shown).or_else(|| {
+            integer_type
+                .then(|| variable.integer_value(self.core))
+                .flatten()
+                .map(i128::from)
+        });
+        Ok(c_expr::Leaf {
+            shown,
+            value,
+            address: variable.memory_location.address(),
+        })
+    }
+
+    fn read(&mut self, address: u64, size: usize) -> Result<u64, String> {
+        let mut bytes = [0u8; 8];
+        self.core
+            .read(address, &mut bytes[..size])
+            .map_err(|error| format!("{address:#010x}: {error}"))?;
+        Ok(u64::from_le_bytes(bytes))
+    }
 }
 
 /// Reads global variables by name without halting the core (a live watch).
@@ -678,11 +738,24 @@ pub async fn live_watch(
         .expressions
         .into_iter()
         .map(|expression| {
-            match resolve_path(&debug_info, &mut core, &mut cache, &expression, &frame) {
-                Ok(response) => WireLiveWatchValue {
+            // A path as before (with its type); any other C expression by `c_expr`.
+            let read = if parse_path(&expression).is_some() {
+                resolve_path(&debug_info, &mut core, &mut cache, &expression, &frame)
+                    .map(|response| (response.result, response.type_))
+            } else {
+                let mut target = LiveTarget {
+                    debug_info: &debug_info,
+                    core: &mut core,
+                    cache: &mut cache,
+                    frame: &frame,
+                };
+                c_expr::evaluate(&expression, &mut target).map(|value| (value, None))
+            };
+            match read {
+                Ok((value, type_)) => WireLiveWatchValue {
                     expression,
-                    value: Some(response.result),
-                    type_: response.type_,
+                    value: Some(value),
+                    type_,
                     error: None,
                 },
                 Err(error) => WireLiveWatchValue {
