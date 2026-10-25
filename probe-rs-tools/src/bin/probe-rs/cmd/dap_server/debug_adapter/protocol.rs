@@ -28,6 +28,28 @@ fn would_block(error: &std::io::Error) -> bool {
     error.kind() == ErrorKind::WouldBlock
 }
 
+/// The input of the DAP client ended: the client closed the connection (or its stdin) without a
+/// `disconnect` request, for example because it was killed. The session ends as for a
+/// disconnect; in TCP multi-session mode the server then takes the next client.
+#[derive(Debug)]
+pub(crate) struct ClientClosed;
+
+impl fmt::Display for ClientClosed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the DAP client closed the connection")
+    }
+}
+
+impl std::error::Error for ClientClosed {}
+
+/// Whether `error` is, or wraps, [`ClientClosed`].
+pub(crate) fn is_client_closed(error: &anyhow::Error) -> bool {
+    error.is::<ClientClosed>()
+        || error
+            .downcast_ref::<DebuggerError>()
+            .is_some_and(DebuggerError::client_closed)
+}
+
 /// A client that does not read for this long holds up the whole server.
 const SLOW_CLIENT_WARNING: Duration = Duration::from_millis(500);
 
@@ -487,8 +509,8 @@ impl<R: Read, W: Write> DapAdapter<R, W> {
             }
 
             match self.input.fill_buf() {
-                // The input is at its end.
-                Ok([]) => return Ok(None),
+                // The input is at its end: the client is gone. (No input yet is `WouldBlock`.)
+                Ok([]) => return Err(DebuggerError::Other(anyhow::Error::new(ClientClosed))),
                 Ok(data) => {
                     self.input_buffer.extend_from_slice(data);
                     let consumed = data.len();
@@ -540,6 +562,11 @@ impl<R: Read, W: Write> DapAdapter<R, W> {
                 Ok(Some(request))
             }
             Ok(None) => Ok(None),
+            // Nobody to tell: the session ends.
+            Err(e) if e.client_closed() => {
+                tracing::info!("{e}");
+                Err(anyhow::Error::new(e))
+            }
             Err(e) => {
                 tracing::warn!("Error while listening to request: {:?}", e);
                 self.log_to_console(&e.to_string());
@@ -564,6 +591,7 @@ impl<R: Read, W: Write> DapAdapter<R, W> {
                 }
             }
             Ok(None) => Ok(None),
+            Err(error) if error.client_closed() => Err(error),
             Err(error) => {
                 // This is a legitimate error. Tell the client about it.
                 Err(DebuggerError::Other(anyhow!("{error}")))
@@ -909,6 +937,23 @@ mod test {
         insta::assert_snapshot!(output_str);
 
         assert!(request.is_none());
+    }
+
+    #[test]
+    fn the_end_of_the_input_is_a_closed_client() {
+        // A request, then the client closes the connection without a `disconnect`.
+        let content = "{ \"seq\": 3, \"type\": \"request\", \"command\": \"test\" }";
+        let input = format!("Content-Length: {}\r\n\r\n{}", content.len(), content);
+        let mut output = Vec::new();
+        let mut adapter = DapAdapter::new(input.as_bytes(), &mut output);
+
+        assert_eq!(adapter.listen_for_request().unwrap().unwrap().seq, 3);
+        let error = adapter.listen_for_request().unwrap_err();
+        assert!(is_client_closed(&error), "{error:?}");
+        // The session loop sees it through `?` into a `DebuggerError`.
+        assert!(DebuggerError::Other(error).client_closed());
+        // Nothing is written to the closed connection.
+        assert!(output.is_empty());
     }
 
     struct FailingWriter {}

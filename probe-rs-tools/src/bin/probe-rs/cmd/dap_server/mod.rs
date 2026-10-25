@@ -69,6 +69,14 @@ pub enum DebuggerError {
     Unimplemented,
 }
 
+impl DebuggerError {
+    /// Whether the error is the end of the client's input (see
+    /// [`debug_adapter::protocol::ClientClosed`]).
+    pub(crate) fn client_closed(&self) -> bool {
+        matches!(self, Self::Other(error) if debug_adapter::protocol::is_client_closed(error))
+    }
+}
+
 /// Open target in debug mode and accept debug commands.
 /// This only works as a [debug_adapter::protocol::DapAdapter] and uses Debug Adapter Protocol (DAP) commands (enables connections from clients such as Microsoft Visual Studio Code).
 ///

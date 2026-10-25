@@ -617,10 +617,15 @@ impl Debugger {
             return Ok(());
         }
 
-        let Some(mut session_data) = self
+        let session = match self
             .start_session(&mut debug_adapter, client, timestamp_offset)
-            .await?
-        else {
+            .await
+        {
+            // The client went away before it attached or launched.
+            Err(error) if error.client_closed() => return Ok(()),
+            result => result?,
+        };
+        let Some(mut session_data) = session else {
             // We got no error, but no SessionData, either
             return Ok(());
         };
@@ -645,6 +650,15 @@ impl Debugger {
                 .await
             {
                 Ok(status) => status,
+                // The client is gone without a `disconnect` (killed, for example): clean up as
+                // for one, so that the next client of the server finds the target as usual.
+                Err(error) if error.client_closed() => {
+                    tracing::info!("{error}: the debug session ends");
+                    if let Err(error) = session_data.clean_up(&self.config).await {
+                        tracing::warn!("Cleaning up after the client closed: {error:?}");
+                    }
+                    return Ok(());
+                }
                 Err(error) => break error,
             };
 
