@@ -141,11 +141,20 @@ pub mod ocds {
     pub const DBGSR_PREVSUSP: u32 = 1 << 6;
 
     /// `TRnEVT` of a data watchpoint without the access bits: address input (`TYP` = 0), halt,
-    /// a break-out pulse for the halt group (`BOD` = 0), break after make, and `SUSP` set so
+    /// a break-out pulse for the halt group (`BOD` = 0), break before make, and `SUSP` set so
     /// that the halt can be told from the halt group's break-in that follows it (see
     /// [`halted_by_suspend_event`]). Measured on the TC275: `SUSP` with `BOD` = 0 gives the
     /// pulse, and the break-in moves `SUSP` to `PREVSUSP`.
-    pub const TRIG_EVT_DATA: u32 = 0x22;
+    ///
+    /// Break before make, as the instruction breakpoints ([`TRIG_EVT_IP`]): measured on the
+    /// TC275, while a break before make trigger is armed a break after make one does not fire
+    /// (a data trigger `0x22` next to an instruction breakpoint never halted, `0x2A` did). The
+    /// core halts at the access; the session then lets the access run with the trigger after
+    /// make alone (see `TriCore::complete_watchpoint_access`), so that the core halts after it
+    /// with the same debug status as a break after make watchpoint.
+    pub const TRIG_EVT_DATA: u32 = 0x2A;
+    /// `TRnEVT.BBM`: break before make.
+    pub const TRIG_EVT_BBM: u32 = 0x8;
     /// `TRnEVT.ALD`: trigger on loads.
     pub const TRIG_EVT_LOAD: u32 = 1 << 28;
     /// `TRnEVT.AST`: trigger on stores.
@@ -1332,6 +1341,12 @@ impl<'probe> TriCore<'probe> {
             "TriCore core {} halted at {pc:#010x}: {reason:?} (TRIG_ACC {trigger_acc:#x})",
             self.core()
         );
+        if reason == HaltReason::Watchpoint {
+            // The data trigger halts before the access (`ocds::TRIG_EVT_DATA`).
+            self.complete_watchpoint_access(pc)?;
+            self.state.halt_reason = Some(reason);
+            return Ok(());
+        }
         self.state.halt_reason = Some(reason);
         self.state.halt_mark = Some((dbgsr, pc));
         Ok(())
@@ -1666,6 +1681,74 @@ impl<'probe> TriCore<'probe> {
         Ok(true)
     }
 
+    /// Lets the access at `pc` that a watchpoint halted before (break before make) run, so that
+    /// the core halts after it, as a break after make watchpoint does: the value is written, the
+    /// PC is at the next instruction, and `DBGSR` shows the watchpoint's unit with `SUSP` (which
+    /// tells a halt group member halted at its own watchpoint, see `members_to_run`).
+    ///
+    /// For the one instruction, the units of the instruction breakpoints are off and the
+    /// watchpoints break after make (a break after make trigger fires only while no break before
+    /// make one is armed), interrupts are masked, and the core runs alone. Then every unit is
+    /// written back from the state.
+    fn complete_watchpoint_access(&mut self, pc: u32) -> Result<(), TriCoreError> {
+        let lifted = self
+            .software_at(pc)
+            .map(|i| self.memory.software[i].clone());
+        if let Some(sw) = &lifted {
+            self.bus()
+                .write_block(AddressMap::Target, sw.address, &sw.original)?;
+        }
+        for unit in 0..ocds::TRIGGER_UNITS {
+            let (_, evt) = self.trigger_value(unit);
+            if self.state.breakpoints[unit].is_some() {
+                self.write_csfr(Self::trigger_evt(unit), 0)?;
+            } else if evt & (ocds::TRIG_EVT_LOAD | ocds::TRIG_EVT_STORE) != 0 {
+                self.write_csfr(Self::trigger_evt(unit), evt & !ocds::TRIG_EVT_BBM)?;
+            }
+        }
+        let masked = self.mask_interrupts_for_step(pc)?;
+        // One bracketed run write, as a step (`run_writes` runs the core a second time, which
+        // would let it go on past the halt after the access).
+        let dbgsr = self.csfr(ocds::DBGSR);
+        self.write_bracketed(&[
+            (ocds::ACCESS_HW_CTRL, ocds::ACCESS_HW_STEP_ON),
+            (dbgsr, ocds::DBGSR_RUN),
+            (ocds::ACCESS_HW_CTRL, ocds::ACCESS_HW_STEP_OFF),
+        ])?;
+        let mut halted = false;
+        for _ in 0..50 {
+            if ocds::is_halted(self.dbgsr()?) {
+                halted = true;
+                break;
+            }
+        }
+        if !halted {
+            // The instruction did not make the access after all (a conditional store, say):
+            // halt the core where it is.
+            tracing::warn!(
+                "TriCore core {}: no access after the watchpoint halt at {pc:#010x}",
+                self.core()
+            );
+            self.write_csfr(ocds::DBGSR, ocds::DBGSR_HALT)?;
+        }
+        for unit in 0..ocds::TRIGGER_UNITS {
+            self.write_trigger(unit)?;
+        }
+        if masked {
+            let icr = self.read_csfr(registers::CSFR_ICR)?;
+            self.write_csfr(registers::CSFR_ICR, icr | ocds::ICR_IE)?;
+        }
+        if let Some(sw) = &lifted {
+            self.bus()
+                .write_block(AddressMap::Target, sw.address, sw.debug())?;
+        }
+        // The accumulator bit of the second halt is the same watchpoint.
+        self.read_csfr(ocds::TRIG_ACC)?;
+        self.state.pending_trigger_acc = 0;
+        self.state.was_halted = true;
+        self.mark_halt()
+    }
+
     fn step_core(&mut self) -> Result<(), TriCoreError> {
         let dbgsr = self.dbgsr()?;
         if !ocds::is_halted(dbgsr) {
@@ -1743,8 +1826,13 @@ impl<'probe> TriCore<'probe> {
             (ocds::ACCESS_HW_CTRL, ocds::ACCESS_HW_STEP_OFF),
         ])?;
         self.step_debug_init(false)?;
-        // The debug init disabled the trigger units, restore the breakpoints.
-        self.rearm_triggers()?;
+        // The debug init left every unit as a data address range without action (`0x2000`):
+        // write all of them from the state, the unused ones disabled. A unit left so takes the
+        // data comparison from a watchpoint in a higher unit, which then no longer halts the
+        // core (measured on the TC275: TR2 and TR4 left at `0x2000`, TR6 watching).
+        for unit in 0..ocds::TRIGGER_UNITS {
+            self.write_trigger(unit)?;
+        }
         // It cleared EXEVT as well, which a halt group member needs to halt on break-in.
         if self.state.halt_group.is_some() {
             self.write_csfr(ocds::EXEVT, ocds::EXEVT_HALT)?;

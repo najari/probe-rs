@@ -30,6 +30,8 @@ struct FakeBus {
     /// The halt group halts all cores just before the request that reads the `DBGSR` of the peer
     /// (a pause in another session, between the reads of one status check).
     halt_group_at_peer_read: bool,
+    /// The next run makes a watched access: the trigger unit halts the core after it.
+    access_on_run: Option<u32>,
 }
 
 impl FakeBus {
@@ -96,6 +98,14 @@ impl FakeBus {
                         self.trig_acc |= 1;
                         self.halted = true;
                         self.evtsrc = 16;
+                    } else if let Some(unit) = self.access_on_run.take() {
+                        // The access a watchpoint halted before runs (a 32-bit store), then the
+                        // trigger halts the core after it.
+                        let pc = Self::csfr(registers::CSFR_PC);
+                        self.set_word(pc, self.word(pc) + 4);
+                        self.trig_acc |= 1 << unit;
+                        self.halted = true;
+                        self.evtsrc = 16 + unit;
                     } else if self.at_debug() {
                         // Break before make: the core halts at once.
                         self.evtsrc = ocds::EVTSRC_SWEVT;
@@ -1328,10 +1338,10 @@ fn a_watchpoint_takes_the_highest_free_trigger_units() {
     drop(core);
 
     assert_eq!(bus.word(trig_adr(7)), 0x7000_A000);
-    assert_eq!(bus.word(trig_evt(7)), 0x0800_0022);
+    assert_eq!(bus.word(trig_evt(7)), 0x0800_002A);
     // Units 6 and 7 are not a free pair: 4 and 5 hold the range.
     assert_eq!(bus.word(trig_adr(4)), 0x7000_A004);
-    assert_eq!(bus.word(trig_evt(4)), 0x1800_2022);
+    assert_eq!(bus.word(trig_evt(4)), 0x1800_202A);
     assert_eq!(bus.word(trig_adr(5)), 0x7000_A008);
     assert_eq!(bus.word(trig_evt(5)), 0);
 
@@ -1339,7 +1349,7 @@ fn a_watchpoint_takes_the_highest_free_trigger_units() {
     core.clear_watchpoint(0x7000_A004).unwrap();
     drop(core);
     assert_eq!(bus.word(trig_evt(4)), 0);
-    assert_eq!(bus.word(trig_evt(7)), 0x0800_0022);
+    assert_eq!(bus.word(trig_evt(7)), 0x0800_002A);
 }
 
 #[test]
@@ -1390,8 +1400,54 @@ fn a_watchpoint_halt_is_reported_and_survives_a_step() {
     // The step reprograms the trigger window; the watchpoint is armed again after it.
     core.step().unwrap();
     drop(core);
-    assert_eq!(bus.word(trig_evt(6)), 0x0800_2022);
+    assert_eq!(bus.word(trig_evt(6)), 0x0800_202A);
     assert_eq!(bus.word(trig_adr(7)), 0x7000_A008);
+}
+
+#[test]
+fn a_watchpoint_halt_lets_the_access_run_with_the_trigger_after_make() {
+    let mut bus = FakeBus::new();
+    bus.halted = true;
+    let mut state = TriCoreCoreState::new();
+    {
+        let mut core = core(&mut bus, &mut state);
+        core.enable_breakpoints(true).unwrap();
+        core.set_hw_breakpoint(0, 0x8021_C080).unwrap();
+        core.set_watchpoint(0x7000_A004, 4, WatchpointAccess::Write)
+            .unwrap();
+        core.run().unwrap();
+    }
+    // The data trigger halts before the store (break before make), at 0x8021_C08C; the store
+    // then runs and the trigger halts the core after it.
+    bus.set_word(FakeBus::csfr(registers::CSFR_PC), 0x8021_C08C);
+    bus.trig_acc |= 1 << 6;
+    bus.halted = true;
+    bus.evtsrc = 16 + 6;
+    bus.access_on_run = Some(6);
+    bus.writes.clear();
+    let mut core = core(&mut bus, &mut state);
+    assert_eq!(
+        core.status().unwrap(),
+        CoreStatus::Halted(HaltReason::Watchpoint)
+    );
+    drop(core);
+    assert_eq!(bus.word(FakeBus::csfr(registers::CSFR_PC)), 0x8021_C090);
+    assert_eq!(bus.evtsrc, 16 + 6);
+    let writes = bus.write_words();
+    // For the access: the breakpoint's unit off, the watchpoint after make.
+    assert!(writes.contains(&(trig_evt(0), 0)));
+    assert!(writes.contains(&(trig_evt(6), 0x0800_2022)));
+    // Then every unit as before.
+    assert_eq!(bus.word(trig_evt(0)), ocds::TRIG_EVT_IP);
+    assert_eq!(bus.word(trig_evt(6)), 0x0800_202A);
+    // A second status check sees the same halt.
+    let mut core = self::core(&mut bus, &mut state);
+    assert_eq!(
+        core.status().unwrap(),
+        CoreStatus::Halted(HaltReason::Watchpoint)
+    );
+    drop(core);
+    assert_eq!(bus.word(FakeBus::csfr(registers::CSFR_PC)), 0x8021_C090);
 }
 
 #[test]
@@ -1822,7 +1878,7 @@ fn a_perf_window_counts_between_two_triggers_and_puts_cctrl_back() {
     assert_eq!(bus.word(trig_evt(6)), ocds::TRIG_EVT_PERF_START);
     assert_eq!(bus.word(trig_adr(7)), 0x8021_C024);
     assert_eq!(bus.word(trig_evt(7)), ocds::TRIG_EVT_PERF_STOP);
-    assert_eq!(bus.word(trig_evt(4)), 0x0800_2022);
+    assert_eq!(bus.word(trig_evt(4)), 0x0800_202A);
     // Cleared counters, task mode, enabled, M1 kept.
     assert_eq!(bus.word(CSFR_BASE + registers::CSFR_ICNT as u32), 0);
     assert_eq!(bus.word(CCTRL), 0x0000_0007);
