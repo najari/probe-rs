@@ -320,10 +320,11 @@ fn find_page(pages: &[FlashPage], address: u64) -> Option<&FlashPage> {
 /// The pages of a sector once it is written: the patched pages, with 0 in the bytes a patch
 /// does not set, and erased pages elsewhere. In the DFLASH a page of zeros is erased.
 ///
-/// `before` is the sector as it was ([`read_pages`]). A page left erased where the PFLASH held
-/// a page of zeros keeps the zeros: [`page_patches`] cannot tell the zeros of
-/// `--restore-unwritten` from fill bytes, and erased PFLASH does not read as zeros (an ECC
-/// error).
+/// `before` is the sector as it was ([`read_pages`]) for `--restore-unwritten`, else empty. A
+/// page left erased where the PFLASH held a page of zeros then keeps the zeros:
+/// [`page_patches`] cannot tell the restored zeros from fill bytes, and erased PFLASH does not
+/// read as zeros (an ECC error). Without the restore the bytes the image does not set are
+/// erased.
 pub fn sector_image(
     sector: Sector,
     patches: &BTreeMap<u32, PagePatch>,
@@ -481,12 +482,14 @@ fn is_bmhd(page: &PageImage) -> bool {
 }
 
 /// Whether a download leaves the TC27x without a valid boot mode header where it had one:
-/// `before` are the pages of [`TC27X_BMHDS`] now, `touched` the sectors the download erases
-/// and `patches` what it writes (the pages as [`sector_image`] makes them).
+/// `before` are the pages of [`TC27X_BMHDS`] now, `touched` the sectors the download erases,
+/// `patches` what it writes and `restoring` whether it restores the unwritten bytes (the pages
+/// as [`sector_image`] makes them).
 fn loses_boot_mode_headers(
     before: &[PageImage],
     touched: &BTreeMap<u32, Sector>,
     patches: &BTreeMap<u32, PagePatch>,
+    restoring: bool,
 ) -> bool {
     let after = TC27X_BMHDS.iter().zip(before).map(|(&address, before)| {
         let erased = touched
@@ -498,7 +501,7 @@ fn loses_boot_mode_headers(
         patches
             .get(&address)
             .map(|patch| patch.map(|byte| byte.unwrap_or(0)))
-            .or_else(|| before.filter(|page| *page == [0; PAGE]))
+            .or_else(|| before.filter(|page| restoring && *page == [0; PAGE]))
     });
     before.iter().any(is_bmhd) && !after.into_iter().any(|page| is_bmhd(&page))
 }
@@ -686,6 +689,9 @@ pub struct AurixFlash {
     map: Mutex<Option<FlashMap>>,
     /// Where the sectors of this download are backed up ([`BACKUP_ENV`]).
     backup: Mutex<Option<PathBuf>>,
+    /// Whether this download restores the bytes the image does not set (`--restore-unwritten`:
+    /// probe-rs read them through [`DebugFlashSequence::read_unwritten`]).
+    restoring: std::sync::atomic::AtomicBool,
 }
 
 /// The JSON backup of a sector: its pages as read before the erase (`None`: erased).
@@ -744,6 +750,7 @@ impl AurixFlash {
             programmed: Mutex::default(),
             map: Mutex::default(),
             backup: Mutex::default(),
+            restoring: Default::default(),
         }
     }
 
@@ -988,7 +995,8 @@ impl AurixFlash {
                 before.push(read_pages(&mut core, address, PAGE)?[0]);
             }
         }
-        if loses_boot_mode_headers(&before, touched, patches)
+        let restoring = self.restoring.load(std::sync::atomic::Ordering::SeqCst);
+        if loses_boot_mode_headers(&before, touched, patches, restoring)
             && std::env::var_os(ALLOW_NO_BMHD_ENV).is_none_or(|v| v.is_empty())
         {
             return Err(other(format!(
@@ -1098,6 +1106,8 @@ impl DebugFlashSequence for AurixFlash {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.restoring
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         *self.backup.lock().unwrap_or_else(|e| e.into_inner()) = std::env::var_os(BACKUP_ENV)
             .filter(|dir| !dir.is_empty())
             .map(|dir| PathBuf::from(dir).join(utc_stamp(SystemTime::now())));
@@ -1120,6 +1130,35 @@ impl DebugFlashSequence for AurixFlash {
 
     fn erase_all(&self, _session: &mut Session) -> Result<(), Error> {
         Err(Error::NotImplemented("chip erase of the AURIX PFLASH"))
+    }
+
+    /// Reads the old content for `--restore-unwritten` page by page: an erased page does not
+    /// read (an ECC error) and gives 0, the erased value of the target description, so that it
+    /// stays erased ([`page_patches`] does not write a page of fill zeros).
+    fn read_unwritten(
+        &self,
+        session: &mut Session,
+        _core_index: usize,
+        address: u64,
+        data: &mut [u8],
+    ) -> Result<(), Error> {
+        self.restoring
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let address = u32::try_from(to_uncached(address))
+            .map_err(|_| other(format!("{address:#x} is not a flash address")))?;
+        let start = address & !(PAGE as u32 - 1);
+        let end = (address as u64 + data.len() as u64).next_multiple_of(PAGE as u64);
+        let pages = {
+            let mut core = session.core(0)?;
+            read_pages(&mut core, start, (end - start as u64) as usize)?
+        };
+        let bytes = pages
+            .iter()
+            .flat_map(|page| page.unwrap_or([0; PAGE]))
+            .collect::<Vec<_>>();
+        let offset = (address - start) as usize;
+        data.copy_from_slice(&bytes[offset..offset + data.len()]);
+        Ok(())
     }
 
     fn supports_chip_erase(&self) -> bool {
@@ -1179,7 +1218,9 @@ impl DebugFlashSequence for AurixFlash {
                 let mut core = session.core(0)?;
                 read_pages(&mut core, sector.base, sector.size as usize)?
             };
-            let image = sector_image(sector, &patches, &backup);
+            let restoring = self.restoring.load(std::sync::atomic::Ordering::SeqCst);
+            let before: &[PageImage] = if restoring { &backup } else { &[] };
+            let image = sector_image(sector, &patches, before);
             if image == backup {
                 tracing::info!("Sector {:#010x} already holds the image", sector.base);
                 continue;
@@ -1393,16 +1434,19 @@ mod tests {
         let before = [Some(header), None, None, None];
         let mut patches = BTreeMap::new();
         patches.insert(0xA000_0100, [Some(0x11); PAGE]);
-        assert!(loses_boot_mode_headers(&before, &touched, &patches));
+        assert!(loses_boot_mode_headers(&before, &touched, &patches, false));
+        assert!(loses_boot_mode_headers(&before, &touched, &patches, true));
         // The image writes a header there.
         patches.insert(0xA000_0000, header.map(Some));
-        assert!(!loses_boot_mode_headers(&before, &touched, &patches));
+        assert!(!loses_boot_mode_headers(&before, &touched, &patches, false));
         // BMHD1 stays (its sector is not erased).
         patches.remove(&0xA000_0000);
         let before = [Some(header), Some(header), None, None];
-        assert!(!loses_boot_mode_headers(&before, &touched, &patches));
+        assert!(!loses_boot_mode_headers(&before, &touched, &patches, false));
         // Without a header before, the download changes nothing about the start.
-        assert!(!loses_boot_mode_headers(&[None; 4], &touched, &patches));
+        assert!(!loses_boot_mode_headers(
+            &[None; 4], &touched, &patches, false
+        ));
     }
 
     #[test]
@@ -1539,6 +1583,8 @@ mod tests {
         assert_eq!(image[1], None);
         assert_eq!(image[2], None);
         assert_eq!(image[3], Some([0x22; PAGE]));
+        // Without `--restore-unwritten` (no sector before): erased.
+        assert_eq!(sector_image(sector, &patches, &[])[0], None);
     }
 
     /// Flash in which the pages of `erased` fail to read, and everything fails when the

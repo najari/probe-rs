@@ -13,6 +13,7 @@ use crate::flashing::FlashLayout;
 use probe_rs_target::NvmRegion;
 
 use crate::Error;
+use crate::memory::MemoryInterface;
 use crate::session::Session;
 
 /// Host-side flash programming interface.
@@ -110,6 +111,21 @@ pub trait DebugFlashSequence: Send + Sync + Debug {
     /// Defaults to `true`.
     fn supports_sector_erase(&self) -> bool {
         true
+    }
+
+    /// Reads the flash at `address` into `data` for `--restore-unwritten`: the bytes of the
+    /// sectors to erase that the image does not set, read before the erase.
+    ///
+    /// The default reads through core `core_index`. A device whose erased flash cannot be read
+    /// (an ECC error) overrides it and gives the erased value there.
+    fn read_unwritten(
+        &self,
+        session: &mut Session,
+        core_index: usize,
+        address: u64,
+        data: &mut [u8],
+    ) -> Result<(), Error> {
+        session.core(core_index)?.read(address, data)
     }
 
     /// Called after all flash operations (erase, program, verify) complete.

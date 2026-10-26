@@ -12,7 +12,6 @@ use super::builder::FlashBuilder;
 use super::{FlashError, FlashLayout, FlashProgress};
 use crate::flashing::flasher::FlashData;
 use crate::flashing::host_sequence::DebugFlashSequence;
-use crate::memory::MemoryInterface;
 use crate::session::Session;
 
 /// Build a region-specific `FlashProperties` from an algorithm's full properties.
@@ -197,8 +196,7 @@ impl HostSideFlasher {
         progress.started_filling();
 
         let result = (|| {
-            let mut core = session.core(self.core_index).map_err(FlashError::Core)?;
-
+            let sequence = self.flash_sequence.clone();
             for region in &mut self.regions {
                 let fills: Vec<_> = region
                     .flash_layout()
@@ -214,7 +212,9 @@ impl HostSideFlasher {
                     let page_offset = (address - page.address()) as usize;
                     let page_slice = &mut page.data_mut()[page_offset..][..size as usize];
 
-                    core.read(address, page_slice).map_err(FlashError::Core)?;
+                    sequence
+                        .read_unwritten(session, self.core_index, address, page_slice)
+                        .map_err(FlashError::Core)?;
                     progress.page_filled(size, start.elapsed());
                 }
             }
