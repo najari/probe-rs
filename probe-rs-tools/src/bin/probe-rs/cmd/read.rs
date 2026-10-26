@@ -2,6 +2,7 @@ use anyhow::Context;
 use ihex::Record;
 use itertools::Itertools;
 
+use probe_rs_rpc::core_ops::WireCoreStatus;
 use probe_rs_rpc_client::{CoreInterface, RpcClient};
 
 use crate::CoreOptions;
@@ -159,6 +160,18 @@ pub struct Cmd {
 impl Cmd {
     pub async fn run(self, client: RpcClient) -> anyhow::Result<()> {
         let session = cli::attach_probe(&client, self.probe_options, None, false).await?;
+        // A read can halt a core to reach the memory (RISC-V, Xtensa): such a core runs again
+        // afterwards. A core that was halted before, by a debugger or another tool, stays
+        // halted. Without the states, every halted core runs, as before.
+        let resume = match session.cores_status(None).await {
+            Ok(before) => Some(cores_to_resume(&before.statuses)),
+            Err(error) => {
+                tracing::warn!(
+                    "The core states could not be read ({error}): every halted core runs after the read"
+                );
+                None
+            }
+        };
         let core = session.core(self.shared.core);
 
         let data = Self::read_memory(
@@ -185,7 +198,14 @@ impl Cmd {
             )?,
         };
 
-        session.resume_all_cores().await?;
+        match resume {
+            Some(cores) if cores.is_empty() => {}
+            // Only the cores halted by now are run.
+            Some(cores) => {
+                session.resume_cores(Some(cores)).await?;
+            }
+            None => session.resume_all_cores().await?,
+        }
 
         Ok(())
     }
@@ -250,5 +270,42 @@ impl Cmd {
         let mut stdout = std::io::stdout();
         format.write(&mut stdout, address, width, data)?;
         Ok(())
+    }
+}
+
+/// The cores to run after a read, given their states before it: those that were not halted.
+fn cores_to_resume(before: &[(u32, WireCoreStatus)]) -> Vec<u32> {
+    before
+        .iter()
+        .filter(|(_, status)| !matches!(status, WireCoreStatus::Halted(_)))
+        .map(|(core, _)| *core)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use probe_rs_rpc::core_ops::WireHaltReason;
+
+    #[test]
+    fn cores_halted_before_the_read_stay_halted() {
+        let before = [
+            // Halted by a debugger (or `start_in_flash`): not run.
+            (0, WireCoreStatus::Halted(WireHaltReason::Request)),
+            (1, WireCoreStatus::Running),
+            (
+                2,
+                WireCoreStatus::Halted(WireHaltReason::Breakpoint(
+                    probe_rs_rpc::core_ops::WireBreakpointCause::Hardware,
+                )),
+            ),
+            (3, WireCoreStatus::Sleeping),
+            (4, WireCoreStatus::Unknown),
+            (5, WireCoreStatus::LockedUp),
+        ];
+        // The rest run again if the read halted them (the server runs halted cores only).
+        assert_eq!(cores_to_resume(&before), [1, 3, 4, 5]);
+        assert!(cores_to_resume(&before[..1]).is_empty());
+        assert!(cores_to_resume(&[]).is_empty());
     }
 }
