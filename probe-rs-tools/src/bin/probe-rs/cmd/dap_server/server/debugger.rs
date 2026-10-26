@@ -29,6 +29,10 @@ use probe_rs_rpc_client::{ResolvedUpload, RpcClient};
 use std::{collections::HashMap, path::Path, time::Duration};
 use time::UtcOffset;
 
+/// The longest wait for the next request before a session starts. Input ends it at once, so it
+/// delays no request; it only spares the CPU while the client has not attached yet.
+const START_WAIT: Duration = Duration::from_millis(100);
+
 fn dap_capabilities() -> Capabilities {
     Capabilities {
         supports_configuration_done_request: Some(true),
@@ -725,8 +729,11 @@ impl Debugger {
         timestamp_offset: UtcOffset,
     ) -> Result<Option<SessionData>, DebuggerError> {
         loop {
-            // Wait for a request
+            // Wait for a request. The read does not block: without a request, wait for input
+            // (at most `START_WAIT`) instead of asking again at once, which kept a CPU core busy
+            // for as long as the client did not attach.
             let Some(request) = debug_adapter.listen_for_request()? else {
+                debug_adapter.wait_for_input(START_WAIT).await;
                 continue;
             };
 
