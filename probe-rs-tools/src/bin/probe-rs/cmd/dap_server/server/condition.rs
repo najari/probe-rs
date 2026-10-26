@@ -66,7 +66,8 @@ impl Comparison {
         // The first operator in the text, at a place the longest (they come first); the `>` of
         // `->` (a pointer's member) is none.
         let bytes = text.as_bytes();
-        let Some((at, symbol, op)) = (0..text.len()).find_map(|at| {
+        // At the characters only: slicing inside one (a name in Korean) would panic.
+        let Some((at, symbol, op)) = text.char_indices().find_map(|(at, _)| {
             if at > 0 && bytes[at] == b'>' && bytes[at - 1] == b'-' {
                 return None;
             }
@@ -547,6 +548,10 @@ mod tests {
         assert!(Condition::parse("v + 1 == 3").is_err());
         assert!(Condition::parse("v == == 3").is_err());
         assert!(Condition::parse("v == 3 &&").is_err());
+        // A name that is not ASCII is no panic.
+        assert!(Condition::parse("변수 == 1").is_ok());
+        assert!(Condition::parse("é>1").is_ok());
+        assert!(Condition::parse("변수").is_err());
         assert!(HitCondition::parse("").is_err());
         assert!(HitCondition::parse("% 0").is_err());
         assert!(HitCondition::parse("three").is_err());

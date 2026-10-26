@@ -32,6 +32,9 @@ struct FakeBus {
     halt_group_at_peer_read: bool,
     /// The next run makes a watched access: the trigger unit halts the core after it.
     access_on_run: Option<u32>,
+    /// The next step saves a context and goes to this address (a call, or a trap when it is in
+    /// the trap vector table).
+    step_saves_context: Option<u32>,
 }
 
 impl FakeBus {
@@ -94,7 +97,11 @@ impl FakeBus {
                     if self.access_hw_step && step_armed {
                         // One instruction, then the step trap halts the core again.
                         let pc = Self::csfr(registers::CSFR_PC);
-                        self.set_word(pc, self.word(pc) + 2);
+                        if let Some(target) = self.step_saves_context.take() {
+                            self.save_context(target);
+                        } else {
+                            self.set_word(pc, self.word(pc) + 2);
+                        }
                         self.trig_acc |= 1;
                         self.halted = true;
                         self.evtsrc = 16;
@@ -148,6 +155,26 @@ impl FakeBus {
         (0..len)
             .map(|i| *self.memory.get(&(address + i as u32)).unwrap_or(&0))
             .collect()
+    }
+
+    /// What a call or a trap entry does with the context registers: `PCXI` links to the free
+    /// context save area and takes `ICR.IE` into `PIE`, and a trap disables interrupts.
+    fn save_context(&mut self, target: u32) {
+        let fcx = self.word(Self::csfr(registers::CSFR_FCX));
+        let icr = self.word(Self::csfr(registers::CSFR_ICR));
+        let pie = if icr & ocds::ICR_IE != 0 {
+            ocds::PCXI_PIE
+        } else {
+            0
+        };
+        let pcxi = Self::csfr(registers::CSFR_PCXI);
+        self.set_word(pcxi, (1 << 20) | pie | (fcx & ocds::CONTEXT_LINK));
+        self.set_word(Self::csfr(registers::CSFR_FCX), fcx + 1);
+        let btv = self.word(Self::csfr(registers::CSFR_BTV));
+        if target.wrapping_sub(btv) < ocds::TRAP_TABLE_SIZE {
+            self.set_word(Self::csfr(registers::CSFR_ICR), icr & !ocds::ICR_IE);
+        }
+        self.set_word(Self::csfr(registers::CSFR_PC), target);
     }
 
     /// Lets the core run into the trigger of `unit` at the address planted there.
@@ -504,6 +531,26 @@ fn the_halt_group_routes_the_core_and_puts_the_registers_back() {
     assert!(!state.in_halt_group());
     assert_eq!(bus.word(ocds::trc(0)), 0x0000_0102);
     assert_eq!(bus.word(CSFR_BASE + 0xFD08), 0);
+}
+
+#[test]
+fn the_halt_state_on_the_suspend_line_stays_in_the_group() {
+    assert!(ocds::in_halt_group(0x0070_0170));
+    // `suspendPeripherals` routes the halt state to trigger line 1.
+    assert!(ocds::in_halt_group(0x0070_0171));
+    // On the group line the halt state would hold the line.
+    assert!(!ocds::in_halt_group(0x0070_0177));
+
+    let mut bus = FakeBus::new();
+    bus.halted = true;
+    let mut state = TriCoreCoreState::new();
+    group_core(&mut bus, &mut state)
+        .set_halt_group(true)
+        .unwrap();
+    bus.set_word(ocds::trc(0), 0x0070_0171);
+    group_core(&mut bus, &mut state).status().unwrap();
+    // The status check finds the core in the group and leaves the routing alone.
+    assert_eq!(bus.word(ocds::trc(0)), 0x0070_0171);
 }
 
 #[test]
@@ -1954,8 +2001,57 @@ fn steps_can_leave_interrupts_enabled() {
 }
 
 #[test]
-fn instructions_that_change_ie_are_recognized() {
-    let yes: [&[u8]; 9] = [
+fn a_step_over_mfcr_icr_reads_ie_unmasked() {
+    let mut bus = FakeBus::new();
+    bus.halted = true;
+    bus.set_word(ICR, 0x0000_8000);
+    // `mfcr %d4, $icr` at the PC: iLLD saves the interrupt enable this way before a critical
+    // section, and enables interrupts after it only when it read them enabled.
+    bus.set_bytes(0x8000_0100, &[0x4D, 0xC0, 0xE2, 0x4F]);
+    let mut state = TriCoreCoreState::new();
+    core(&mut bus, &mut state).step().unwrap();
+    assert!(icr_writes(&bus).is_empty());
+}
+
+const PCXI: u32 = CSFR_BASE + registers::CSFR_PCXI as u32;
+const FCX: u32 = CSFR_BASE + registers::CSFR_FCX as u32;
+const BTV: u32 = CSFR_BASE + registers::CSFR_BTV as u32;
+
+#[test]
+fn a_step_into_a_call_keeps_the_interrupt_enable_of_the_saved_context() {
+    let mut bus = FakeBus::new();
+    bus.halted = true;
+    bus.set_word(ICR, 0x0000_8000);
+    bus.set_word(FCX, 0x0003_0010);
+    bus.set_word(BTV, 0x8000_F000);
+    bus.step_saves_context = Some(0x8000_2000);
+    let mut state = TriCoreCoreState::new();
+    core(&mut bus, &mut state).step().unwrap();
+    // The call took the masked ICR.IE into PCXI.PIE; both are set again.
+    assert_eq!(bus.word(PCXI), 0x0013_0010 | ocds::PCXI_PIE);
+    assert_eq!(bus.word(ICR), 0x8000);
+}
+
+#[test]
+fn a_step_into_a_trap_leaves_the_handler_with_interrupts_disabled() {
+    let mut bus = FakeBus::new();
+    bus.halted = true;
+    bus.set_word(ICR, 0x0000_8000);
+    // `syscall 3` at the PC: the system call trap, class 6.
+    bus.set_bytes(0x8000_0100, &[0xAD, 0x30, 0x80, 0x00]);
+    bus.set_word(FCX, 0x0003_0010);
+    bus.set_word(BTV, 0x8000_F000);
+    bus.step_saves_context = Some(0x8000_F0C0);
+    let mut state = TriCoreCoreState::new();
+    core(&mut bus, &mut state).step().unwrap();
+    // The RFE of the handler gives the task its interrupts back; the handler starts without.
+    assert_eq!(bus.word(PCXI), 0x0013_0010 | ocds::PCXI_PIE);
+    assert_eq!(bus.word(ICR), 0);
+}
+
+#[test]
+fn instructions_that_use_ie_are_recognized() {
+    let yes: [&[u8]; 10] = [
         &[0x0D, 0x00, 0x00, 0x03], // enable
         &[0x0D, 0x00, 0x40, 0x03], // disable
         &[0x0D, 0x03, 0xC0, 0x03], // disable %d3
@@ -1964,20 +2060,23 @@ fn instructions_that_change_ie_are_recognized() {
         &[0x00, 0x80],             // rfe
         &[0x0D, 0x00, 0x40, 0x01], // rfm
         &[0xCD, 0xC4, 0xE2, 0x0F], // mtcr $icr, %d4
-        &[0x0D, 0x00, 0x80, 0x01], // rfe (32 bit)
+        &[0x4D, 0xC0, 0xE2, 0x4F], // mfcr %d4, $icr
+        &[0x0D, 0x00, 0xC0, 0x01], // rfe (32 bit)
     ];
     for code in yes {
-        assert!(ocds::changes_interrupt_enable(code), "{code:02x?}");
+        assert!(ocds::uses_interrupt_enable(code), "{code:02x?}");
     }
-    let no: [&[u8]; 5] = [
-        &[0x4D, 0xC0, 0xE2, 0x4F], // mfcr %d4, $icr
+    let no: [&[u8]; 7] = [
+        &[0x4D, 0x00, 0xE0, 0x4F], // mfcr %d4, $pcxi
         &[0xAD, 0x30, 0x80, 0x00], // syscall 3
         &[0x00, 0x90],             // ret
+        &[0x0D, 0x00, 0x80, 0x01], // ret (32 bit)
         &[0x40, 0xAE],             // mov.aa
         &[0x59, 0xE4, 0xFC, 0xFF], // st.w
+        &[0x6D, 0x00, 0x10, 0x00], // call
     ];
     for code in no {
-        assert!(!ocds::changes_interrupt_enable(code), "{code:02x?}");
+        assert!(!ocds::uses_interrupt_enable(code), "{code:02x?}");
     }
 }
 

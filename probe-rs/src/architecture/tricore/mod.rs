@@ -234,10 +234,17 @@ pub mod ocds {
     /// `ICR.IE`: interrupts enabled.
     pub const ICR_IE: u32 = 1 << 15;
 
+    /// `PCXI.PIE`: the interrupt enable of the context `PCXI` links to (bit 21).
+    pub const PCXI_PIE: u32 = 1 << 21;
+    /// The link of `PCXI` and `FCX` to a context save area: `PCXS` and `PCXO` (bits 19:0).
+    pub const CONTEXT_LINK: u32 = 0xF_FFFF;
+    /// The trap vector table at `BTV`: 8 trap classes of 32 bytes.
+    pub const TRAP_TABLE_SIZE: u32 = 0x100;
+
     /// Whether the instruction that starts with `code` (4 bytes, or 2 for a 16-bit instruction)
-    /// changes `ICR.IE`: ENABLE, DISABLE, DISABLE D\[a\], RESTORE D\[a\], BISR, RFE, RFM, and
-    /// MTCR to ICR. A step over one of them must not set `ICR.IE` back.
-    pub fn changes_interrupt_enable(code: &[u8]) -> bool {
+    /// changes or reads `ICR.IE`: ENABLE, DISABLE, DISABLE D\[a\], RESTORE D\[a\], BISR, RFE,
+    /// RFM, and MTCR to and MFCR from ICR. A step over one of them must not mask `ICR.IE`.
+    pub fn uses_interrupt_enable(code: &[u8]) -> bool {
         let Some(&first) = code.first() else {
             return false;
         };
@@ -254,11 +261,11 @@ pub mod ocds {
         };
         match first {
             // SYS format: ENABLE, DISABLE, DISABLE D[a], RESTORE D[a], RFM, RFE.
-            0x0D => matches!((word >> 22) & 0x3F, 0x0C | 0x0D | 0x0F | 0x0E | 0x05 | 0x06),
+            0x0D => matches!((word >> 22) & 0x3F, 0x0C | 0x0D | 0x0F | 0x0E | 0x05 | 0x07),
             // RC format: BISR const9 (SYSCALL shares the opcode with op2 4).
             0xAD => (word >> 21) & 0x7F == 0,
-            // RLC format: MTCR const16, D[a] with const16 = ICR.
-            0xCD => {
+            // RLC format: MTCR const16, D[a] and MFCR D[c], const16 with const16 = ICR.
+            0xCD | 0x4D => {
                 (word >> 12) & 0xFFFF == crate::architecture::tricore::registers::CSFR_ICR as u32
             }
             _ => false,
@@ -289,6 +296,8 @@ pub mod ocds {
     /// 3:0), `BRKOUT` (the break-out pulse of a debug event to a line, bits 7:4) and `BRKIN` (a
     /// line to the core break-in, bits 23:20). Bits 0-8 and 20-27 are writable on the TC275.
     pub const TRC_HALT_BRKIN: u32 = 0x00F0_00FF;
+    /// `HALT` of `CBS_TRCn`.
+    const TRC_HALT: u32 = 0xF;
     /// `BRKOUT` and `BRKIN` of a halt group member: both on [`HALT_GROUP_LINE`].
     ///
     /// The line carries break-out pulses, not the halt state: a core in boot halt after an
@@ -306,10 +315,14 @@ pub mod ocds {
     }
 
     /// Whether a `CBS_TRCn` value puts the core in the halt group (also the halt state routing
-    /// that an earlier version left).
+    /// that an earlier version left). Joining takes the halt state off its line, but a `HALT`
+    /// set since on a line other than the group's is not the group's to undo: the session routes
+    /// the halt state to the suspend line with `suspendPeripherals`. On the group line it would
+    /// hold the line (a core in boot halt), so the core is not in the group then.
     pub fn in_halt_group(trc: u32) -> bool {
-        let fields = trc & TRC_HALT_BRKIN;
-        fields == TRC_HALT_GROUP || fields == TRC_HALT_STATE_GROUP
+        let pulses = trc & TRC_HALT_BRKIN & !TRC_HALT;
+        pulses == TRC_HALT_GROUP && trc & TRC_HALT != HALT_GROUP_LINE
+            || trc & TRC_HALT_BRKIN == TRC_HALT_STATE_GROUP
     }
 }
 
@@ -1779,9 +1792,8 @@ impl<'probe> TriCore<'probe> {
             self.write_csfr(ocds::DBGSR, ocds::DBGSR_HALT)?;
         }
         self.write_triggers(0..ocds::TRIGGER_UNITS)?;
-        if masked {
-            let icr = self.read_csfr(registers::CSFR_ICR)?;
-            self.write_csfr(registers::CSFR_ICR, icr | ocds::ICR_IE)?;
+        if let Some(fcx) = masked {
+            self.unmask_interrupts_after_step(fcx)?;
         }
         if let Some(sw) = &lifted {
             self.bus()
@@ -1823,10 +1835,8 @@ impl<'probe> TriCore<'probe> {
         }
         let masked = self.mask_interrupts_for_step(pc)?;
         let stepped = self.step_once();
-        if masked {
-            // The instruction left ICR.IE alone (see `mask_interrupts_for_step`).
-            let icr = self.read_csfr(registers::CSFR_ICR)?;
-            self.write_csfr(registers::CSFR_ICR, icr | ocds::ICR_IE)?;
+        if let Some(fcx) = masked {
+            self.unmask_interrupts_after_step(fcx)?;
         }
         if let Some(sw) = &lifted {
             self.bus()
@@ -1836,15 +1846,15 @@ impl<'probe> TriCore<'probe> {
     }
 
     /// Clears `ICR.IE` for a single step, when interrupts are enabled, the session masks them
-    /// during steps and the instruction at `pc` does not change `ICR.IE` itself. Returns whether
-    /// it did: the caller sets `ICR.IE` again after the step.
-    fn mask_interrupts_for_step(&mut self, pc: u32) -> Result<bool, TriCoreError> {
+    /// during steps and the instruction at `pc` does not use `ICR.IE` itself. Returns the `FCX`
+    /// from before the step when it did: [`Self::unmask_interrupts_after_step`] takes it.
+    fn mask_interrupts_for_step(&mut self, pc: u32) -> Result<Option<u32>, TriCoreError> {
         if !self.state.mask_step_interrupts {
-            return Ok(false);
+            return Ok(None);
         }
         let icr = self.read_csfr(registers::CSFR_ICR)?;
         if icr & ocds::ICR_IE == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         let address = translate_local_address(self.core(), pc);
         let mut code = [0; 4];
@@ -1854,11 +1864,34 @@ impl<'probe> TriCore<'probe> {
             self.bus()
                 .read_block(AddressMap::Target, address, &mut code)?;
         }
-        if ocds::changes_interrupt_enable(&code) {
-            return Ok(false);
+        if ocds::uses_interrupt_enable(&code) {
+            return Ok(None);
         }
+        let fcx = self.read_csfr(registers::CSFR_FCX)?;
         self.write_csfr(registers::CSFR_ICR, icr & !ocds::ICR_IE)?;
-        Ok(true)
+        Ok(Some(fcx))
+    }
+
+    /// Puts back the interrupt enable that [`Self::mask_interrupts_for_step`] cleared, `fcx`
+    /// being the `FCX` from before the step.
+    ///
+    /// A context the step saved (a call, `SVLCX`, a trap such as `SYSCALL`) took the masked
+    /// `ICR.IE` into `PCXI.PIE`, which the return from a trap (`RFE`) gives to `ICR.IE`: it is
+    /// set. The step saved one when `PCXI` links to the context save area that was free before
+    /// it. A trap handler starts with interrupts disabled, so in one `ICR.IE` stays as the trap
+    /// left it.
+    fn unmask_interrupts_after_step(&mut self, fcx: u32) -> Result<(), TriCoreError> {
+        let link = fcx & ocds::CONTEXT_LINK;
+        let pcxi = self.read_csfr(registers::CSFR_PCXI)?;
+        if link != 0 && pcxi & ocds::CONTEXT_LINK == link {
+            self.write_csfr(registers::CSFR_PCXI, pcxi | ocds::PCXI_PIE)?;
+            let btv = self.read_csfr(registers::CSFR_BTV)? & !1;
+            if self.pc()?.wrapping_sub(btv) < ocds::TRAP_TABLE_SIZE {
+                return Ok(());
+            }
+        }
+        let icr = self.read_csfr(registers::CSFR_ICR)?;
+        self.write_csfr(registers::CSFR_ICR, icr | ocds::ICR_IE)
     }
 
     /// The single step sequence of [`Self::step_core`].
