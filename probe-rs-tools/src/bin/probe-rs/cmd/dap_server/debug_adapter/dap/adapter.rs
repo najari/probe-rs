@@ -2308,17 +2308,31 @@ impl DebugAdapter {
             );
         }
 
-        // Override the halt reason: stepping uses breakpoints, which would
-        // otherwise surface as a "BreakPoint" halt reason.
-        core_data.last_known_status = CoreStatus::Halted(HaltReason::Step);
+        // The event says "step", though stepping uses breakpoints (a step over a call halts at
+        // a temporary one) and the core reports that halt reason; it says "breakpoint" when
+        // the step stopped at one of the client's breakpoints (one in a call stepped over).
+        // The status kept is the one the core reports: the next poll reads it again and so
+        // sees no new halt. With `Halted(Step)` kept instead, the poll took the core's
+        // `Halted(Breakpoint)` for a new stop and sent a second `stopped` event ("Stopped at a
+        // hardware breakpoint") at the address the step had just stopped at.
+        core_data.last_known_status = new_status;
         if matches!(new_status, CoreStatus::Halted(_)) {
-            let reason = core_data
-                .last_known_status
+            let at_breakpoint = matches!(new_status, CoreStatus::Halted(HaltReason::Breakpoint(_)))
+                && core_data
+                    .breakpoints
+                    .iter()
+                    .any(|breakpoint| breakpoint.address == program_counter);
+            let shown = if at_breakpoint {
+                new_status
+            } else {
+                CoreStatus::Halted(HaltReason::Step)
+            };
+            let reason = shown
                 .short_long_status(backend, None, false)
                 .await
                 .0
                 .to_string();
-            let description = CoreStatus::Halted(HaltReason::Step)
+            let description = shown
                 .short_long_status(backend, Some(program_counter), false)
                 .await
                 .1;
