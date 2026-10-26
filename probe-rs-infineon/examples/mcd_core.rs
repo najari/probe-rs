@@ -21,6 +21,7 @@
 //! break <address>      a hardware breakpoint; prints its trigger ID
 //! unbreak [id]         remove one, or all this run set (the run removes them when it ends)
 //! mem <address> [n]    n 32-bit words of the device memory (1)
+//! reset                a system reset through the library, the cores halted after it
 //! ```
 //!
 //! For example, on the TC275 with the flash demo halted at main by `start_in_flash`:
@@ -240,6 +241,11 @@ fn run(probe: &mut McdProbe, breakpoints: &mut Vec<u32>, command: &str) -> Resul
             probe.remove_trigger(id)?;
             breakpoints.retain(|b| *b != id);
             println!("ok");
+        }
+        ["reset"] => {
+            // `mcd_rst_f` with the system reset class and halt after the reset.
+            probe.target_reset()?;
+            println!("ok, the cores are halted after the reset");
         }
         ["mem", address] | ["mem", address, _] => {
             let address = u32::try_from(number(address)?)?;

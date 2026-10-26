@@ -39,7 +39,9 @@ use base64::Engine as _;
 
 use probe_rs::{
     CoreStatus, Error, MemoryInterface, RegisterId, Session,
-    architecture::tricore::registers::{CSFR_A0, CSFR_ICR, CSFR_PC, TRICORE_CORE_REGISTERS},
+    architecture::tricore::registers::{
+        CSFR_A0, CSFR_FCX, CSFR_ICR, CSFR_PC, TRICORE_CORE_REGISTERS,
+    },
     flashing::{DebugFlashSequence, FlashLayout, FlashPage},
 };
 use probe_rs_target::NvmRegion;
@@ -59,6 +61,34 @@ const LOADER_SP: u32 = 0x7000_E000;
 const MAGIC: u32 = 0x4D32_354D;
 /// The RAM the loader uses: payload, stack, data and mailbox in DSPR, code in PSPR.
 const LOADER_RAM: [(u32, usize); 2] = [(0x7000_A000, 0x6000), (PSPR, 0x2000)];
+/// The data of the loader (`.data` and `.bss`, `dsprdata` of `loader/m25_flash_loader.ld`).
+const LOADER_DATA: (u32, u32) = (0x7000_E000, 0x800);
+/// Context save areas for a CPU0 that has none (`FCX` = 0, as after a reset and halt, before
+/// the start-up software made its list): the loader's calls trap without them. They sit
+/// between the loader's data and the mailbox, in the RAM that is saved and put back.
+const LOADER_CSA: u32 = LOADER_DATA.0 + LOADER_DATA.1;
+/// The number of those context save areas, 64 bytes each.
+const LOADER_CSA_COUNT: u32 = 32;
+/// The size of a context save area.
+const CSA_SIZE: u32 = 64;
+
+/// The link word of the context save area at `address` (as in `FCX` and `PCXI`): the segment
+/// in bits 19:16, the offset in 64-byte units in bits 15:0.
+fn csa_link(address: u32) -> u32 {
+    ((address >> 12) & 0xF_0000) | ((address >> 6) & 0xFFFF)
+}
+
+/// A free list of `count` context save areas from `base`: the `FCX` that heads it, and the
+/// bytes of the areas, each linking to the next and the last to none.
+fn csa_free_list(base: u32, count: u32) -> (u32, Vec<u8>) {
+    let mut bytes = vec![0; (CSA_SIZE * count) as usize];
+    for i in 1..count {
+        let link = csa_link(base + CSA_SIZE * i);
+        let at = (CSA_SIZE * (i - 1)) as usize;
+        bytes[at..at + 4].copy_from_slice(&link.to_le_bytes());
+    }
+    (csa_link(base), bytes)
+}
 
 /// The PFLASH program page size.
 pub const PAGE: usize = 32;
@@ -1116,6 +1146,23 @@ impl AurixFlash {
             loader.len()
         );
         core.write(PSPR as u64, loader)?;
+        // The loader's code calls functions, which takes context save areas. Right after a
+        // reset and halt CPU0 has none and would trap at the first call: it gets a list in the
+        // loader's RAM. `stop_loader` puts back FCX and that RAM.
+        let fcx = saved
+            .registers
+            .iter()
+            .find(|(id, _)| *id == RegisterId(CSFR_FCX))
+            .map(|(_, value)| *value);
+        if fcx == Some(0) {
+            let (head, areas) = csa_free_list(LOADER_CSA, LOADER_CSA_COUNT);
+            tracing::info!(
+                "CPU0 has no context save areas (FCX = 0): the loader gets {LOADER_CSA_COUNT} \
+                 at {LOADER_CSA:#010x}"
+            );
+            core.write(LOADER_CSA as u64, &areas)?;
+            core.write_core_reg(RegisterId(CSFR_FCX), head)?;
+        }
         core.write_word_32((MAILBOX + 4 * MB_MAGIC) as u64, 0)?;
         core.write_core_reg(RegisterId(CSFR_PC), PSPR)?;
         core.write_core_reg(RegisterId(CSFR_A0 + 4 * 10), LOADER_SP)?;
@@ -1973,6 +2020,39 @@ mod tests {
             FlashDevice::for_jtag_id(0x1020_9083),
             Some(FlashDevice::Tc36x)
         );
+    }
+
+    #[test]
+    fn a_cpu_without_context_save_areas_gets_a_list_in_the_loader_ram() {
+        let word =
+            |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let (head, bytes) = csa_free_list(LOADER_CSA, LOADER_CSA_COUNT);
+        assert_eq!(LOADER_CSA, 0x7000_E800);
+        assert_eq!(head, 0x0007_03A0);
+        assert_eq!(bytes.len(), 2048);
+        // Each area links to the next, the last to none.
+        assert_eq!(word(&bytes, 0), 0x0007_03A1);
+        assert_eq!(word(&bytes, 64), 0x0007_03A2);
+        assert_eq!(
+            word(&bytes, (CSA_SIZE * (LOADER_CSA_COUNT - 1)) as usize),
+            0
+        );
+        // A link is the address again: the segment in bits 31:28, the offset in bits 21:6.
+        let address = |link: u32| ((link & 0xF_0000) << 12) | ((link & 0xFFFF) << 6);
+        assert_eq!(address(head), LOADER_CSA);
+        assert_eq!(address(word(&bytes, 0)), LOADER_CSA + 64);
+
+        // Aligned, above the loader's data and below the mailbox, in the RAM that is saved
+        // and put back, and clear of the payload and the stack below LOADER_SP.
+        let end = LOADER_CSA + CSA_SIZE * LOADER_CSA_COUNT;
+        assert_eq!(LOADER_CSA % CSA_SIZE, 0);
+        assert!(LOADER_CSA >= LOADER_DATA.0 + LOADER_DATA.1 && end <= MAILBOX);
+        let (ram, size) = LOADER_RAM[0];
+        assert!(LOADER_CSA >= ram && end <= ram + size as u32);
+        assert!(LOADER_CSA >= LOADER_SP && PAYLOAD + PAYLOAD_SIZE as u32 <= LOADER_SP);
+        // The loader's data is where its linker script puts it.
+        let script = include_str!("../loader/m25_flash_loader.ld");
+        assert!(script.contains("dsprdata (rw) : ORIGIN = 0x7000E000, LENGTH = 2K"));
     }
 
     #[test]
