@@ -433,6 +433,76 @@ fn keep_first(failed: &mut Option<Error>, result: Result<(), Error>) {
     }
 }
 
+/// Checks the sectors of a device file against the built-in map: each must be a sector of it.
+/// A device with less flash leaves sectors out; a sector the built-in map does not have would be
+/// erased at boundaries the flash controller does not have (a file of another device).
+fn check_file_sectors(
+    what: &str,
+    name: &str,
+    file: &std::path::Path,
+    sectors: &[Sector],
+    builtin: &[Sector],
+    device: FlashDevice,
+) -> Result<(), Error> {
+    if sectors == builtin {
+        return Ok(());
+    }
+    if let Some(odd) = sectors.iter().find(|s| !builtin.contains(s)) {
+        return Err(other(format!(
+            "the {what} map of {name} ({}) has sector {:#010x} ({} KiB), which the {} does not \
+             have: the file is not for this device",
+            file.display(),
+            odd.base,
+            odd.size / 1024,
+            device.name()
+        )));
+    }
+    tracing::info!(
+        "The {what} map of {name} has {} of the {} sectors of the {}",
+        sectors.len(),
+        builtin.len(),
+        device.name()
+    );
+    Ok(())
+}
+
+/// The TC27x boot mode headers BMHD0-BMHD3 in the PFLASH, one page each. The start-up software
+/// starts the program from the first valid one (`BMHDID` 0xB359 at offset 6); with none it
+/// starts the bootstrap loader (Infineon AP32566).
+const TC27X_BMHDS: [u32; 4] = [0xA000_0000, 0xA002_0000, 0xA000_FFE0, 0xA001_FFE0];
+
+/// The environment variable that lets a download leave the TC27x without a valid boot mode
+/// header.
+pub const ALLOW_NO_BMHD_ENV: &str = "PROBE_RS_TRICORE_ALLOW_NO_BMHD";
+
+/// Whether a page holds a boot mode header (its `BMHDID`).
+fn is_bmhd(page: &PageImage) -> bool {
+    page.is_some_and(|page| page[6..8] == [0x59, 0xB3])
+}
+
+/// Whether a download leaves the TC27x without a valid boot mode header where it had one:
+/// `before` are the pages of [`TC27X_BMHDS`] now, `touched` the sectors the download erases
+/// and `patches` what it writes (the pages as [`sector_image`] makes them).
+fn loses_boot_mode_headers(
+    before: &[PageImage],
+    touched: &BTreeMap<u32, Sector>,
+    patches: &BTreeMap<u32, PagePatch>,
+) -> bool {
+    let after = TC27X_BMHDS.iter().zip(before).map(|(&address, before)| {
+        let erased = touched
+            .values()
+            .any(|s| address >= s.base && address - s.base < s.size);
+        if !erased {
+            return *before;
+        }
+        patches
+            .get(&address)
+            .map(|patch| patch.map(|byte| byte.unwrap_or(0)))
+            .or_else(|| before.filter(|page| *page == [0; PAGE]))
+    });
+    before.iter().any(is_bmhd) && !after.into_iter().any(|page| is_bmhd(&page))
+}
+
 /// SCU_CHIPID, which tells the device step and variant apart.
 const SCU_CHIPID: u64 = 0xF003_6140;
 
@@ -513,13 +583,14 @@ impl FlashMap {
                 size: s.size,
             })
             .collect::<Vec<_>>();
-        if sectors != device.sectors() {
-            tracing::warn!(
-                "The PFLASH map of {name} differs from the built-in {} map; using {}",
-                device.name(),
-                config.file.display()
-            );
-        }
+        check_file_sectors(
+            "PFLASH",
+            name,
+            &config.file,
+            &sectors,
+            &device.sectors(),
+            device,
+        )?;
         // The DFLASH sectors of the file, for a device whose DFLASH the loader programs. Only
         // sectors in the DFLASH range count (never a UCB); a file without them leaves the
         // built-in map.
@@ -544,13 +615,14 @@ impl FlashMap {
                         size: s.size,
                     })
                     .collect::<Vec<_>>();
-                if dflash != builtin_dflash {
-                    tracing::warn!(
-                        "The DFLASH map of {name} differs from the built-in {} map; using {}",
-                        device.name(),
-                        config.file.display()
-                    );
-                }
+                check_file_sectors(
+                    "DFLASH",
+                    name,
+                    &config.file,
+                    &dflash,
+                    &builtin_dflash,
+                    device,
+                )?;
                 dflash
             }
             None => builtin_dflash,
@@ -900,6 +972,36 @@ impl AurixFlash {
         Ok(())
     }
 
+    /// Refuses a download after which the TC27x would have no valid boot mode header where it
+    /// had one: the device would start the bootstrap loader, not the program
+    /// ([`ALLOW_NO_BMHD_ENV`] lets it).
+    fn check_boot_mode_headers(
+        &self,
+        session: &mut Session,
+        touched: &BTreeMap<u32, Sector>,
+        patches: &BTreeMap<u32, PagePatch>,
+    ) -> Result<(), Error> {
+        let mut before = Vec::new();
+        {
+            let mut core = session.core(0)?;
+            for address in TC27X_BMHDS {
+                before.push(read_pages(&mut core, address, PAGE)?[0]);
+            }
+        }
+        if loses_boot_mode_headers(&before, touched, patches)
+            && std::env::var_os(ALLOW_NO_BMHD_ENV).is_none_or(|v| v.is_empty())
+        {
+            return Err(other(format!(
+                "after this download the TC27x would have no valid boot mode header (BMHD0-3 at \
+                 {:#010x}, {:#010x}, {:#010x}, {:#010x}): it would start the bootstrap loader, \
+                 not the program. Write an image with a boot mode header, or set \
+                 {ALLOW_NO_BMHD_ENV}=1",
+                TC27X_BMHDS[0], TC27X_BMHDS[1], TC27X_BMHDS[2], TC27X_BMHDS[3]
+            )));
+        }
+        Ok(())
+    }
+
     /// Stops the loader and puts back what [`Self::start_loader`] saved. Every step is tried,
     /// also after one failed: the first error is returned.
     fn stop_loader(&self, session: &mut Session) -> Result<(), Error> {
@@ -911,7 +1013,10 @@ impl AurixFlash {
             // Nothing ran: the cores halted so far run again, the rest was not changed.
             for (id, running) in saved.running.iter().enumerate() {
                 if *running {
-                    keep_first(&mut failed, session.core(id).and_then(|mut core| core.run()));
+                    keep_first(
+                        &mut failed,
+                        session.core(id).and_then(|mut core| core.run()),
+                    );
                 }
             }
             return failed.map_or(Ok(()), Err);
@@ -955,7 +1060,10 @@ impl AurixFlash {
 
         for (id, running) in saved.running.iter().enumerate() {
             if *running {
-                keep_first(&mut failed, session.core(id).and_then(|mut core| core.run()));
+                keep_first(
+                    &mut failed,
+                    session.core(id).and_then(|mut core| core.run()),
+                );
             }
         }
 
@@ -1061,6 +1169,9 @@ impl DebugFlashSequence for AurixFlash {
         for page in patches.keys() {
             let sector = map.sector(*page as u64)?;
             touched.insert(sector.base, sector);
+        }
+        if self.device == FlashDevice::Tc27x {
+            self.check_boot_mode_headers(session, &touched, &patches)?;
         }
 
         for sector in touched.into_values() {
@@ -1249,6 +1360,52 @@ mod tests {
     }
 
     #[test]
+    fn a_device_file_with_sectors_of_another_device_is_refused() {
+        // Fewer sectors (a device with less flash): taken.
+        let mut runs = builtin_runs();
+        runs.truncate(20);
+        let dir = device_dir("TC27x_small", "flax_TC2xx.hex", "0x401DA083", &runs);
+        let map = FlashMap::for_device(std::slice::from_ref(&dir), 0x401D_A083, None).unwrap();
+        assert_eq!(map.sectors.len(), 20);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // A sector that the TC27x does not have: refused.
+        let mut runs = builtin_runs();
+        runs[1].1 *= 2;
+        let dir = device_dir("TC27x_odd", "flax_TC2xx.hex", "0x401DA083", &runs);
+        let error = FlashMap::for_device(std::slice::from_ref(&dir), 0x401D_A083, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not for this device"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_download_must_leave_a_boot_mode_header() {
+        let mut header = [0; PAGE];
+        header[6..8].copy_from_slice(&[0x59, 0xB3]);
+        let sector0 = Sector {
+            base: 0xA000_0000,
+            size: 0x4000,
+        };
+        let touched = BTreeMap::from([(sector0.base, sector0)]);
+        // BMHD0 only, and the image erases its sector without writing one.
+        let before = [Some(header), None, None, None];
+        let mut patches = BTreeMap::new();
+        patches.insert(0xA000_0100, [Some(0x11); PAGE]);
+        assert!(loses_boot_mode_headers(&before, &touched, &patches));
+        // The image writes a header there.
+        patches.insert(0xA000_0000, header.map(Some));
+        assert!(!loses_boot_mode_headers(&before, &touched, &patches));
+        // BMHD1 stays (its sector is not erased).
+        patches.remove(&0xA000_0000);
+        let before = [Some(header), Some(header), None, None];
+        assert!(!loses_boot_mode_headers(&before, &touched, &patches));
+        // Without a header before, the download changes nothing about the start.
+        assert!(!loses_boot_mode_headers(&[None; 4], &touched, &patches));
+    }
+
+    #[test]
     fn restricted_sectors_are_refused() {
         let mut runs = builtin_runs();
         runs[0].2 = true;
@@ -1397,7 +1554,8 @@ mod tests {
         fn check(&mut self, address: u64, len: usize) -> Result<(), Error> {
             self.reads += 1;
             let page = |a: u64| (a as u32) & !(PAGE as u32 - 1);
-            if self.broken || (address..address + len as u64).any(|a| self.erased.contains(&page(a)))
+            if self.broken
+                || (address..address + len as u64).any(|a| self.erased.contains(&page(a)))
             {
                 return Err(other("read failed"));
             }

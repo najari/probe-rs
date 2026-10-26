@@ -703,6 +703,11 @@ impl Debugger {
         };
 
         tracing::error!("The debug session ends with an error: {error:?}");
+        // No `clean_up` on this path; what `suspendPeripherals` changed goes back at least (the
+        // probe may be gone, then this fails as well).
+        if let Err(restore) = super::peripheral_suspend::restore(&mut session_data).await {
+            tracing::warn!("`suspendPeripherals` could not be put back: {restore}");
+        }
         debug_adapter.show_message(
             MessageSeverity::Error,
             format!("Debug Adapter terminated unexpectedly with an error: {error:?}"),
@@ -1090,20 +1095,31 @@ impl Debugger {
             debug_adapter.log_to_console(message);
         }
 
-        if requested_target_session_type == TargetSessionType::LaunchRequest {
-            // This will effectively do a `reset` and `halt` of the core, which is what we want until after the `configuration_done` request.
-            // A reset of the first core resets the device (TriCore): the other cores of the
-            // session start from it as well.
-            debug_adapter
-                .restart_async(&mut session_data, target_core_config.core_index, None)
-                .await
-                .context("Failed to restart core")?;
+        let started = async {
+            if requested_target_session_type == TargetSessionType::LaunchRequest {
+                // This will effectively do a `reset` and `halt` of the core, which is what we want until after the `configuration_done` request.
+                // A reset of the first core resets the device (TriCore): the other cores of the
+                // session start from it as well.
+                debug_adapter
+                    .restart_async(&mut session_data, target_core_config.core_index, None)
+                    .await
+                    .context("Failed to restart core")?;
+            }
+
+            session_data.poll_cores(&self.config, debug_adapter).await?;
+
+            debug_adapter.send_response::<()>(launch_attach_request, Ok(None))?;
+            self.debug_logger.flush_to_dap(debug_adapter)?;
+            Ok::<_, DebuggerError>(())
         }
-
-        session_data.poll_cores(&self.config, debug_adapter).await?;
-
-        debug_adapter.send_response::<()>(launch_attach_request, Ok(None))?;
-        self.debug_logger.flush_to_dap(debug_adapter)?;
+        .await;
+        if let Err(error) = started {
+            // The session ends before it began: what `suspendPeripherals` changed goes back.
+            if let Err(restore) = super::peripheral_suspend::restore(&mut session_data).await {
+                tracing::warn!("`suspendPeripherals` could not be put back: {restore}");
+            }
+            return Err(error);
+        }
 
         Ok(session_data)
     }

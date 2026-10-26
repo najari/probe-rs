@@ -35,6 +35,8 @@ struct FakeBus {
     /// The next step saves a context and goes to this address (a call, or a trap when it is in
     /// the trap vector table).
     step_saves_context: Option<u32>,
+    /// The next request that writes `ACCESS_HW_CTRL` (a run bracket) fails.
+    refuse_run: bool,
 }
 
 impl FakeBus {
@@ -219,8 +221,11 @@ impl FakeBus {
 
 impl TriCoreBusAccess for FakeBus {
     fn execute(&mut self, transfers: &mut [BusTransfer]) -> Result<(), TriCoreError> {
-        if self.refuse > 0 {
-            self.refuse -= 1;
+        let run = transfers
+            .iter()
+            .any(|t| !t.is_read() && t.address == ocds::ACCESS_HW_CTRL);
+        if self.refuse > 0 || (run && std::mem::take(&mut self.refuse_run)) {
+            self.refuse = self.refuse.saturating_sub(1);
             for transfer in transfers {
                 transfer.status = Some(TransferStatus::Failed(0x44));
             }
@@ -1315,6 +1320,40 @@ fn a_debug_instruction_of_the_program_is_skipped() {
 }
 
 #[test]
+fn a_debug_instruction_of_the_program_is_skipped_in_the_halt_group() {
+    let mut bus = FakeBus::new();
+    bus.set_bytes(0x7010_0020, &ocds::DEBUG16);
+    let mut state = TriCoreCoreState::new();
+    group_core(&mut bus, &mut state)
+        .set_halt_group(true)
+        .unwrap();
+    bus.halted = true;
+    group_core(&mut bus, &mut state).run().unwrap();
+    assert!(!bus.halted);
+    // The core runs into the DEBUG instruction; the break-in from the group line that follows
+    // overwrites EVTSRC.
+    bus.set_word(FakeBus::csfr(registers::CSFR_PC), 0x7010_0020);
+    bus.halted = true;
+    bus.evtsrc = 0;
+    group_core(&mut bus, &mut state).status().unwrap();
+    // Stepping moves past it, without running the core.
+    bus.writes.clear();
+    assert_eq!(
+        group_core(&mut bus, &mut state).step().unwrap().pc,
+        0x7010_0022
+    );
+    assert!(!bus.writes.iter().any(|w| w.0 == ocds::ACCESS_HW_CTRL));
+
+    // A step that stops at a DEBUG instruction has not run it: the next step does.
+    bus.set_word(FakeBus::csfr(registers::CSFR_PC), 0x7010_001E);
+    group_core(&mut bus, &mut state).step().unwrap();
+    assert_eq!(bus.word(FakeBus::csfr(registers::CSFR_PC)), 0x7010_0020);
+    bus.writes.clear();
+    group_core(&mut bus, &mut state).step().unwrap();
+    assert!(bus.writes.iter().any(|w| w.0 == ocds::ACCESS_HW_CTRL));
+}
+
+#[test]
 fn a_member_halted_at_a_software_breakpoint_stays_halted() {
     let mut bus = FakeBus::new();
     bus.set_word(ocds::trc(1), ocds::TRC_HALT_GROUP);
@@ -1559,6 +1598,36 @@ fn set_stm(bus: &mut FakeBus, value: u64) {
         ocds::STM0_TIM0SV + ocds::STM0_CAPSV_OFFSET,
         (value >> 32) as u32,
     );
+}
+
+#[test]
+fn a_reset_by_another_session_arms_the_kept_debug_instructions_again() {
+    let mut bus = pspr_bus();
+    bus.halted = false;
+    let mut state = TriCoreCoreState::new();
+    {
+        let mut core = core(&mut bus, &mut state);
+        core.enable_breakpoints(true).unwrap();
+        for slot in 0..ocds::TRIGGER_UNITS {
+            core.set_hw_breakpoint(slot, 0x8000_0200 + 4 * slot as u64)
+                .unwrap();
+        }
+        core.set_hw_breakpoint(ocds::TRIGGER_UNITS, PSPR_MOV_AA as u64)
+            .unwrap();
+    }
+    let swevt = FakeBus::csfr(ocds::SWEVT);
+    assert_eq!(bus.word(swevt), ocds::SWEVT_HALT);
+    set_stm(&mut bus, 0x5_0000_0000);
+    core(&mut bus, &mut state).status().unwrap();
+
+    // Another session resets the device; the PSPR keeps the DEBUG instruction, the reset
+    // clears SWEVT.
+    set_stm(&mut bus, 1000);
+    bus.set_word(swevt, 0);
+    core(&mut bus, &mut state).status().unwrap();
+    assert_eq!(state.take_notices().len(), 1);
+    assert_eq!(bus.bytes(PSPR_MOV_AA, 2), ocds::DEBUG16);
+    assert_eq!(bus.word(swevt), ocds::SWEVT_HALT);
 }
 
 #[test]
@@ -1948,6 +2017,27 @@ fn icr_writes(bus: &FakeBus) -> Vec<(usize, u32)> {
         .filter(|&(_, (address, _))| address == ICR)
         .map(|(i, (_, value))| (i, value))
         .collect()
+}
+
+#[test]
+fn a_failed_step_puts_the_trigger_units_back() {
+    let mut bus = FakeBus::new();
+    bus.halted = true;
+    let mut state = TriCoreCoreState::new();
+    {
+        let mut core = core(&mut bus, &mut state);
+        core.enable_breakpoints(true).unwrap();
+        core.set_hw_breakpoint(1, 0x8000_0400).unwrap();
+    }
+    let tr0 = FakeBus::csfr(ocds::TRIG);
+    let tr1 = FakeBus::csfr(ocds::TRIG + 8);
+    let breakpoint = (bus.word(tr1), bus.word(tr1 + 4));
+    // The run request of the step fails (another session reboots the device, say).
+    bus.refuse_run = true;
+    assert!(core(&mut bus, &mut state).step().is_err());
+    // The step trigger is not left in TR0, and the breakpoint is in TR1 again.
+    assert_ne!(bus.word(tr0), ocds::STEP_TRIGGERS_ARM[0]);
+    assert_eq!((bus.word(tr1), bus.word(tr1 + 4)), breakpoint);
 }
 
 #[test]

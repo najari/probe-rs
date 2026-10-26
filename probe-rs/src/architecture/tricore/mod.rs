@@ -1476,6 +1476,11 @@ impl<'probe> TriCore<'probe> {
         // The units compare the PC: copied code does not take them away.
         self.promote_software()?;
         self.replant_software()?;
+        // The reset cleared SWEVT as well (as `finish_reset` says): the `DEBUG` instructions of
+        // the code that was kept would not halt.
+        if !self.memory.software.is_empty() {
+            self.write_csfr(ocds::SWEVT, ocds::SWEVT_HALT)?;
+        }
         self.state.reset_seen = Some(Instant::now());
         if self.state.halt_after_reset {
             self.state.reset_halt = true;
@@ -1721,7 +1726,12 @@ impl<'probe> TriCore<'probe> {
     /// Moves the PC past a `DEBUG` instruction of the program that halted the core (break before
     /// make leaves the PC at it, so running would halt there again). Returns whether it did.
     fn skip_program_debug(&mut self, dbgsr: u32, pc: u32) -> Result<bool, TriCoreError> {
-        if ocds::event_source(dbgsr) != ocds::EVTSRC_SWEVT || self.software_at(pc).is_some() {
+        // In the halt group the break-in that follows the halt overwrites `EVTSRC`: after a run
+        // (not a halt request, not a step, which stops before the instruction), a `DEBUG` at the
+        // PC is the one that halted the core.
+        let debug_event = ocds::event_source(dbgsr) == ocds::EVTSRC_SWEVT
+            || (self.state.halt_group.is_some() && self.state.last_action == LastAction::Run);
+        if !debug_event || self.software_at(pc).is_some() {
             return Ok(false);
         }
         let address = translate_local_address(self.core(), pc);
@@ -1896,25 +1906,21 @@ impl<'probe> TriCore<'probe> {
 
     /// The single step sequence of [`Self::step_core`].
     fn step_once(&mut self) -> Result<(), TriCoreError> {
-        self.step_debug_init(true)?;
         let dbgsr = self.csfr(ocds::DBGSR);
         let (on, off) = self.state.run_bracket();
-        self.write_bracketed(&[
-            (ocds::ACCESS_HW_CTRL, on),
-            (dbgsr, ocds::DBGSR_RUN),
-            (ocds::ACCESS_HW_CTRL, off),
-        ])?;
-        self.step_debug_init(false)?;
-        // The debug init left every unit as a data address range without action (`0x2000`):
-        // write all of them from the state, the unused ones disabled. A unit left so takes the
-        // data comparison from a watchpoint in a higher unit, which then no longer halts the
-        // core (measured on the TC275: TR2 and TR4 left at `0x2000`, TR6 watching).
-        let mut writes = self.trigger_writes(0..ocds::TRIGGER_UNITS);
-        // It cleared EXEVT as well, which a halt group member needs to halt on break-in.
-        if self.state.halt_group.is_some() {
-            writes.push((self.csfr(ocds::EXEVT), ocds::EXEVT_HALT));
-        }
-        self.write_words_at(&writes)?;
+        let stepped = self.step_debug_init(true).and_then(|()| {
+            self.write_bracketed(&[
+                (ocds::ACCESS_HW_CTRL, on),
+                (dbgsr, ocds::DBGSR_RUN),
+                (ocds::ACCESS_HW_CTRL, off),
+            ])
+        });
+        // The trigger units go back also when the step failed (a reboot by another session):
+        // left armed, the step trigger would halt the next run after one instruction, with the
+        // breakpoints and the break-in of the halt group off.
+        let restored = self.end_step();
+        stepped?;
+        restored?;
 
         for _ in 0..20 {
             if ocds::is_halted(self.dbgsr()?) {
@@ -1929,6 +1935,21 @@ impl<'probe> TriCore<'probe> {
             }
         }
         Err(TriCoreError::StepFailed(self.core()))
+    }
+
+    /// Puts the trigger units back from the state after a step of [`Self::step_once`].
+    fn end_step(&mut self) -> Result<(), TriCoreError> {
+        self.step_debug_init(false)?;
+        // The debug init left every unit as a data address range without action (`0x2000`):
+        // write all of them from the state, the unused ones disabled. A unit left so takes the
+        // data comparison from a watchpoint in a higher unit, which then no longer halts the
+        // core (measured on the TC275: TR2 and TR4 left at `0x2000`, TR6 watching).
+        let mut writes = self.trigger_writes(0..ocds::TRIGGER_UNITS);
+        // It cleared EXEVT as well, which a halt group member needs to halt on break-in.
+        if self.state.halt_group.is_some() {
+            writes.push((self.csfr(ocds::EXEVT), ocds::EXEVT_HALT));
+        }
+        self.write_words_at(&writes)
     }
 
     fn run_core(&mut self) -> Result<(), TriCoreError> {
