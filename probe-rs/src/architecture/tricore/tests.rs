@@ -2007,6 +2007,31 @@ fn a_perf_window_counts_between_two_triggers_and_puts_cctrl_back() {
     assert_eq!(bus.word(CCTRL), 0x0000_0004);
 }
 
+#[test]
+fn the_counters_of_a_killed_session_count_again() {
+    let dir = journal_dir("perf");
+    let mut bus = FakeBus::new();
+    bus.halted = true;
+    bus.set_word(CCTRL, 0x0000_0006);
+    let mut state = TriCoreCoreState::new();
+    state.set_journal_dir(dir.clone());
+    core(&mut bus, &mut state)
+        .set_perf_window(Some((0x8021_C000, 0x8021_C024)))
+        .unwrap();
+    assert_eq!(bus.word(CCTRL), 0x0000_0007);
+
+    // The session is killed with the window set: the next one puts CCTRL back.
+    state.abandon_journal();
+    drop(state);
+    let mut next = TriCoreCoreState::new();
+    next.set_journal_dir(dir.clone());
+    core(&mut bus, &mut next).status().unwrap();
+    assert_eq!(bus.word(CCTRL), 0x0000_0006);
+    assert_eq!(bus.word(trig_evt(6)), 0);
+    assert_eq!(journal_files(&dir), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 const ICR: u32 = CSFR_BASE + registers::CSFR_ICR as u32;
 
 /// The (index, value) of every ICR write.

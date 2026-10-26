@@ -277,8 +277,12 @@ impl DebugAdapter {
         const MAX_BYTES: usize = 64 * 1024;
 
         let arguments: ReadRangesArguments = get_arguments(self, request)?;
-        let total: usize = arguments.ranges.iter().map(|r| r.count).sum();
-        if arguments.ranges.len() > MAX_RANGES || total > MAX_BYTES {
+        // Counts added up without wrapping: a huge count must not slip under the limit.
+        let total = arguments
+            .ranges
+            .iter()
+            .try_fold(0usize, |total, r| total.checked_add(r.count));
+        if arguments.ranges.len() > MAX_RANGES || total.is_none_or(|total| total > MAX_BYTES) {
             return self.send_response::<()>(
                 request,
                 Err(&DebuggerError::UserMessage(format!(

@@ -201,6 +201,12 @@ pub mod ocds {
     /// `CCTRL.M1`-`M3`: the events that `M1CNT`-`M3CNT` count.
     pub const CCTRL_EVENTS: u32 = 0x7FC;
 
+    /// `CCTRL` for a performance counter window: the events of `saved` (the application's
+    /// `CCTRL`), task mode, enabled.
+    pub fn window_cctrl(saved: u32) -> u32 {
+        (saved & CCTRL_EVENTS) | CCTRL_CM | CCTRL_CE
+    }
+
     /// STM0 `TIM0SV`, the second view of the low 32 bits of the system timer: reading it
     /// captures the high bits in `CAPSV` and leaves the application's `TIM0` / `CAP` pair alone.
     /// The system timer counts up from 0 after every application reset. This is the TC2xx
@@ -1219,7 +1225,8 @@ impl<'probe> TriCore<'probe> {
 
     /// The values this session wrote into the device that a session after it puts back if this
     /// one ends without doing so (it was killed): the `DEBUG` instructions, the `TRnEVT` of the
-    /// trigger units it armed, and the halt group routing (`CBS_TRCn`, `EXEVT`).
+    /// trigger units it armed, `CCTRL` of the performance counter window, and the halt group
+    /// routing (`CBS_TRCn`, `EXEVT`).
     fn journal_entries(&self) -> Vec<journal::Entry> {
         let mut entries = self
             .memory
@@ -1238,6 +1245,14 @@ impl<'probe> TriCore<'probe> {
                     ));
                 }
             }
+        }
+        if let Some(window) = self.state.perf_window {
+            // Left in task mode, the counters count only inside a window that is gone.
+            entries.push(journal::Entry::word(
+                self.csfr(registers::CSFR_CCTRL),
+                window.saved_cctrl,
+                ocds::window_cctrl(window.saved_cctrl),
+            ));
         }
         if let Some((saved_trc, saved_exevt)) = self.state.halt_group {
             // What leaving the group writes: the other `CBS_TRCn` fields stay as the routing
@@ -1298,10 +1313,7 @@ impl<'probe> TriCore<'probe> {
         });
         self.write_trigger(start_unit)?;
         self.write_trigger(stop_unit)?;
-        self.write_csfr(
-            registers::CSFR_CCTRL,
-            (saved_cctrl & ocds::CCTRL_EVENTS) | ocds::CCTRL_CM | ocds::CCTRL_CE,
-        )
+        self.write_csfr(registers::CSFR_CCTRL, ocds::window_cctrl(saved_cctrl))
     }
 
     /// Rewrites the trigger units in use. The single step sequence reprograms the trigger

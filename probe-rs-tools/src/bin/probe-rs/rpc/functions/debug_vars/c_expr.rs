@@ -184,7 +184,13 @@ fn tokens(text: &str) -> Result<Vec<Token>, String> {
 struct Parser {
     tokens: Vec<Token>,
     at: usize,
+    /// How deep the parser is in nested expressions (parentheses, indexes, unary operators).
+    depth: usize,
 }
+
+/// The nesting the parser takes: deeper expressions are refused, not parsed into a stack
+/// overflow.
+const MAX_DEPTH: usize = 64;
 
 impl Parser {
     fn peek(&self) -> Option<&Token> {
@@ -207,7 +213,25 @@ impl Parser {
         }
     }
 
+    /// Runs `parse` one level deeper.
+    fn nested(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<Expr, String>,
+    ) -> Result<Expr, String> {
+        if self.depth >= MAX_DEPTH {
+            return Err(format!("nested more than {MAX_DEPTH} deep"));
+        }
+        self.depth += 1;
+        let expr = parse(self);
+        self.depth -= 1;
+        expr
+    }
+
     fn conditional(&mut self) -> Result<Expr, String> {
+        self.nested(Self::conditional_here)
+    }
+
+    fn conditional_here(&mut self) -> Result<Expr, String> {
         let condition = self.binary(0)?;
         if self.peek_op() != Some("?") {
             return Ok(condition);
@@ -274,6 +298,10 @@ impl Parser {
     }
 
     fn unary(&mut self) -> Result<Expr, String> {
+        self.nested(Self::unary_here)
+    }
+
+    fn unary_here(&mut self) -> Result<Expr, String> {
         if let Some((ty, after)) = self.cast_at() {
             self.at = after;
             return Ok(Expr::Cast(ty, Box::new(self.unary()?)));
@@ -378,6 +406,7 @@ pub(crate) fn parse(text: &str) -> Result<Expr, String> {
     let mut parser = Parser {
         tokens: tokens(text)?,
         at: 0,
+        depth: 0,
     };
     if parser.tokens.is_empty() {
         return Err("an expression is missing".into());
@@ -456,6 +485,19 @@ fn path_text(
     Ok(text)
 }
 
+/// The size in bytes of what a pointer to `ty` points to, and whether it is signed: a pointer
+/// for `ty *`, 1 for `void` (as GCC counts it).
+fn element(ty: &CType) -> Result<(usize, bool), String> {
+    if ty.pointers > 0 {
+        Ok((4, false))
+    } else if ty.name == "void" {
+        Ok((1, false))
+    } else {
+        ty.integer()
+            .ok_or_else(|| format!("`{} *`: the size of `{}` is not known", ty.name, ty.name))
+    }
+}
+
 /// Truncates `n` to `size` bytes, sign-extended when `signed`.
 fn fit(n: i128, size: usize, signed: bool) -> i128 {
     let bits = 8 * size as u32;
@@ -509,13 +551,10 @@ fn eval(expr: &Expr, target: &mut dyn Target) -> Result<Value, String> {
                     "`*` takes a pointer: cast it first, as in *(uint32 *)0x70001000".into(),
                 );
             };
-            let (size, signed) = if ty.pointers > 0 {
-                (4, false)
-            } else {
-                ty.integer().ok_or_else(|| {
-                    format!("`*({} *)`: the size of `{}` is not known", ty.name, ty.name)
-                })?
-            };
+            if ty.pointers == 0 && ty.name == "void" {
+                return Err("`*(void *)` reads nothing: cast to a sized type".into());
+            }
+            let (size, signed) = element(&ty)?;
             let raw = target.read(value.n as u64, size)?;
             let n = fit(raw as i128, size, signed);
             if ty.pointers > 0 {
@@ -564,11 +603,33 @@ fn eval(expr: &Expr, target: &mut dyn Target) -> Result<Value, String> {
         }
         Expr::Binary(op, left, right) => {
             let a = eval(left, target)?;
-            let b = eval(right, target)?;
+            let mut b = eval(right, target)?;
+            let mut a = a;
+            // `1 + p` is `p + 1`.
+            if *op == "+" && a.pointer.is_none() && b.pointer.is_some() {
+                std::mem::swap(&mut a, &mut b);
+            }
             let pointer = match *op {
                 "+" | "-" => a.pointer.clone().filter(|_| b.pointer.is_none()),
                 _ => None,
             };
+            // A typed pointer moves by elements, as in C; an address of no known type (`&x`)
+            // by bytes.
+            if let Some(Some(ty)) = &pointer {
+                let (size, _) = element(ty)?;
+                b.n =
+                    b.n.checked_mul(size as i128)
+                        .ok_or("the value is too large")?;
+            }
+            // The difference of two pointers to the same type: elements.
+            if *op == "-"
+                && let (Some(Some(left)), Some(Some(right))) = (&a.pointer, &b.pointer)
+                && left == right
+            {
+                let (size, _) = element(left)?;
+                let bytes = a.n.checked_sub(b.n).ok_or("the value is too large")?;
+                return Ok(Value::int(bytes / size as i128));
+            }
             let (x, y) = (a.n, b.n);
             let n = match *op {
                 "+" => x.checked_add(y),
@@ -746,6 +807,21 @@ mod tests {
         assert_eq!(read("*(sint8 *)&g_signed").unwrap(), "-1");
         assert_eq!(read("*(unsigned int*)(0x70000018)").unwrap(), "4294967295");
         assert!(read("*0x70000010").unwrap_err().contains("cast it first"));
+        // A typed pointer moves by its elements, an address of no known type by bytes.
+        assert_eq!(read("(uint32 *)0x70000010 + 1").unwrap(), "0x70000014");
+        assert_eq!(read("2 + (uint16 *)0x70000010").unwrap(), "0x70000014");
+        assert_eq!(read("(uint8 **)0x70000010 - 1").unwrap(), "0x7000000c");
+        assert_eq!(read("(void *)0x70000010 + 3").unwrap(), "0x70000013");
+        assert_eq!(
+            read("(uint32 *)0x70000020 - (uint32 *)0x70000010").unwrap(),
+            "4"
+        );
+        assert_eq!(read("*((uint16 *)0x70000016 + 1)").unwrap(), "65535");
+        assert!(
+            read("(TaskType *)0x70000010 + 1")
+                .unwrap_err()
+                .contains("not known")
+        );
         assert!(
             read("*(TaskType *)0x70000010")
                 .unwrap_err()
@@ -783,10 +859,29 @@ mod tests {
             ("x[1", "`]` expected"),
             ("nothing + 1", "not a global variable"),
             ("1 / 0", "by 0"),
+            ("*(void *)0x70000010", "reads nothing"),
+            ("", "missing"),
         ] {
             let error = read(text).unwrap_err();
             assert!(error.contains(why), "{text}: {error}");
         }
+    }
+
+    #[test]
+    fn nesting_is_bounded() {
+        // Refused, not a stack overflow.
+        for text in [
+            format!("{}1{}", "(".repeat(10_000), ")".repeat(10_000)),
+            format!("{}1", "-".repeat(10_000)),
+            format!("x{}", "[x".repeat(10_000)),
+        ] {
+            let error = read(&text).unwrap_err();
+            assert!(error.contains("nested"), "{error}");
+        }
+        assert_eq!(
+            read(&format!("{}1{}", "(".repeat(30), ")".repeat(30))).unwrap(),
+            "1"
+        );
     }
 
     #[test]
