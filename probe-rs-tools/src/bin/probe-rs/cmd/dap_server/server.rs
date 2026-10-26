@@ -11,6 +11,7 @@ pub(crate) mod debugger;
 /// Manage the logging/tracing associated with the debugger.
 pub(crate) mod logger;
 /// Program binaries of one session (one per core) that would write the same flash sector.
+pub(crate) mod peripheral_suspend;
 pub(crate) mod program_overlap;
 /// Per-DAP-client RPC connection open/close for TCP multi-session mode.
 pub(crate) mod rpc_lifetime;

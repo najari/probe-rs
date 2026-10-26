@@ -92,6 +92,9 @@ pub(crate) struct SessionData {
     ///
     /// Getting the offset can fail, so it's better to store it.
     timestamp_offset: UtcOffset,
+
+    /// The words `suspendPeripherals` changed, to put back when the session ends.
+    pub(crate) peripheral_suspend: Vec<super::peripheral_suspend::Restore>,
 }
 
 impl SessionData {
@@ -203,6 +206,7 @@ impl SessionData {
         let mut this = SessionData {
             backend,
             core_data: core_data_vec,
+            peripheral_suspend: Vec::new(),
             timestamp_offset,
         };
 
@@ -1407,6 +1411,9 @@ impl SessionData {
         &mut self,
         session_config: &SessionConfig,
     ) -> Result<(), DebuggerError> {
+        if let Err(error) = super::peripheral_suspend::restore(self).await {
+            tracing::warn!("`suspendPeripherals` could not be put back: {error}");
+        }
         for core_config in session_config.core_configs.iter() {
             if core_config.rtt_config.enabled {
                 let Some(cd_idx) = self

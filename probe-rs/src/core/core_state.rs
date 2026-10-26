@@ -349,6 +349,21 @@ impl CombinedCoreState {
         }
     }
 
+    /// Sets the suspend targets of trigger line 1 that the run brackets of this TriCore core
+    /// put back (`None`: the reset value).
+    pub(crate) fn tricore_set_suspend_targets(
+        &mut self,
+        targets: Option<u32>,
+    ) -> Result<(), Error> {
+        match &mut self.specific_state {
+            SpecificCoreState::TriCore(state) => {
+                state.set_suspend_targets(targets);
+                Ok(())
+            }
+            _ => Err(TriCoreError::NoTriCoreTarget.into()),
+        }
+    }
+
     /// Sets whether single steps of this TriCore core run with interrupts disabled.
     pub(crate) fn tricore_set_mask_step_interrupts(&mut self, mask: bool) -> Result<(), Error> {
         match &mut self.specific_state {

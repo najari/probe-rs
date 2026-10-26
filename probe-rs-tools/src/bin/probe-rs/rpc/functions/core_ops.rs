@@ -264,6 +264,9 @@ pub async fn core_tricore_options(
     if let Some(halt) = request.halt_after_reset {
         probe_rs_try!(session.set_tricore_halt_after_reset(request.core as usize, halt));
     }
+    if let Some(targets) = request.suspend_targets {
+        probe_rs_try!(session.set_tricore_suspend_targets(request.core as usize, targets));
+    }
     Ok(())
 }
 

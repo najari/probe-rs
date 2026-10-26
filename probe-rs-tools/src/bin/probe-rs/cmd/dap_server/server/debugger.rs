@@ -993,7 +993,7 @@ impl Debugger {
             if core_config.step_interrupts == StepInterrupts::Allow
                 && let Err(error) = session_data
                     .backend
-                    .set_tricore_options(core_index, Some(false), None, None)
+                    .set_tricore_options(core_index, Some(false), None, None, None)
                     .await
             {
                 debug_adapter.log_to_console(format!(
@@ -1005,7 +1005,7 @@ impl Debugger {
             if core_config.reset_behavior == ResetBehavior::Halt
                 && let Err(error) = session_data
                     .backend
-                    .set_tricore_options(core_index, None, None, Some(true))
+                    .set_tricore_options(core_index, None, None, Some(true), None)
                     .await
             {
                 debug_adapter.log_to_console(format!(
@@ -1031,7 +1031,13 @@ impl Debugger {
                 let message = match (resolve(&window.start), resolve(&window.stop)) {
                     (Ok(start), Ok(stop)) => match session_data
                         .backend
-                        .set_tricore_options(core_index, None, Some(Some((start, stop))), None)
+                        .set_tricore_options(
+                            core_index,
+                            None,
+                            Some(Some((start, stop))),
+                            None,
+                            None,
+                        )
                         .await
                     {
                         Ok(()) => format!(
@@ -1064,6 +1070,24 @@ impl Debugger {
                 Ok(()) => {}
                 Err(error) => tracing::warn!("Failed to load SVD file: {error:?}"),
             }
+        }
+
+        if self.config.suspend_peripherals {
+            let cores = core_configs
+                .iter()
+                .map(|c| c.core_index)
+                .collect::<Vec<_>>();
+            let message = match super::peripheral_suspend::apply(
+                &mut session_data,
+                self.config.chip.as_deref(),
+                &cores,
+            )
+            .await
+            {
+                Ok(message) => message,
+                Err(error) => format!("`suspendPeripherals` is ignored: {error}"),
+            };
+            debug_adapter.log_to_console(message);
         }
 
         if requested_target_session_type == TargetSessionType::LaunchRequest {

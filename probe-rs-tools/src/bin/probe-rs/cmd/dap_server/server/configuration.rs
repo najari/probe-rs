@@ -87,6 +87,13 @@ pub struct SessionConfig {
     #[serde(default)]
     pub(crate) all_stop: bool,
 
+    /// TriCore TC3xx: the system timer of each core of this session stops while the core is
+    /// halted (its halt state on trigger line 1, which suspends the session's cores, and the timer
+    /// in soft suspend). Cores of no session do not stop for it; with several cores in the session,
+    /// a halt of one suspends the others. Put back when the session ends.
+    #[serde(default)]
+    pub(crate) suspend_peripherals: bool,
+
     /// Flashing configuration
     #[serde(default)]
     pub(crate) flashing_config: FlashingConfig,

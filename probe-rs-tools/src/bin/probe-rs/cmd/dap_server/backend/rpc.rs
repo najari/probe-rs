@@ -491,10 +491,16 @@ impl RpcBackend {
         mask_step_interrupts: Option<bool>,
         perf_window: Option<Option<(u64, u64)>>,
         halt_after_reset: Option<bool>,
+        suspend_targets: Option<Option<u32>>,
     ) -> Result<(), Error> {
         let client = self.core(core_index);
         client
-            .set_tricore_options(mask_step_interrupts, perf_window, halt_after_reset)
+            .set_tricore_options(
+                mask_step_interrupts,
+                perf_window,
+                halt_after_reset,
+                suspend_targets,
+            )
             .await
             .map_err(rpc_err)
     }

@@ -1747,13 +1747,15 @@ impl CoreInterface {
 
     /// Sets debug options of this TriCore core: whether single steps run with interrupts
     /// disabled, the performance counter window (`Some(None)` clears it), and whether the core
-    /// halts after a reset of the device that the session did not make. `None` leaves an option
-    /// as it is.
+    /// halts after a reset of the device that the session did not make, and the suspend targets
+    /// of trigger line 1 that its run writes put back (`Some(None)`: the reset value). `None`
+    /// leaves an option as it is.
     pub async fn set_tricore_options(
         &self,
         mask_step_interrupts: Option<bool>,
         perf_window: Option<Option<(u64, u64)>>,
         halt_after_reset: Option<bool>,
+        suspend_targets: Option<Option<u32>>,
     ) -> Result<(), ClientError> {
         self.client
             .send_resp::<CoreTriCoreOptionsEndpoint, _>(&CoreTriCoreOptionsRequest {
@@ -1762,6 +1764,7 @@ impl CoreInterface {
                 mask_step_interrupts,
                 perf_window,
                 halt_after_reset,
+                suspend_targets,
             })
             .await
     }

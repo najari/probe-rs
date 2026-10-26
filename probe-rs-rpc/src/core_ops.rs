@@ -104,6 +104,9 @@ pub struct CoreTriCoreOptionsRequest {
     pub perf_window: Option<Option<(u64, u64)>>,
     /// Whether the core halts after a reset of the device that the session did not make.
     pub halt_after_reset: Option<bool>,
+    /// The suspend targets of trigger line 1 that the core's run writes put back: `Some(None)`
+    /// for the reset value.
+    pub suspend_targets: Option<Option<u32>>,
 }
 
 #[derive(Serialize, Deserialize, Schema, Clone)]

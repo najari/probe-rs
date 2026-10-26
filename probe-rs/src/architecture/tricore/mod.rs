@@ -72,6 +72,10 @@ pub mod ocds {
     pub const ACCESS_HW_STEP_ON: u32 = 0x8000_003E;
     /// `ACCESS_HW_CTRL` value that brackets a `DBGSR` run write (end).
     pub const ACCESS_HW_STEP_OFF: u32 = 0x8000_003F;
+    /// The cores of `ACCESS_HW_CTRL`, which is `CBS_TL1ST` (the suspend targets of trigger line
+    /// 1, `C0`-`C5`) by the TC3xx SFR headers: the brackets take CPU0 off the line during the run
+    /// write and put the reset value back.
+    pub const SUSPEND_TARGET_CORES: u32 = 0x3F;
 
     /// The `HALT` field (bits 2:1) of a `DBGSR` value.
     pub fn halt_field(dbgsr: u32) -> u32 {
@@ -633,6 +637,10 @@ pub struct TriCoreCoreState {
     last_stm: Option<u64>,
     /// Whether the core halts when such a reset is seen. Otherwise it runs on.
     halt_after_reset: bool,
+    /// The suspend targets of trigger line 1 (`CBS_TL1ST`) that a session set (a debugger's
+    /// option to suspend peripherals with the core): the run brackets take every core off the
+    /// line during the run write and put this value back instead of the reset value.
+    suspend_targets: Option<u32>,
     /// Set while the core halts because of such a reset, for the halt reason.
     reset_halt: bool,
     /// When such a reset was seen. For a while after it, the status checks plant the software
@@ -689,6 +697,7 @@ impl TriCoreCoreState {
             perf_window: None,
             last_stm: None,
             halt_after_reset: false,
+            suspend_targets: None,
             reset_halt: false,
             reset_seen: None,
             software_first: false,
@@ -746,6 +755,22 @@ impl TriCoreCoreState {
     /// session (the default is to let it run on).
     pub(crate) fn set_halt_after_reset(&mut self, halt: bool) {
         self.halt_after_reset = halt;
+    }
+
+    /// Sets the suspend targets of trigger line 1 that the run brackets put back (`None`: the
+    /// reset value, as the DAS server writes it).
+    pub(crate) fn set_suspend_targets(&mut self, targets: Option<u32>) {
+        self.suspend_targets = targets;
+    }
+
+    /// The `ACCESS_HW_CTRL` (`CBS_TL1ST`) values that bracket a `DBGSR` run write: start, end.
+    /// With suspend targets set, no core is a target during the write: a core held by the line
+    /// (its halt state routed to it) would stay suspended and keep the line active.
+    fn run_bracket(&self) -> (u32, u32) {
+        match self.suspend_targets {
+            None => (ocds::ACCESS_HW_STEP_ON, ocds::ACCESS_HW_STEP_OFF),
+            Some(targets) => (targets & !ocds::SUSPEND_TARGET_CORES, targets),
+        }
     }
 
     /// Whether a breakpoint, a watchpoint or the performance counter window uses trigger unit
@@ -1731,10 +1756,11 @@ impl<'probe> TriCore<'probe> {
         // One bracketed run write, as a step (`run_writes` runs the core a second time, which
         // would let it go on past the halt after the access).
         let dbgsr = self.csfr(ocds::DBGSR);
+        let (on, off) = self.state.run_bracket();
         self.write_bracketed(&[
-            (ocds::ACCESS_HW_CTRL, ocds::ACCESS_HW_STEP_ON),
+            (ocds::ACCESS_HW_CTRL, on),
             (dbgsr, ocds::DBGSR_RUN),
-            (ocds::ACCESS_HW_CTRL, ocds::ACCESS_HW_STEP_OFF),
+            (ocds::ACCESS_HW_CTRL, off),
         ])?;
         let mut halted = false;
         for _ in 0..50 {
@@ -1839,10 +1865,11 @@ impl<'probe> TriCore<'probe> {
     fn step_once(&mut self) -> Result<(), TriCoreError> {
         self.step_debug_init(true)?;
         let dbgsr = self.csfr(ocds::DBGSR);
+        let (on, off) = self.state.run_bracket();
         self.write_bracketed(&[
-            (ocds::ACCESS_HW_CTRL, ocds::ACCESS_HW_STEP_ON),
+            (ocds::ACCESS_HW_CTRL, on),
             (dbgsr, ocds::DBGSR_RUN),
-            (ocds::ACCESS_HW_CTRL, ocds::ACCESS_HW_STEP_OFF),
+            (ocds::ACCESS_HW_CTRL, off),
         ])?;
         self.step_debug_init(false)?;
         // The debug init left every unit as a data address range without action (`0x2000`):
@@ -1895,13 +1922,14 @@ impl<'probe> TriCore<'probe> {
         // a halt before the others run would not reach them.
         // A run alone leaves them halted; they still run with the next run of this core.
         let mut writes = Vec::new();
+        let bracket = self.state.run_bracket();
         if !std::mem::take(&mut self.state.run_alone) {
             for dbgsr in self.halted_group_members()? {
-                writes.extend(Self::run_writes(dbgsr));
+                writes.extend(Self::run_writes(dbgsr, bracket));
             }
         }
         let peers_run = !writes.is_empty();
-        writes.extend(Self::run_writes(self.csfr(ocds::DBGSR)));
+        writes.extend(Self::run_writes(self.csfr(ocds::DBGSR), bracket));
         self.write_bracketed(&writes)?;
 
         let dbgsr = self.dbgsr()?;
@@ -1926,12 +1954,13 @@ impl<'probe> TriCore<'probe> {
         Ok(())
     }
 
-    /// The writes that run one core: a `DBGSR` run write between the access hardware writes.
-    fn run_writes(dbgsr: u32) -> [(u32, u32); 5] {
+    /// The writes that run one core: a `DBGSR` run write between the access hardware writes
+    /// (`bracket`, [`TriCoreState::run_bracket`]).
+    fn run_writes(dbgsr: u32, (on, off): (u32, u32)) -> [(u32, u32); 5] {
         [
-            (ocds::ACCESS_HW_CTRL, ocds::ACCESS_HW_STEP_ON),
+            (ocds::ACCESS_HW_CTRL, on),
             (dbgsr, ocds::DBGSR_RUN),
-            (ocds::ACCESS_HW_CTRL, ocds::ACCESS_HW_STEP_OFF),
+            (ocds::ACCESS_HW_CTRL, off),
             (dbgsr, ocds::DBGSR_RUN),
             (ocds::ACCESS_HW_RUNCMD, 2),
         ]

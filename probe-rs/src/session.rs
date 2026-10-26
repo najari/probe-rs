@@ -684,6 +684,19 @@ impl Session {
             .tricore_set_halt_after_reset(halt)
     }
 
+    /// Sets the suspend targets of trigger line 1 (`CBS_TL1ST`) that the run writes of TriCore
+    /// core `core_index` put back, for a debugger that changed them (`None`: the reset value).
+    pub fn set_tricore_suspend_targets(
+        &mut self,
+        core_index: usize,
+        targets: Option<u32>,
+    ) -> Result<(), Error> {
+        self.cores
+            .get_mut(core_index)
+            .ok_or(Error::CoreNotFound(core_index))?
+            .tricore_set_suspend_targets(targets)
+    }
+
     /// Sets the performance counter window (A-to-B) of TriCore core `core_index`: its counters
     /// are cleared and count only from `start` to `stop`. `None` clears the window. The session
     /// clears it when it ends.
