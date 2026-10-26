@@ -230,6 +230,9 @@ pub mod ocds {
             (5, "STM0"),
             (6, "STM1"),
             (7, "STM2"),
+            // TC3xx: resets the HSM requested.
+            (26, "an HSM system reset"),
+            (27, "an HSM application reset"),
         ]
         .into_iter()
         .filter(|&(bit, _)| rststat & (1 << bit) != 0)
@@ -2316,7 +2319,15 @@ impl<'probe> TriCore<'probe> {
             // This session's own reset is not reported as a reset of the device.
             self.state.last_stm = None;
             match self.finish_reset(timeout) {
-                Err(error) if start.elapsed() > reboot_timeout => return Err(error),
+                Err(error) if start.elapsed() > reboot_timeout => {
+                    let notice = format!(
+                        "TriCore core {}: the device did not answer within {reboot_timeout:?}                          after the reset. A TC3xx whose HSM holds the start (secure boot,                          DMU_SP_PROCONHSMCFG.SSWWAIT) or locks the debug interface does so.",
+                        self.core()
+                    );
+                    tracing::warn!("{notice}");
+                    self.state.notices.push(notice);
+                    return Err(error);
+                }
                 Err(error) => {
                     tracing::debug!("TriCore core {}: rebooting ({error})", self.core());
                     std::thread::sleep(Duration::from_millis(20));

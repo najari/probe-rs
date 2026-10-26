@@ -1631,6 +1631,18 @@ fn a_reset_by_another_session_arms_the_kept_debug_instructions_again() {
 }
 
 #[test]
+fn the_reset_triggers_are_named() {
+    assert_eq!(ocds::reset_triggers(0x10), ["software"]);
+    // TC3xx: requested by the HSM.
+    assert_eq!(
+        ocds::reset_triggers((1 << 26) | (1 << 27)),
+        ["an HSM system reset", "an HSM application reset"]
+    );
+    // The board after a power-on: no trigger of these.
+    assert!(ocds::reset_triggers(0x1001_0000).is_empty());
+}
+
+#[test]
 fn a_reset_of_the_device_is_noticed_and_the_core_runs_on() {
     let mut bus = pspr_bus();
     bus.halted = false;

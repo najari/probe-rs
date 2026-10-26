@@ -509,6 +509,124 @@ fn loses_boot_mode_headers(
 /// SCU_CHIPID, which tells the device step and variant apart.
 const SCU_CHIPID: u64 = 0xF003_6140;
 
+/// `DMU_SP_PROCONHSMCFG`, then `_CBS`, `_CX0` and `_CX1` (TC3xx user's manual, DMU): the HSM
+/// protection of the PFLASH after the flash startup.
+const DMU_SP_PROCONHSMCFG: u64 = 0xF807_0000;
+/// `DMU_HF_PROCONPF`: `RPRO` (bit 31), the read protection of the PFLASH.
+const DMU_HF_PROCONPF: u64 = 0xF804_0080;
+/// PF0 logical sectors S0-S39 (16 KiB each) can hold HSM code (TC3xx user's manual, NVM
+/// "PFLASH HSM PCODE Configuration").
+const HSM_CODE_BASE: u32 = 0xA000_0000;
+const HSM_CODE_SECTORS: u32 = 40;
+const HSM_CODE_SECTOR_SIZE: u32 = 0x4000;
+
+/// The environment variable that lets a download erase the HSM code sectors of a TC3xx whose
+/// HSM boots.
+pub const ALLOW_HSM_CODE_ERASE_ENV: &str = "PROBE_RS_TRICORE_ALLOW_HSM_CODE_ERASE";
+
+/// The HSM protection of a TC3xx PFLASH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HsmProtection {
+    /// `HSMBOOTEN`: the startup software boots the HSM from its code sectors.
+    pub boot: bool,
+    /// `SSWWAIT`: CPU0 starts the application only once the HSM lets it (secure boot).
+    pub ssw_wait: bool,
+    /// `BOOTSEL0`-`BOOTSEL3`: the HSM code sectors searched for the boot code.
+    pub boot_sectors: [u32; 4],
+    /// `HSMxX` of `CX0` and `CX1`: the PF0 sectors S0-S39 only the HSM may access.
+    pub exclusive: u64,
+    /// `RPRO`: the PFLASH is read protected.
+    pub read_protected: bool,
+}
+
+impl HsmProtection {
+    /// From `DMU_SP_PROCONHSMCFG`, `_CBS`, `_CX0`, `_CX1` and `DMU_HF_PROCONPF`.
+    pub fn from_words(cfg: u32, cbs: u32, cx0: u32, cx1: u32, proconpf: u32) -> Self {
+        Self {
+            boot: cfg & 1 != 0,
+            ssw_wait: cfg & 2 != 0,
+            boot_sectors: [0, 8, 16, 24].map(|shift| (cbs >> shift) & 0x3F),
+            exclusive: u64::from(cx0) | (u64::from(cx1 & 0xFF) << 32),
+            read_protected: proconpf & (1 << 31) != 0,
+        }
+    }
+
+    /// The HSM code sector number (S0-S39 of PF0) of `sector`, if it is one.
+    fn code_sector(sector: Sector) -> Option<u32> {
+        let offset = sector.base.checked_sub(HSM_CODE_BASE)?;
+        (sector.size == HSM_CODE_SECTOR_SIZE
+            && offset.is_multiple_of(HSM_CODE_SECTOR_SIZE)
+            && offset / HSM_CODE_SECTOR_SIZE < HSM_CODE_SECTORS)
+            .then_some(offset / HSM_CODE_SECTOR_SIZE)
+    }
+
+    /// Why `sector` must not be erased, if it must not. `allow_code` lets the HSM code sectors
+    /// of a booting HSM go ([`ALLOW_HSM_CODE_ERASE_ENV`]).
+    pub fn refusal(&self, sector: Sector, allow_code: bool) -> Option<String> {
+        if self.read_protected {
+            return Some(
+                "the PFLASH is read protected (DMU_HF_PROCONPF.RPRO): its content cannot be \
+                 read to back it up; remove the protection with its password first"
+                    .into(),
+            );
+        }
+        let n = Self::code_sector(sector)?;
+        if self.exclusive & (1 << n) != 0 {
+            return Some(format!(
+                "sector {:#010x} (PF0 S{n}) is HSM_exclusive (DMU_SP_PROCONHSMCX): only the HSM \
+                 can erase or program it",
+                sector.base
+            ));
+        }
+        if self.boot && !allow_code {
+            let boot = if self.boot_sectors.contains(&n) {
+                "the HSM searches it for its boot code (BOOTSELx): erased, the device does not \
+                 start any more and cannot be recovered"
+            } else {
+                "it is one of the HSM code sectors S0-S39: erasing HSM code can stop the HSM and \
+                 the device"
+            };
+            return Some(format!(
+                "sector {:#010x} (PF0 S{n}): the HSM boots (DMU_SP_PROCONHSMCFG.HSMBOOTEN) and \
+                 {boot}. Set {ALLOW_HSM_CODE_ERASE_ENV}=1 only if the image holds valid HSM code",
+                sector.base
+            ));
+        }
+        None
+    }
+}
+
+/// The names of the error bits of a loader status: `DMU_HF_ERRSR` on the TC3xx, `FLASH0_FSR`
+/// (bits 11-13) on the TC27x.
+fn status_text(device: FlashDevice, status: u32) -> String {
+    let bits: &[(u32, &str)] = match device {
+        FlashDevice::Tc36x => &[
+            (0, "OPER: operation error"),
+            (1, "SQER: command sequence error"),
+            (2, "PROER: protection error (a protected or HSM sector)"),
+            (3, "PVER: program verify error"),
+            (4, "EVER: erase verify error"),
+            (5, "ADER: address error"),
+            (6, "ORIER: out of range interrupt"),
+        ],
+        FlashDevice::Tc27x => &[
+            (11, "OPER: operation error"),
+            (12, "SQER: command sequence error"),
+            (13, "PROER: protection error"),
+        ],
+    };
+    let names = bits
+        .iter()
+        .filter(|(bit, _)| status & (1 << bit) != 0)
+        .map(|(_, name)| *name)
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        format!("status {status:#x}")
+    } else {
+        format!("status {status:#x}: {}", names.join(", "))
+    }
+}
+
 /// The flash sectors of the connected device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashMap {
@@ -692,6 +810,8 @@ pub struct AurixFlash {
     /// Whether this download restores the bytes the image does not set (`--restore-unwritten`:
     /// probe-rs read them through [`DebugFlashSequence::read_unwritten`]).
     restoring: std::sync::atomic::AtomicBool,
+    /// The HSM protection of the connected TC3xx, read when the loader starts.
+    hsm: Mutex<Option<HsmProtection>>,
 }
 
 /// The JSON backup of a sector: its pages as read before the erase (`None`: erased).
@@ -751,6 +871,7 @@ impl AurixFlash {
             map: Mutex::default(),
             backup: Mutex::default(),
             restoring: Default::default(),
+            hsm: Mutex::default(),
         }
     }
 
@@ -787,7 +908,17 @@ impl AurixFlash {
     /// Checks that the loader can program the device and takes its sector map.
     fn check_device(&self, session: &mut Session) -> Result<(), Error> {
         let jtag_id = session.get_tricore_bus()?.jtag_id()?;
-        let chip_id = session.core(0)?.read_word_32(SCU_CHIPID).ok();
+        let chip_id = match session.core(0)?.read_word_32(SCU_CHIPID) {
+            Ok(chip_id) => Some(chip_id),
+            Err(error) => {
+                // The device answers on JTAG, but not even SCU_CHIPID reads.
+                return Err(other(format!(
+                    "the device answers on JTAG (ID {jtag_id:#010x}) but its memory cannot be \
+                     read ({error}): the debug interface is locked (a debug password, the PFLASH \
+                     read protection or the HSM)"
+                )));
+            }
+        };
         let map = FlashMap::for_device(&device_config::config_dirs(), jtag_id, chip_id)?;
         if map.device != self.device {
             return Err(other(format!(
@@ -803,8 +934,32 @@ impl AurixFlash {
             map.dflash.len(),
             chip_id.map_or("?".into(), |c| format!("{c:#010x}"))
         );
+        let hsm = if map.device == FlashDevice::Tc36x {
+            let mut core = session.core(0)?;
+            let mut words = [0; 4];
+            core.read_32(DMU_SP_PROCONHSMCFG, &mut words)?;
+            let proconpf = core.read_word_32(DMU_HF_PROCONPF)?;
+            let hsm = HsmProtection::from_words(words[0], words[1], words[2], words[3], proconpf);
+            if hsm != HsmProtection::default() {
+                tracing::info!("HSM protection of the PFLASH: {hsm:?}");
+            }
+            Some(hsm)
+        } else {
+            None
+        };
+        *self.hsm.lock().unwrap_or_else(|e| e.into_inner()) = hsm;
         *self.map.lock().unwrap_or_else(|e| e.into_inner()) = Some(map);
         Ok(())
+    }
+
+    /// Refuses to erase `sector` where the HSM protection does not allow it (TC3xx).
+    fn check_hsm(&self, sector: Sector) -> Result<(), Error> {
+        let hsm = *self.hsm.lock().unwrap_or_else(|e| e.into_inner());
+        let allow = std::env::var_os(ALLOW_HSM_CODE_ERASE_ENV).is_some_and(|v| !v.is_empty());
+        match hsm.and_then(|hsm| hsm.refusal(sector, allow)) {
+            Some(why) => Err(other(why)),
+            None => Ok(()),
+        }
     }
 
     /// The sector map of the device (the built-in one before the loader started).
@@ -861,7 +1016,7 @@ impl AurixFlash {
         Ok(status)
     }
 
-    fn erase(session: &mut Session, sector: Sector) -> Result<(), Error> {
+    fn erase(&self, session: &mut Session, sector: Sector) -> Result<(), Error> {
         tracing::info!(
             "Erasing sector {:#010x} ({} KiB)",
             sector.base,
@@ -870,8 +1025,9 @@ impl AurixFlash {
         let status = Self::command(session, CMD_ERASE, [sector.base, 1, 0], ERASE_TIMEOUT)?;
         if status != 0 {
             return Err(other(format!(
-                "erasing {:#010x} failed (status {status:#x})",
-                sector.base
+                "erasing {:#010x} failed ({})",
+                sector.base,
+                status_text(self.device, status)
             )));
         }
         Ok(())
@@ -907,7 +1063,8 @@ impl AurixFlash {
             )?;
             if status != 0 {
                 return Err(other(format!(
-                    "programming {address:#010x} failed (status {status:#x})"
+                    "programming {address:#010x} failed ({})",
+                    status_text(self.device, status)
                 )));
             }
             let mut programmed = self.programmed.lock().unwrap_or_else(|e| e.into_inner());
@@ -1095,6 +1252,13 @@ impl AurixFlash {
                 )));
             }
         }
+        let hsm = *self.hsm.lock().unwrap_or_else(|e| e.into_inner());
+        if hsm.is_some_and(|hsm| hsm.boot && hsm.ssw_wait) {
+            tracing::warn!(
+                "The HSM holds CPU0 at startup (SSWWAIT): a secure boot may not start the new \
+                 image until its MAC is updated"
+            );
+        }
         tracing::info!("Flash loader stopped; reset the device to run the new image");
         Ok(())
     }
@@ -1172,7 +1336,8 @@ impl DebugFlashSequence for AurixFlash {
                 "{address:#010x} is not the start of a sector"
             )));
         }
-        Self::erase(session, sector)
+        self.check_hsm(sector)?;
+        self.erase(session, sector)
     }
 
     fn program(&self, session: &mut Session, address: u64, data: &[u8]) -> Result<(), Error> {
@@ -1213,6 +1378,10 @@ impl DebugFlashSequence for AurixFlash {
             self.check_boot_mode_headers(session, &touched, &patches)?;
         }
 
+        // Before any erase: a sector refused half way would leave the ones before it erased.
+        for sector in touched.values() {
+            self.check_hsm(*sector)?;
+        }
         for sector in touched.into_values() {
             let backup = {
                 let mut core = session.core(0)?;
@@ -1226,7 +1395,7 @@ impl DebugFlashSequence for AurixFlash {
                 continue;
             }
             self.save_backup(sector, &backup)?;
-            Self::erase(session, sector)?;
+            self.erase(session, sector)?;
             self.program_pages(session, sector.base, &image)?;
             tracing::info!(
                 "Sector {:#010x}: {} page(s) written",
@@ -1419,6 +1588,56 @@ mod tests {
             .to_string();
         assert!(error.contains("not for this device"), "{error}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn hsm_sectors_are_refused() {
+        let sector = |n: u32| Sector {
+            base: HSM_CODE_BASE + n * HSM_CODE_SECTOR_SIZE,
+            size: HSM_CODE_SECTOR_SIZE,
+        };
+        let above = Sector {
+            base: 0xA040_0000,
+            size: 0x4000,
+        };
+        // This board: no HSM boot, nothing exclusive.
+        let none = HsmProtection::from_words(0, 0, 0, 0, 0);
+        assert_eq!(none, HsmProtection::default());
+        assert!(none.refusal(sector(0), false).is_none());
+
+        // S8 exclusive, the HSM boots from S9 (BOOTSEL0).
+        let hsm = HsmProtection::from_words(0b11, 9, 1 << 8, 0, 0);
+        assert!(hsm.boot && hsm.ssw_wait);
+        assert!(
+            hsm.refusal(sector(8), true)
+                .unwrap()
+                .contains("HSM_exclusive")
+        );
+        let boot = hsm.refusal(sector(9), false).unwrap();
+        assert!(boot.contains("boot code"), "{boot}");
+        assert!(hsm.refusal(sector(20), false).unwrap().contains("S0-S39"));
+        assert!(hsm.refusal(sector(9), true).is_none());
+        assert!(hsm.refusal(sector(40), false).is_none());
+        assert!(hsm.refusal(above, false).is_none());
+        // CX1: S32-S39.
+        let hsm = HsmProtection::from_words(0, 0, 0, 1 << 7, 0);
+        assert!(hsm.refusal(sector(39), false).unwrap().contains("S39"));
+        // The read protection refuses every sector.
+        let hsm = HsmProtection::from_words(0, 0, 0, 0, 1 << 31);
+        assert!(hsm.refusal(above, false).unwrap().contains("RPRO"));
+    }
+
+    #[test]
+    fn loader_errors_are_named() {
+        assert_eq!(
+            status_text(FlashDevice::Tc36x, 0x4),
+            "status 0x4: PROER: protection error (a protected or HSM sector)"
+        );
+        assert_eq!(
+            status_text(FlashDevice::Tc27x, 0x2000),
+            "status 0x2000: PROER: protection error"
+        );
+        assert_eq!(status_text(FlashDevice::Tc36x, 0x100), "status 0x100");
     }
 
     #[test]
