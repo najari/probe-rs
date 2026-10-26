@@ -16,15 +16,75 @@
 //! session for several cores, PRD test T-M8). Each core keeps the context save areas its
 //! application set up.
 //!
+//! A core the application never started (boot halt, `SYSCON.BHALT`, like CPU1 of the TC36x test
+//! board) is first taken out of boot halt into a debug halt: a halt request in `DBGSR`, then
+//! `BHALT` cleared. It has no context save areas either, so it gets a free list of 256 (16 KiB of
+//! its DSPR from local address 0xD0004000, below the demos' data at 0xD000A000) in `FCX`/`LCX`.
+//!
 //! The chip is detected; `PROBE_RS_CHIP` names it instead, for example `TC36x`.
 
 use std::time::Duration;
 
 use probe_rs::{
     MemoryInterface, Permissions, RegisterId,
-    architecture::tricore::registers::{CSFR_A0, CSFR_ICR, CSFR_PC, CSFR_PCXI},
+    architecture::tricore::registers::{
+        CSFR_A0, CSFR_FCX, CSFR_ICR, CSFR_PC, CSFR_PCXI, CSFR_SYSCON, SYSCON_BHALT,
+    },
     probe::list::Lister,
 };
+
+/// The CSFRs of core `n` on the bus (TC27x and TC3xx).
+fn csfr_base(core: usize) -> u64 {
+    0xF881_0000 + 0x2_0000 * core as u64
+}
+/// `DBGSR`, and the value that requests a halt.
+const DBGSR: u64 = 0xFD00;
+const DBGSR_HALT: u32 = 0x6;
+const CSFR_LCX: u64 = 0xFE3C;
+/// The context save areas of a core taken out of boot halt: local DSPR addresses.
+const CSA_START: u32 = 0xD000_4000;
+const CSA_COUNT: u32 = 256;
+
+/// A context save area's link word: segment (bits 19:16) and offset (bits 15:0) of its address.
+fn csa_link(address: u32) -> u32 {
+    ((address >> 12) & 0xF_0000) | ((address >> 6) & 0xFFFF)
+}
+
+/// Takes core `n` out of boot halt into a debug halt and gives it a free list of context save
+/// areas. Nothing happens for a core that is not in boot halt.
+fn release_boot_halt(core: &mut probe_rs::Core, n: usize) -> Result<bool> {
+    let syscon = core.read_word_32(csfr_base(n) + CSFR_SYSCON as u64)?;
+    if syscon & SYSCON_BHALT == 0 {
+        return Ok(false);
+    }
+    // The halt request is taken as soon as the core leaves boot halt, before it runs code.
+    core.write_word_32(csfr_base(n) + DBGSR, DBGSR_HALT)?;
+    core.write_word_32(csfr_base(n) + CSFR_SYSCON as u64, syscon & !SYSCON_BHALT)?;
+    core.halt(Duration::from_millis(500))?;
+
+    // The list, each area's first word the link to the next, the last 0. The DSPR of core n is
+    // its local 0xD000_0000, and 0x7000_0000 - n * 0x1000_0000 on the bus (CPU0-CPU4).
+    let global = |local: u32| (local - 0xD000_0000 + 0x7000_0000 - 0x1000_0000 * n as u32) as u64;
+    for i in 0..CSA_COUNT {
+        let area = CSA_START + 64 * i;
+        let next = if i + 1 < CSA_COUNT {
+            csa_link(area + 64)
+        } else {
+            0
+        };
+        core.write_word_32(global(area), next)?;
+    }
+    core.write_word_32(csfr_base(n) + CSFR_FCX as u64, csa_link(CSA_START))?;
+    // LCX: the depletion trap comes with a few areas left for the trap handler.
+    core.write_word_32(
+        csfr_base(n) + CSFR_LCX,
+        csa_link(CSA_START + 64 * (CSA_COUNT - 4)),
+    )?;
+    println!(
+        "CPU{n} was in boot halt: halted, {CSA_COUNT} context save areas at {CSA_START:#010x}"
+    );
+    Ok(true)
+}
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -69,6 +129,9 @@ fn main() -> Result<()> {
     let mut session = probe.attach(chip, Permissions::default())?;
     println!("{}", session.target().name);
     let mut core = session.core(core_index)?;
+    if core_index > 0 && core_index <= 4 {
+        release_boot_halt(&mut core, core_index)?;
+    }
     core.halt(Duration::from_millis(500))?;
 
     // A stale image would run garbage.
