@@ -15,7 +15,8 @@
 //!
 //! On the TC36x test board halting CPU0 then stops STM0 (`SUSSTA` 1), and STM0 in soft suspend
 //! without the routing runs on. The TC27x does not suspend its peripherals from the line (STM0
-//! ran on), and the GTM of the TC36x does not either (probe-rs-infineon's `gtm_suspend`).
+//! ran on), and the GTM of the TC36x does not either: it takes the OTGS's global suspend, which
+//! the TC3xx manual does not describe (probe-rs-infineon's `gtm_suspend` has what was tried).
 
 use super::session_data::SessionData;
 

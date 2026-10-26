@@ -24,9 +24,14 @@
 //! On the TC36x test board (gtm_demo -Board tc36x) with `TRC_HALT=1`, trigger line 1 being the
 //! system suspend signal of the TC3xx: halting CPU0 suspends STM0 (`SUSSTA` 1, the timer
 //! stops), which the TC275 did not, but not the GTM, in soft (`GTM_SUS=2`) or hard
-//! (`GTM_SUS=1`) suspend: `GTM_OCS.SUSSTA` stays 0 and MCS1 runs on. `CBS_TL1ST` (0x8000003F)
-//! names CPU0-CPU5 and the HSM as targets of the line; what else the GTM needs to suspend is in
-//! the TC3xx family manual, not in the TC36x appendix or the SFR headers.
+//! (`GTM_SUS=1`) suspend: `GTM_OCS.SUSSTA` stays 0 and MCS1 runs on. STM0 stops because line 1
+//! suspends CPU0 (`CBS_TL1ST.C0`) and STMx follows `CPUxSUSOUT` (TC3xx User's Manual, STM OCS).
+//! The GTM does not take the cores' suspend: "Suspend is globally controlled in OTGS and GTM
+//! locally with the OCS register" (TC3xx User's Manual, GTM 28.25.19.1.1), and the OTGS's global
+//! suspend is not in the manual (its OCDS chapter is a separate specification). Tried on the
+//! board without effect on the GTM: CPU0's halt state on each of lines 1-6, the OCDS control bits
+//! `CBS_OSTATE.OC0`-`OC2` (set through `CBS_OCNTRL`), and `M0`-`M2`, `DMA`, `DMA1` as targets of
+//! line 1.
 
 use std::time::Duration;
 
