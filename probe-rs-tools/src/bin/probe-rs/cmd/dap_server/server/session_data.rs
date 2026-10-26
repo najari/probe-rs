@@ -943,6 +943,20 @@ impl SessionData {
                 });
                 debug_adapter.send_event("continued", event_body)?;
                 tracing::trace!("Notified DAP client that the core continued: {:?}", status);
+                // DAP has no thread state for a core that sleeps (an AURIX core in boot halt runs
+                // no code until the application starts it): a custom event says so. A client
+                // that does not know it ignores it and shows the thread as running.
+                if status == CoreStatus::Sleeping {
+                    let description = status.short_long_status(&self.backend, None, false).await.1;
+                    debug_adapter.send_event(
+                        "probe-rs-core-status",
+                        Some(serde_json::json!({
+                            "threadId": self.core_data[cd_idx].core_index,
+                            "status": "sleeping",
+                            "description": description,
+                        })),
+                    )?;
+                }
             }
             CoreStatus::Halted(HaltReason::Step) => {}
             CoreStatus::Halted(HaltReason::Breakpoint(BreakpointCause::Semihosting(_))) => {}

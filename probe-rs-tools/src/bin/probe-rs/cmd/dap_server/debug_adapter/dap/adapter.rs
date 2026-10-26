@@ -1513,10 +1513,16 @@ impl DebugAdapter {
             .await
             .map_err(DebuggerError::ProbeRs)?;
         if !status.is_halted() {
+            // Says why: a client tells a core that runs from one that sleeps (an AURIX core in
+            // boot halt) only by this answer.
+            let description = status
+                .short_long_status(&session_data.backend, None, false)
+                .await
+                .1;
             return self.send_response::<()>(
                 request,
                 Err(&DebuggerError::Other(anyhow!(
-                    "Core must be halted before requesting a stack trace"
+                    "Core must be halted before requesting a stack trace: {description}"
                 ))),
             );
         }
