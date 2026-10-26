@@ -1816,19 +1816,103 @@ impl DebugAdapter {
         core_index: usize,
         request: &Request,
     ) -> Result<(), anyhow::Error> {
-        self.step_impl_async(
-            stepping_mode,
-            &mut session_data.backend,
-            session_data
-                .core_data
-                .iter_mut()
-                .find(|c| c.core_index == core_index)
-                .ok_or_else(|| anyhow!("No core data for core {core_index}"))?,
-        )
-        .await?;
+        let cd_idx = session_data
+            .core_data
+            .iter()
+            .position(|c| c.core_index == core_index)
+            .ok_or_else(|| anyhow!("No core data for core {core_index}"))?;
+
+        // A step over a call, or out of a function, can halt at one of the client's
+        // breakpoints in a deeper call that does not stop the core: a condition or hit count
+        // that does not hold, a log point. The step goes on then, out of the calls, until it is
+        // back as deep in the stack as it ends: the depth of the step's start (step over), one
+        // frame less (step out). Only with such breakpoints set is the depth needed; the
+        // client asked for the stack at the stop the step starts from, else it is unwound.
+        let frames_up = match stepping_mode {
+            SteppingMode::OverStatement => Some(0),
+            SteppingMode::OutOfStatement => Some(1),
+            _ => None,
+        };
+        let conditional = session_data.core_data[cd_idx]
+            .breakpoints
+            .iter()
+            .any(|breakpoint| breakpoint.condition.is_some());
+        let target_depth = match frames_up {
+            Some(up) if conditional => {
+                let core_data = &session_data.core_data[cd_idx];
+                let depth = if core_data.stack_frames_valid {
+                    Some(core_data.stack_frames.len())
+                } else {
+                    Self::stack_depth(&mut session_data.backend, core_index).await
+                };
+                depth.and_then(|depth| depth.checked_sub(up))
+            }
+            _ => None,
+        };
+
+        let mut mode = stepping_mode;
+        // Once the step goes on after a breakpoint, each round leaves a call; the bound is for a
+        // stack that does not unwind as it should.
+        let mut going_on = false;
+        for round in 0.. {
+            let core_data = &mut session_data.core_data[cd_idx];
+            let (status, program_counter) = self
+                .step_once(mode, &mut session_data.backend, core_data)
+                .await?;
+            let mut at_breakpoint = Self::at_client_breakpoint(
+                status,
+                program_counter,
+                &session_data.core_data[cd_idx],
+            );
+            if let Some(target) = target_depth
+                && round < STEP_ROUNDS
+                && (at_breakpoint || going_on)
+            {
+                let deeper = Self::stack_depth(&mut session_data.backend, core_index)
+                    .await
+                    .is_some_and(|depth| depth > target);
+                // A breakpoint here stops the core, unless its conditions do not hold (a log
+                // point prints its line). Where the step ends, one that does not stop the core
+                // leaves a stop of the step.
+                let goes_on = if at_breakpoint {
+                    session_data.step_halt_goes_on(core_index, status).await
+                } else {
+                    Some(Vec::new())
+                };
+                if let Some(lines) = goes_on {
+                    for line in lines {
+                        self.log_point(&line);
+                    }
+                    at_breakpoint = false;
+                    if deeper {
+                        going_on = true;
+                        mode = SteppingMode::OutOfStatement;
+                        continue;
+                    }
+                }
+            }
+            self.report_step(
+                status,
+                program_counter,
+                at_breakpoint,
+                &session_data.backend,
+                core_index,
+            )
+            .await?;
+            break;
+        }
         self.send_response::<()>(request, Ok(None))?;
 
         Ok(())
+    }
+
+    /// The frames of the stack of a halted core, `None` when it does not unwind.
+    async fn stack_depth(backend: &mut RpcBackend, core_index: usize) -> Option<usize> {
+        backend
+            .unwind_stack(core_index, 500)
+            .await
+            .ok()
+            .map(|frames| frames.len())
     }
 
     /// Session-level `restart`: reset-and-halt (reapplying breakpoints on
@@ -2161,6 +2245,9 @@ impl DebugAdapter {
     }
 }
 
+/// The calls a step leaves at most to finish after a breakpoint that does not stop it.
+const STEP_ROUNDS: usize = 32;
+
 impl DebugAdapter {
     /// Halt the core (REPL/DAP `pause`).
     pub(crate) async fn pause_impl_async(
@@ -2290,6 +2377,28 @@ impl DebugAdapter {
         backend: &mut RpcBackend,
         core_data: &mut CoreData,
     ) -> Result<u64> {
+        let (new_status, program_counter) =
+            self.step_once(stepping_mode, backend, core_data).await?;
+        let at_breakpoint = Self::at_client_breakpoint(new_status, program_counter, core_data);
+        let core_index = core_data.core_index;
+        self.report_step(
+            new_status,
+            program_counter,
+            at_breakpoint,
+            backend,
+            core_index,
+        )
+        .await?;
+        Ok(program_counter)
+    }
+
+    /// One step of the core, the client not told yet ([`Self::report_step`]).
+    async fn step_once(
+        &mut self,
+        stepping_mode: SteppingMode,
+        backend: &mut RpcBackend,
+        core_data: &mut CoreData,
+    ) -> Result<(CoreStatus, u64)> {
         let core_index = core_data.core_index;
         // Mark the adapter's cached status unknown before the server performs
         // the step, without notifying the client.
@@ -2307,47 +2416,66 @@ impl DebugAdapter {
                 format!("Step error @{program_counter:#010X}: {message}"),
             );
         }
-
-        // The event says "step", though stepping uses breakpoints (a step over a call halts at
-        // a temporary one) and the core reports that halt reason; it says "breakpoint" when
-        // the step stopped at one of the client's breakpoints (one in a call stepped over).
         // The status kept is the one the core reports: the next poll reads it again and so
         // sees no new halt. With `Halted(Step)` kept instead, the poll took the core's
-        // `Halted(Breakpoint)` for a new stop and sent a second `stopped` event ("Stopped at a
-        // hardware breakpoint") at the address the step had just stopped at.
+        // `Halted(Breakpoint)` (a step over a call halts at a temporary breakpoint) for a new
+        // stop and sent a second `stopped` event ("Stopped at a hardware breakpoint") at the
+        // address the step had just stopped at.
         core_data.last_known_status = new_status;
-        if matches!(new_status, CoreStatus::Halted(_)) {
-            let at_breakpoint = matches!(new_status, CoreStatus::Halted(HaltReason::Breakpoint(_)))
-                && core_data
-                    .breakpoints
-                    .iter()
-                    .any(|breakpoint| breakpoint.address == program_counter);
-            let shown = if at_breakpoint {
-                new_status
-            } else {
-                CoreStatus::Halted(HaltReason::Step)
-            };
-            let reason = shown
-                .short_long_status(backend, None, false)
-                .await
-                .0
-                .to_string();
-            let description = shown
-                .short_long_status(backend, Some(program_counter), false)
-                .await
-                .1;
-            let event_body = StoppedEventBody {
-                reason,
-                description: Some(description),
-                thread_id: Some(core_index as i64),
-                preserve_focus_hint: None,
-                text: None,
-                all_threads_stopped: Some(self.all_cores_halted),
-                hit_breakpoint_ids: None,
-            };
-            self.dyn_send_event("stopped", serde_json::to_value(event_body).ok())?;
+        Ok((new_status, program_counter))
+    }
+
+    /// Whether a step halted at one of the client's breakpoints.
+    fn at_client_breakpoint(
+        status: CoreStatus,
+        program_counter: u64,
+        core_data: &CoreData,
+    ) -> bool {
+        matches!(status, CoreStatus::Halted(HaltReason::Breakpoint(_)))
+            && core_data
+                .breakpoints
+                .iter()
+                .any(|breakpoint| breakpoint.address == program_counter)
+    }
+
+    /// The `stopped` event of a step. It says "step", though stepping uses breakpoints and the
+    /// core reports that halt reason; it says "breakpoint" when the step stopped at one of the
+    /// client's breakpoints that stops the core (`at_breakpoint`; one in a call stepped over).
+    async fn report_step(
+        &mut self,
+        new_status: CoreStatus,
+        program_counter: u64,
+        at_breakpoint: bool,
+        backend: &RpcBackend,
+        core_index: usize,
+    ) -> Result<()> {
+        if !matches!(new_status, CoreStatus::Halted(_)) {
+            return Ok(());
         }
-        Ok(program_counter)
+        let shown = if at_breakpoint {
+            new_status
+        } else {
+            CoreStatus::Halted(HaltReason::Step)
+        };
+        let reason = shown
+            .short_long_status(backend, None, false)
+            .await
+            .0
+            .to_string();
+        let description = shown
+            .short_long_status(backend, Some(program_counter), false)
+            .await
+            .1;
+        let event_body = StoppedEventBody {
+            reason,
+            description: Some(description),
+            thread_id: Some(core_index as i64),
+            preserve_focus_hint: None,
+            text: None,
+            all_threads_stopped: Some(self.all_cores_halted),
+            hit_breakpoint_ids: None,
+        };
+        self.dyn_send_event("stopped", serde_json::to_value(event_body).ok())
     }
 
     #[tracing::instrument(level = "trace", skip_all)]

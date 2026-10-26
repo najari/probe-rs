@@ -627,6 +627,23 @@ impl SessionData {
         Ok(())
     }
 
+    /// Whether a step that halted at one of the client's breakpoints goes on: `Some` with the
+    /// lines of its log points when the breakpoints there do not stop the core (a condition or
+    /// hit count that does not hold, a log point), `None` when they do (one without a
+    /// condition, or a condition that holds). Hit counts count this hit.
+    pub(crate) async fn step_halt_goes_on(
+        &mut self,
+        core_index: usize,
+        status: CoreStatus,
+    ) -> Option<Vec<String>> {
+        let cd_idx = self
+            .core_data
+            .iter()
+            .position(|core_data| core_data.core_index == core_index)?;
+        let check = self.check_halt(cd_idx, status).await?;
+        (!check.stop).then_some(check.lines)
+    }
+
     /// What the conditions of the breakpoints that a new halt is at make of it; `None` when the
     /// halt is reported as it is: it is not at a breakpoint, or at one without a condition.
     ///
