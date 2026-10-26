@@ -23,8 +23,10 @@
 //! A sector that already holds exactly that content is not erased.
 //!
 //! `prepare_flash` saves the CPU0 registers and the RAM the loader uses, and halts all cores.
-//! `finish_flash` restores them and resumes the cores that were running. The application in
-//! flash has changed by then, so reset the device after flashing.
+//! `finish_flash` restores them and resumes the cores that were running; so does a
+//! `prepare_flash` that fails part way (probe-rs runs no `finish_flash` then). The loader
+//! disables the CPU0 and the safety watchdog and puts their disable request back when it
+//! exits. The application in flash has changed by then, so reset the device after flashing.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -197,7 +199,8 @@ impl FlashDevice {
         }
     }
 
-    /// `WDTCPU0_CON0` and `WDTS_CON0`, which hold ENDINIT.
+    /// `WDTCPU0_CON0` and `WDTS_CON0`, which hold ENDINIT; `CON1` (the disable request
+    /// `DR`, bit 3) follows each.
     fn watchdogs(self) -> (u64, u64) {
         match self {
             Self::Tc27x => (0xF003_6100, 0xF003_60F0),
@@ -316,7 +319,16 @@ fn find_page(pages: &[FlashPage], address: u64) -> Option<&FlashPage> {
 
 /// The pages of a sector once it is written: the patched pages, with 0 in the bytes a patch
 /// does not set, and erased pages elsewhere. In the DFLASH a page of zeros is erased.
-pub fn sector_image(sector: Sector, patches: &BTreeMap<u32, PagePatch>) -> Vec<PageImage> {
+///
+/// `before` is the sector as it was ([`read_pages`]). A page left erased where the PFLASH held
+/// a page of zeros keeps the zeros: [`page_patches`] cannot tell the zeros of
+/// `--restore-unwritten` from fill bytes, and erased PFLASH does not read as zeros (an ECC
+/// error).
+pub fn sector_image(
+    sector: Sector,
+    patches: &BTreeMap<u32, PagePatch>,
+    before: &[PageImage],
+) -> Vec<PageImage> {
     let dflash = is_dflash(sector.base);
     (0..sector.size as usize / PAGE)
         .map(|index| {
@@ -324,6 +336,13 @@ pub fn sector_image(sector: Sector, patches: &BTreeMap<u32, PagePatch>) -> Vec<P
             patches
                 .get(&address)
                 .map(|patch| patch.map(|byte| byte.unwrap_or(0)))
+                .or_else(|| {
+                    before
+                        .get(index)
+                        .copied()
+                        .flatten()
+                        .filter(|page| *page == [0; PAGE])
+                })
                 .filter(|page| !(dflash && *page == [0; PAGE]))
         })
         .collect()
@@ -332,6 +351,10 @@ pub fn sector_image(sector: Sector, patches: &BTreeMap<u32, PagePatch>) -> Vec<P
 /// Reads `size` bytes of flash at `address` page by page: a page that can not be read (an
 /// erased PFLASH page) or a DFLASH page of zeros is `None`. Large reads are tried first and
 /// split only where they fail.
+///
+/// A read that fails could also be a broken connection, which would make the pages erased:
+/// after a failed read of more than a page the CPU0 DSPR is read, and when that fails too, so
+/// does this function.
 pub fn read_pages(
     memory: &mut dyn MemoryInterface,
     address: u32,
@@ -344,8 +367,9 @@ pub fn read_pages(
         address: u32,
         size: usize,
         step: usize,
+        top: bool,
         pages: &mut [PageImage],
-    ) {
+    ) -> Result<(), Error> {
         let mut offset = 0;
         while offset < size {
             let n = step.min(size - offset);
@@ -356,13 +380,25 @@ pub fn read_pages(
                     let index = (at - base) as usize / PAGE + i;
                     pages[index] = Some(*chunk);
                 }
-            } else if n > PAGE {
-                walk(memory, base, at, n, if n > 512 { 512 } else { PAGE }, pages);
+            } else {
+                if n > PAGE || top {
+                    memory.read_word_32(MAILBOX as u64).map_err(|error| {
+                        other(format!(
+                            "reading the flash at {at:#010x} failed, and so did a read of RAM \
+                             ({error}): the connection to the device is broken"
+                        ))
+                    })?;
+                }
+                if n > PAGE {
+                    let step = if n > 512 { 512 } else { PAGE };
+                    walk(memory, base, at, n, step, false, pages)?;
+                }
             }
             offset += n;
         }
+        Ok(())
     }
-    walk(memory, address, address, size, 0x1000, &mut pages);
+    walk(memory, address, address, size, 0x1000, true, &mut pages)?;
     if is_dflash(address) {
         for page in &mut pages {
             if *page == Some([0; PAGE]) {
@@ -373,11 +409,28 @@ pub fn read_pages(
     Ok(pages)
 }
 
-#[derive(Debug)]
+/// What the loader changes, saved by [`AurixFlash::start_loader`] as it goes (a part, when it
+/// fails part way).
+#[derive(Debug, Default)]
 struct SavedState {
     registers: Vec<(RegisterId, u32)>,
     ram: Vec<(u32, Vec<u8>)>,
+    /// Whether each core ran; a core that ran was halted.
     running: Vec<bool>,
+    /// `WDTCPU0_CON1` and `WDTS_CON1` before the loader disabled the watchdogs.
+    watchdogs: Option<(u32, u32)>,
+    /// Whether CPU0 was run with the loader.
+    started: bool,
+}
+
+/// `CON1.DR` of a watchdog: the disable request.
+const WDT_DR: u32 = 1 << 3;
+
+/// Keeps the first error of several steps that are all tried.
+fn keep_first(failed: &mut Option<Error>, result: Result<(), Error>) {
+    if let Err(error) = result {
+        failed.get_or_insert(error);
+    }
 }
 
 /// SCU_CHIPID, which tells the device step and variant apart.
@@ -786,15 +839,16 @@ impl AurixFlash {
         Ok(())
     }
 
-    fn start_loader(&self, session: &mut Session) -> Result<(), Error> {
+    /// Halts the cores and starts the loader on CPU0. What it changes goes into `saved` before
+    /// it is changed, so that [`Self::stop_loader`] puts back what was done when a step fails.
+    fn start_loader(&self, session: &mut Session, saved: &mut SavedState) -> Result<(), Error> {
         self.check_device(session)?;
 
-        let mut running = Vec::new();
         for id in 0..session.list_cores().len() {
             let mut core = session.core(id)?;
             // A core the application has not started (boot halt) sleeps: the halt leaves it as
             // it is, and it is not run afterwards.
-            running.push(core.status()? == CoreStatus::Running);
+            saved.running.push(core.status()? == CoreStatus::Running);
             // The application may reset the device when a core stops answering.
             core.halt(Duration::from_millis(500))?;
         }
@@ -810,6 +864,14 @@ impl AurixFlash {
             core.read(address as u64, &mut data)?;
             ram.push((address, data));
         }
+        let (wdtcpu0_con0, wdts_con0) = self.device.watchdogs();
+        let watchdogs = (
+            core.read_word_32(wdtcpu0_con0 + 4)?,
+            core.read_word_32(wdts_con0 + 4)?,
+        );
+        saved.registers = registers;
+        saved.ram = ram;
+        saved.watchdogs = Some(watchdogs);
 
         let loader = self.device.loader();
         tracing::info!(
@@ -824,14 +886,9 @@ impl AurixFlash {
         // No application interrupt may run while a flash bank is busy.
         let icr: u32 = core.read_core_reg(RegisterId(CSFR_ICR))?;
         core.write_core_reg(RegisterId(CSFR_ICR), icr & !(1 << 15))?;
+        saved.started = true;
         core.run()?;
         drop(core);
-
-        *self.saved.lock().unwrap_or_else(|e| e.into_inner()) = Some(SavedState {
-            registers,
-            ram,
-            running,
-        });
 
         let start = Instant::now();
         while !Self::loader_running(session)? {
@@ -843,41 +900,84 @@ impl AurixFlash {
         Ok(())
     }
 
+    /// Stops the loader and puts back what [`Self::start_loader`] saved. Every step is tried,
+    /// also after one failed: the first error is returned.
     fn stop_loader(&self, session: &mut Session) -> Result<(), Error> {
         let Some(saved) = self.saved.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return Ok(());
         };
-
-        if Self::loader_running(session)? {
-            Self::command(session, CMD_EXIT, [0; 3], Duration::from_secs(2))?;
+        let mut failed = None;
+        if !saved.started {
+            // Nothing ran: the cores halted so far run again, the rest was not changed.
+            for (id, running) in saved.running.iter().enumerate() {
+                if *running {
+                    keep_first(&mut failed, session.core(id).and_then(|mut core| core.run()));
+                }
+            }
+            return failed.map_or(Ok(()), Err);
         }
-        let mut core = session.core(0)?;
-        core.halt(Duration::from_millis(500))?;
 
-        // The loader must have set ENDINIT again.
-        let (wdtcpu0_con0, wdts_con0) = self.device.watchdogs();
-        let cpu0 = core.read_word_32(wdtcpu0_con0)?;
-        let safety = core.read_word_32(wdts_con0)?;
-
-        for (address, data) in &saved.ram {
-            core.write(*address as u64, data)?;
+        match Self::loader_running(session) {
+            Ok(true) => keep_first(
+                &mut failed,
+                Self::command(session, CMD_EXIT, [0; 3], Duration::from_secs(2)).map(drop),
+            ),
+            Ok(false) => {}
+            Err(error) => keep_first(&mut failed, Err(error)),
         }
-        for (id, value) in &saved.registers {
-            core.write_core_reg(*id, *value)?;
+        // The loader must have set ENDINIT again, and put back the disable requests.
+        let mut watchdogs = None;
+        match session.core(0) {
+            Ok(mut core) => {
+                keep_first(&mut failed, core.halt(Duration::from_millis(500)).map(drop));
+                let (wdtcpu0_con0, wdts_con0) = self.device.watchdogs();
+                let words = [wdtcpu0_con0, wdtcpu0_con0 + 4, wdts_con0, wdts_con0 + 4]
+                    .map(|address| core.read_word_32(address));
+                match words {
+                    [Ok(con0), Ok(con1), Ok(s_con0), Ok(s_con1)] => {
+                        watchdogs = Some((con0, con1, s_con0, s_con1));
+                    }
+                    words => {
+                        for word in words {
+                            keep_first(&mut failed, word.map(drop));
+                        }
+                    }
+                }
+                for (address, data) in &saved.ram {
+                    keep_first(&mut failed, core.write(*address as u64, data));
+                }
+                for (id, value) in &saved.registers {
+                    keep_first(&mut failed, core.write_core_reg(*id, *value));
+                }
+            }
+            Err(error) => keep_first(&mut failed, Err(error)),
         }
-        drop(core);
 
         for (id, running) in saved.running.iter().enumerate() {
             if *running {
-                session.core(id)?.run()?;
+                keep_first(&mut failed, session.core(id).and_then(|mut core| core.run()));
             }
         }
 
-        if cpu0 & 1 == 0 || safety & 1 == 0 {
-            return Err(other(format!(
-                "ENDINIT is still cleared after flashing (WDTCPU0_CON0 {cpu0:#010x}, \
-                 WDTS_CON0 {safety:#010x}): reset the device"
-            )));
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        if let Some((cpu0, cpu0_con1, safety, safety_con1)) = watchdogs {
+            if cpu0 & 1 == 0 || safety & 1 == 0 {
+                return Err(other(format!(
+                    "ENDINIT is still cleared after flashing (WDTCPU0_CON0 {cpu0:#010x}, \
+                     WDTS_CON0 {safety:#010x}): reset the device"
+                )));
+            }
+            if let Some((before, safety_before)) = saved.watchdogs
+                && ((cpu0_con1 ^ before) | (safety_con1 ^ safety_before)) & WDT_DR != 0
+            {
+                return Err(other(format!(
+                    "the watchdogs are not enabled as before flashing (WDTCPU0_CON1 \
+                     {cpu0_con1:#010x}, was {before:#010x}; WDTS_CON1 {safety_con1:#010x}, \
+                     was {safety_before:#010x}): reset the device"
+                )));
+            }
         }
         tracing::info!("Flash loader stopped; reset the device to run the new image");
         Ok(())
@@ -893,7 +993,17 @@ impl DebugFlashSequence for AurixFlash {
         *self.backup.lock().unwrap_or_else(|e| e.into_inner()) = std::env::var_os(BACKUP_ENV)
             .filter(|dir| !dir.is_empty())
             .map(|dir| PathBuf::from(dir).join(utc_stamp(SystemTime::now())));
-        self.start_loader(session)
+        let mut saved = SavedState::default();
+        let started = self.start_loader(session, &mut saved);
+        *self.saved.lock().unwrap_or_else(|e| e.into_inner()) = Some(saved);
+        if let Err(error) = started {
+            // probe-rs runs no `finish_flash` after a failed `prepare_flash`.
+            if let Err(restore) = self.stop_loader(session) {
+                tracing::warn!("Putting back the state from before the flash loader: {restore}");
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn finish_flash(&self, session: &mut Session) -> Result<(), Error> {
@@ -958,7 +1068,7 @@ impl DebugFlashSequence for AurixFlash {
                 let mut core = session.core(0)?;
                 read_pages(&mut core, sector.base, sector.size as usize)?
             };
-            let image = sector_image(sector, &patches);
+            let image = sector_image(sector, &patches, &backup);
             if image == backup {
                 tracing::info!("Sector {:#010x} already holds the image", sector.base);
                 continue;
@@ -1075,7 +1185,7 @@ mod tests {
         patch[1] = Some(0xAB);
         patches.insert(sector.base + 64, patch);
 
-        let image = sector_image(sector, &patches);
+        let image = sector_image(sector, &patches, &[]);
         assert_eq!(image.len(), 512);
         let mut expected = [0; PAGE];
         expected[1] = 0xAB;
@@ -1255,6 +1365,107 @@ mod tests {
     }
 
     #[test]
+    fn a_page_of_zeros_that_was_in_the_pflash_stays() {
+        let sector = Sector {
+            base: 0xA021_C000,
+            size: 0x4000,
+        };
+        // Programmed zeros at page 0 (an application's data), erased at page 1, data at page 2;
+        // the image sets page 3 only.
+        let mut before = vec![None; 512];
+        before[0] = Some([0; PAGE]);
+        before[2] = Some([0x11; PAGE]);
+        let mut patches = BTreeMap::new();
+        patches.insert(sector.base + 3 * PAGE as u32, [Some(0x22); PAGE]);
+        let image = sector_image(sector, &patches, &before);
+        assert_eq!(image[0], Some([0; PAGE]));
+        assert_eq!(image[1], None);
+        assert_eq!(image[2], None);
+        assert_eq!(image[3], Some([0x22; PAGE]));
+    }
+
+    /// Flash in which the pages of `erased` fail to read, and everything fails when the
+    /// connection is `broken`.
+    #[derive(Default)]
+    struct FakeFlash {
+        erased: BTreeSet<u32>,
+        broken: bool,
+        reads: usize,
+    }
+
+    impl FakeFlash {
+        fn check(&mut self, address: u64, len: usize) -> Result<(), Error> {
+            self.reads += 1;
+            let page = |a: u64| (a as u32) & !(PAGE as u32 - 1);
+            if self.broken || (address..address + len as u64).any(|a| self.erased.contains(&page(a)))
+            {
+                return Err(other("read failed"));
+            }
+            Ok(())
+        }
+    }
+
+    impl MemoryInterface for FakeFlash {
+        fn supports_native_64bit_access(&mut self) -> bool {
+            true
+        }
+        fn read_64(&mut self, address: u64, data: &mut [u64]) -> Result<(), Error> {
+            self.check(address, data.len() * 8)
+        }
+        fn read_32(&mut self, address: u64, data: &mut [u32]) -> Result<(), Error> {
+            self.check(address, data.len() * 4)
+        }
+        fn read_16(&mut self, address: u64, data: &mut [u16]) -> Result<(), Error> {
+            self.check(address, data.len() * 2)
+        }
+        fn read_8(&mut self, address: u64, data: &mut [u8]) -> Result<(), Error> {
+            self.check(address, data.len())?;
+            data.fill(0x5A);
+            Ok(())
+        }
+        fn write_64(&mut self, _: u64, _: &[u64]) -> Result<(), Error> {
+            unimplemented!()
+        }
+        fn write_32(&mut self, _: u64, _: &[u32]) -> Result<(), Error> {
+            unimplemented!()
+        }
+        fn write_16(&mut self, _: u64, _: &[u16]) -> Result<(), Error> {
+            unimplemented!()
+        }
+        fn write_8(&mut self, _: u64, _: &[u8]) -> Result<(), Error> {
+            unimplemented!()
+        }
+        fn supports_8bit_transfers(&self) -> Result<bool, Error> {
+            Ok(true)
+        }
+        fn flush(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pages_that_fail_to_read_are_erased_unless_the_connection_is_broken() {
+        let base = 0xA040_0000;
+        let mut flash = FakeFlash::default();
+        flash.erased.insert(base + 0x20);
+        flash.erased.insert(base + 0x3FE0);
+        let pages = read_pages(&mut flash, base, 0x4000).unwrap();
+        assert_eq!(pages[1], None);
+        assert_eq!(pages[511], None);
+        assert_eq!(pages[0], Some([0x5A; PAGE]));
+        assert_eq!(pages.iter().filter(|p| p.is_none()).count(), 2);
+
+        // A broken connection fails every read: that is no erased sector.
+        let mut flash = FakeFlash {
+            broken: true,
+            ..FakeFlash::default()
+        };
+        assert!(read_pages(&mut flash, base, 0x4000).is_err());
+        // It is found at the first read.
+        assert_eq!(flash.reads, 2);
+    }
+
+    #[test]
     fn dflash_pages_of_zeros_are_erased() {
         let sector = Sector {
             base: 0xAF00_2000,
@@ -1266,7 +1477,7 @@ mod tests {
         patch[3] = Some(0x5A);
         patches.insert(sector.base + PAGE as u32, patch);
 
-        let image = sector_image(sector, &patches);
+        let image = sector_image(sector, &patches, &[]);
         assert_eq!(image.len(), 256);
         assert_eq!(image[0], None);
         let mut expected = [0; PAGE];
@@ -1281,7 +1492,7 @@ mod tests {
         };
         let mut patches = BTreeMap::new();
         patches.insert(pflash.base, [Some(0); PAGE]);
-        assert_eq!(sector_image(pflash, &patches)[0], Some([0; PAGE]));
+        assert_eq!(sector_image(pflash, &patches, &[])[0], Some([0; PAGE]));
     }
 
     #[test]
@@ -1345,9 +1556,9 @@ mod tests {
     fn the_loaders_are_the_reviewed_builds() {
         // A change of a loader binary must be deliberate: rebuild with loader/build.ps1 and
         // update this check.
-        // TC27x SHA-256 E564ED00516DBA8357654AD5B86F7D827C4B11D38008970A7DEBA13D41034E15.
-        assert_eq!(LOADER_TC27X.len(), 1118);
-        // TC3xx SHA-256 437DC5BC82ACCE13FD6EA751EF35D6CC852C541308FE7C4675F68F2EAC85164C.
-        assert_eq!(LOADER_TC3XX.len(), 966);
+        // TC27x SHA-256 B01DE77697D2A6994F1BB8A07CAC7BE06C98FB88713DFB472638B15312E300AF.
+        assert_eq!(LOADER_TC27X.len(), 1280);
+        // TC3xx SHA-256 DAD758F0DCB352D3227DE92DBF11400B7F3DEC275D5E23D473CDDB961BD7DDB1.
+        assert_eq!(LOADER_TC3XX.len(), 1128);
     }
 }

@@ -30,6 +30,9 @@
  *   [5] status   0=ok else DMU_ERRSR value
  *   [6] done     0=busy 1=command finished
  *   [7] progress units processed (sectors / pages)
+ *   [8] loader: WDTCPU0_CON1 before the loader disabled the CPU0 watchdog
+ *   [9] loader: WDTS_CON1 before the loader disabled the safety watchdog
+ *       (exit puts their DR bits back)
  */
 
 typedef unsigned int u32;
@@ -68,6 +71,10 @@ typedef unsigned int u32;
 #define MB_STATUS     5
 #define MB_DONE       6
 #define MB_PROGRESS   7
+#define MB_WDT_CPU0   8
+#define MB_WDT_SAFETY 9
+
+#define WDT_DR        (1u << 3)      /* CON1.DR: disable request */
 
 #define PFLASH_SECTOR_SIZE 0x4000u   /* 16 KiB logical sector */
 #define PFLASH_PAGE_SIZE   32u       /* 32 bytes per program page */
@@ -171,17 +178,36 @@ static void wdt_set_endinit(volatile u32 *con0_reg, u32 pw)
     }
 }
 
-/* disable the CPU0 watchdog and the safety watchdog (like professional flashers) */
+/* disable the CPU0 watchdog and the safety watchdog (like professional flashers);
+ * their CON1 go to the mailbox for wdt_restore */
 static void wdt_disable(void)
 {
     u32 pw = wdt_password(&WDTCPU0_CON0);
+    MB[MB_WDT_CPU0] = WDTCPU0_CON1;
     if (wdt_clear_endinit(&WDTCPU0_CON0)) {
-        WDTCPU0_CON1 = WDTCPU0_CON1 | (1u << 3);   /* DR = 1 (disable request) */
+        WDTCPU0_CON1 = WDTCPU0_CON1 | WDT_DR;
+        wdt_set_endinit(&WDTCPU0_CON0, pw);
+    }
+    pw = wdt_password(&WDTS_CON0);
+    MB[MB_WDT_SAFETY] = WDTS_CON1;
+    if (wdt_clear_endinit(&WDTS_CON0)) {
+        WDTS_CON1 = WDTS_CON1 | WDT_DR;
+        wdt_set_endinit(&WDTS_CON0, pw);
+    }
+}
+
+/* put back the disable request of both watchdogs as the application had it: the
+ * application runs on after the flashing */
+static void wdt_restore(void)
+{
+    u32 pw = wdt_password(&WDTCPU0_CON0);
+    if (wdt_clear_endinit(&WDTCPU0_CON0)) {
+        WDTCPU0_CON1 = (WDTCPU0_CON1 & ~WDT_DR) | (MB[MB_WDT_CPU0] & WDT_DR);
         wdt_set_endinit(&WDTCPU0_CON0, pw);
     }
     pw = wdt_password(&WDTS_CON0);
     if (wdt_clear_endinit(&WDTS_CON0)) {
-        WDTS_CON1 = WDTS_CON1 | (1u << 3);         /* DR = 1 */
+        WDTS_CON1 = (WDTS_CON1 & ~WDT_DR) | (MB[MB_WDT_SAFETY] & WDT_DR);
         wdt_set_endinit(&WDTS_CON0, pw);
     }
 }
@@ -331,6 +357,7 @@ void _start(void)
         }
         else if (cmd == CMD_EXIT) {
             set_endinit();
+            wdt_restore();
             MB[MB_STATUS] = 0u;
             MB[MB_DONE]   = 1u;
             MB[MB_CMD]    = 0u;
