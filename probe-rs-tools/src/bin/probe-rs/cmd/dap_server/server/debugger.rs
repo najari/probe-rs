@@ -998,7 +998,7 @@ impl Debugger {
             if core_config.step_interrupts == StepInterrupts::Allow
                 && let Err(error) = session_data
                     .backend
-                    .set_tricore_options(core_index, Some(false), None, None, None)
+                    .set_tricore_options(core_index, Some(false), None, None, None, None)
                     .await
             {
                 debug_adapter.log_to_console(format!(
@@ -1010,7 +1010,7 @@ impl Debugger {
             if core_config.reset_behavior == ResetBehavior::Halt
                 && let Err(error) = session_data
                     .backend
-                    .set_tricore_options(core_index, None, None, Some(true), None)
+                    .set_tricore_options(core_index, None, None, Some(true), None, None)
                     .await
             {
                 debug_adapter.log_to_console(format!(
@@ -1040,6 +1040,7 @@ impl Debugger {
                             core_index,
                             None,
                             Some(Some((start, stop))),
+                            None,
                             None,
                             None,
                         )

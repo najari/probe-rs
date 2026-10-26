@@ -11,7 +11,10 @@
 //! `CBS_TRCn` (`BRKOUT`, `BRKIN`) and line 7.
 //!
 //! The registers are in the debug reset domain: an application reset (a launch, a restart)
-//! keeps them. The session puts back every word it changed when it ends.
+//! keeps them. The session puts back every word it changed when it ends, and the journal of
+//! the cores keeps them meanwhile: a session after a killed one puts them back where they
+//! still hold what this one wrote (`CBS_TRCn` and the system timer's `OCS` with core n,
+//! `CBS_TL1ST` with the first core).
 //!
 //! On the TC36x test board halting CPU0 then stops STM0 (`SUSSTA` 1), and STM0 in soft suspend
 //! without the routing runs on. The TC27x does not suspend its peripherals from the line (STM0
@@ -37,6 +40,8 @@ const OCS_SUS_P: u32 = 1 << 28;
 const OCS_SOFT_SUSPEND: u32 = 2 << 24;
 /// `OCS` of a system timer, from its base.
 const STM_OCS: u64 = 0xE8;
+/// `OCS.SUSSTA` (bit 29): the timer is suspended now.
+const OCS_SUSSTA: u32 = 1 << 29;
 
 /// The system timers of a chip, STMx of CPUx, or why the option is not for the chip.
 pub(crate) fn system_timers(chip: Option<&str>) -> Result<Vec<u64>, &'static str> {
@@ -134,6 +139,8 @@ pub(crate) async fn apply(
         return Err("no core of the session can be routed (in boot halt)".into());
     }
     let mut restore = Vec::new();
+    // The words for the journal of each core: (address, original, written).
+    let mut journal = std::collections::BTreeMap::<usize, Vec<(u32, u32, u32)>>::new();
     let outcome = async {
         for &core in &routed_cores {
             let ocs_address = timers[core] + STM_OCS;
@@ -143,6 +150,13 @@ pub(crate) async fn apply(
                 address: ocs_address,
                 value: sensitivity_of(ocs),
             });
+            // As it reads back while the timer runs (the journal compares what it reads).
+            let written = read(session_data, bus, ocs_address).await? & !OCS_SUSSTA;
+            journal.entry(core).or_default().push((
+                ocs_address as u32,
+                sensitivity_of(ocs),
+                written,
+            ));
         }
         let tl1st = read(session_data, bus, CBS_TL1ST).await?;
         let set = targets(tl1st, &routed_cores);
@@ -151,11 +165,15 @@ pub(crate) async fn apply(
             address: CBS_TL1ST,
             value: tl1st,
         });
+        journal
+            .entry(bus)
+            .or_default()
+            .push((CBS_TL1ST as u32, tl1st, set));
         // The run writes of each core put this value back, not the reset value.
         for &core in cores {
             session_data
                 .backend
-                .set_tricore_options(core, None, None, None, Some(Some(set)))
+                .set_tricore_options(core, None, None, None, Some(Some(set)), None)
                 .await
                 .map_err(|error| format!("core {core}: {error}"))?;
         }
@@ -167,10 +185,26 @@ pub(crate) async fn apply(
                 address,
                 value: trc,
             });
+            // First in the core's journal: the halt group's entry for `CBS_TRCn` finds the word
+            // as the group wrote it only once this one is back.
+            journal
+                .entry(core)
+                .or_default()
+                .insert(0, (address as u32, trc, routed(trc)));
         }
         Ok::<_, String>(())
     }
     .await;
+    // What was written, also when a step failed: the journals keep it.
+    for (core, words) in journal {
+        if let Err(error) = session_data
+            .backend
+            .set_tricore_options(core, None, None, None, None, Some(words))
+            .await
+        {
+            tracing::warn!("`suspendPeripherals`: no journal for core {core}: {error}");
+        }
+    }
     session_data.peripheral_suspend.extend(restore);
     outcome?;
     let cores = routed_cores
@@ -201,7 +235,7 @@ pub(crate) async fn restore(session_data: &mut SessionData) -> Result<(), String
     for core in cores {
         if let Err(error) = session_data
             .backend
-            .set_tricore_options(core, None, None, None, Some(None))
+            .set_tricore_options(core, None, None, None, Some(None), Some(Vec::new()))
             .await
         {
             failed.get_or_insert(format!("core {core}: {error}"));

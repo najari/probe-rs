@@ -349,6 +349,21 @@ impl CombinedCoreState {
         }
     }
 
+    /// Sets the words of a debugger that the journal of this TriCore core keeps: (address,
+    /// original, written).
+    pub(crate) fn tricore_set_journal_words(
+        &mut self,
+        words: Vec<(u32, u32, u32)>,
+    ) -> Result<(), Error> {
+        match &mut self.specific_state {
+            SpecificCoreState::TriCore(state) => {
+                state.set_journal_words(words);
+                Ok(())
+            }
+            _ => Err(TriCoreError::NoTriCoreTarget.into()),
+        }
+    }
+
     /// Sets the suspend targets of trigger line 1 that the run brackets of this TriCore core
     /// put back (`None`: the reset value).
     pub(crate) fn tricore_set_suspend_targets(

@@ -492,6 +492,7 @@ impl RpcBackend {
         perf_window: Option<Option<(u64, u64)>>,
         halt_after_reset: Option<bool>,
         suspend_targets: Option<Option<u32>>,
+        journal_words: Option<Vec<(u32, u32, u32)>>,
     ) -> Result<(), Error> {
         let client = self.core(core_index);
         client
@@ -500,6 +501,7 @@ impl RpcBackend {
                 perf_window,
                 halt_after_reset,
                 suspend_targets,
+                journal_words,
             )
             .await
             .map_err(rpc_err)

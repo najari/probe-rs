@@ -684,6 +684,20 @@ impl Session {
             .tricore_set_halt_after_reset(halt)
     }
 
+    /// Sets words that a debugger wrote for its debugging, (address, original, written), for
+    /// the journal of TriCore core `core_index`: a session after a killed one puts them back
+    /// where they still hold the written value. Empty once the debugger put them back.
+    pub fn set_tricore_journal_words(
+        &mut self,
+        core_index: usize,
+        words: Vec<(u32, u32, u32)>,
+    ) -> Result<(), Error> {
+        self.cores
+            .get_mut(core_index)
+            .ok_or(Error::CoreNotFound(core_index))?
+            .tricore_set_journal_words(words)
+    }
+
     /// Sets the suspend targets of trigger line 1 (`CBS_TL1ST`) that the run writes of TriCore
     /// core `core_index` put back, for a debugger that changed them (`None`: the reset value).
     pub fn set_tricore_suspend_targets(

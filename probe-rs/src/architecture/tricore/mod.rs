@@ -660,6 +660,10 @@ pub struct TriCoreCoreState {
     /// option to suspend peripherals with the core): the run brackets take every core off the
     /// line during the run write and put this value back instead of the reset value.
     suspend_targets: Option<u32>,
+    /// Words a debugger wrote for its debugging besides this core's own (`suspendPeripherals`:
+    /// `CBS_TRCn`, the system timer's `OCS`), as (address, original, written): kept in the
+    /// journal, so that a session after a killed one puts them back.
+    journal_words: Vec<(u32, u32, u32)>,
     /// Set while the core halts because of such a reset, for the halt reason.
     reset_halt: bool,
     /// When such a reset was seen. For a while after it, the status checks plant the software
@@ -717,6 +721,7 @@ impl TriCoreCoreState {
             last_stm: None,
             halt_after_reset: false,
             suspend_targets: None,
+            journal_words: Vec::new(),
             reset_halt: false,
             reset_seen: None,
             software_first: false,
@@ -780,6 +785,12 @@ impl TriCoreCoreState {
     /// reset value, as the DAS server writes it).
     pub(crate) fn set_suspend_targets(&mut self, targets: Option<u32>) {
         self.suspend_targets = targets;
+    }
+
+    /// Sets the words of a debugger that the journal keeps with this core's (see
+    /// `journal_words`); empty when they are back.
+    pub(crate) fn set_journal_words(&mut self, words: Vec<(u32, u32, u32)>) {
+        self.journal_words = words;
     }
 
     /// The `ACCESS_HW_CTRL` (`CBS_TL1ST`) values that bracket a `DBGSR` run write: start, end.
@@ -1090,8 +1101,8 @@ impl<'probe> TriCore<'probe> {
         }
         if registers > 0 {
             let notice = format!(
-                "TriCore core {}: cleared the trigger units and the halt group routing that a \
-                 debugger session left behind ({registers} register(s))",
+                "TriCore core {}: put back {registers} register(s) that a debugger session left \
+                 behind (trigger units, halt group routing, `suspendPeripherals`)",
                 self.core()
             );
             tracing::warn!("{notice}");
@@ -1234,6 +1245,12 @@ impl<'probe> TriCore<'probe> {
             .iter()
             .map(|sw| journal::Entry::debug_instruction(sw.address, sw.original.clone()))
             .collect::<Vec<_>>();
+        // A debugger's words before the halt group routing: one of them can be `CBS_TRCn` with
+        // the group's fields, which the group's entry finds as it wrote it only once this one
+        // is back.
+        for &(address, original, written) in &self.state.journal_words {
+            entries.push(journal::Entry::word(address, original, written));
+        }
         if self.state.owns_triggers {
             for unit in 0..ocds::TRIGGER_UNITS {
                 let (_, evt) = self.trigger_value(unit);

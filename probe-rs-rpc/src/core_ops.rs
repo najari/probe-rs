@@ -107,6 +107,9 @@ pub struct CoreTriCoreOptionsRequest {
     /// The suspend targets of trigger line 1 that the core's run writes put back: `Some(None)`
     /// for the reset value.
     pub suspend_targets: Option<Option<u32>>,
+    /// Words the debugger wrote, (address, original, written), for the core's journal: empty
+    /// once they are back.
+    pub journal_words: Option<Vec<(u32, u32, u32)>>,
 }
 
 #[derive(Serialize, Deserialize, Schema, Clone)]

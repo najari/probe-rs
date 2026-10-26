@@ -1797,6 +1797,40 @@ fn debug_instructions_that_a_killed_session_left_are_taken_out() {
 }
 
 #[test]
+fn the_words_of_a_killed_debugger_go_back_before_the_halt_group() {
+    let dir = journal_dir("words");
+    let mut bus = FakeBus::new();
+    // After a reset CPU0 halts onto line 2.
+    bus.set_word(ocds::trc(0), 0x0000_0102);
+    let mut state = TriCoreCoreState::new();
+    state.set_journal_dir(dir.clone());
+    group_core(&mut bus, &mut state)
+        .set_halt_group(true)
+        .unwrap();
+    assert_eq!(bus.word(ocds::trc(0)), 0x0070_0170);
+    // `suspendPeripherals`: the halt state on line 1, STM0 in soft suspend.
+    let stm0_ocs = 0xF000_10E8;
+    bus.set_word(ocds::trc(0), 0x0070_0171);
+    bus.set_word(stm0_ocs, 0x0200_0000);
+    state.set_journal_words(vec![
+        (ocds::trc(0), 0x0070_0170, 0x0070_0171),
+        (stm0_ocs, 0x1000_0000, 0x0200_0000),
+    ]);
+    group_core(&mut bus, &mut state).status().unwrap();
+
+    // The debugger is killed: the next session puts back the words, then the group's.
+    state.abandon_journal();
+    drop(state);
+    let mut next = TriCoreCoreState::new();
+    next.set_journal_dir(dir.clone());
+    core(&mut bus, &mut next).status().unwrap();
+    assert_eq!(bus.word(ocds::trc(0)), 0x0000_0102);
+    assert_eq!(bus.word(stm0_ocs), 0x1000_0000);
+    assert_eq!(journal_files(&dir), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn trigger_units_and_routing_that_a_killed_session_left_are_put_back() {
     let dir = journal_dir("killed-triggers");
     let mut bus = FakeBus::new();
@@ -1831,7 +1865,7 @@ fn trigger_units_and_routing_that_a_killed_session_left_are_put_back() {
     assert!(
         notices
             .iter()
-            .any(|n| n.contains("cleared the trigger units")),
+            .any(|n| n.contains("register(s) that a debugger session left")),
         "{notices:?}"
     );
     assert_eq!(journal_files(&dir), 0);

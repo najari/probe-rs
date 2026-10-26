@@ -267,6 +267,9 @@ pub async fn core_tricore_options(
     if let Some(targets) = request.suspend_targets {
         probe_rs_try!(session.set_tricore_suspend_targets(request.core as usize, targets));
     }
+    if let Some(words) = request.journal_words {
+        probe_rs_try!(session.set_tricore_journal_words(request.core as usize, words));
+    }
     Ok(())
 }
 
