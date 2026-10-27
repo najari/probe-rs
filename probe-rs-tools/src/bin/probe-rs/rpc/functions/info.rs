@@ -65,6 +65,11 @@ pub async fn target_metadata(
             .map(|(index, core_type)| WireSessionCore {
                 index: index as u32,
                 core_type: to_wire_core_type(core_type),
+                name: target
+                    .cores
+                    .get(index)
+                    .map(|core| core.name.clone())
+                    .unwrap_or_default(),
             })
             .collect(),
         memory_map: target

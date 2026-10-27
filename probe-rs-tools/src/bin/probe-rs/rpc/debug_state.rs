@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -16,6 +16,9 @@ pub struct ServerDebugState {
     /// The DWARF of the cores that run another program binary than the session's (one DAP
     /// session for several cores). The other cores use [`Self::debug_info`].
     pub core_debug_info: HashMap<usize, Arc<DebugInfo>>,
+    /// The cores of another architecture than the target's (the HSM of an AURIX): the
+    /// session's DWARF is not theirs, they use only their own.
+    pub cores_without_session_debug_info: HashSet<usize>,
     pub per_core: HashMap<usize, CoreDebugState>,
     /// Per-core semihosting file state, owned server-side so that semihosting
     /// file I/O happens next to the target. Decoupled from [`Self::per_core`]
@@ -69,11 +72,18 @@ impl ServerDebugState {
         self.clear_core(core_index);
     }
 
-    /// The DWARF of `core_index`: its own, else the session's. `None` asks for the session's.
+    /// The DWARF of `core_index`: its own, else the session's (not for a core of another
+    /// architecture). `None` asks for the session's.
     pub fn debug_info_for(&self, core_index: Option<usize>) -> Option<Arc<DebugInfo>> {
-        core_index
-            .and_then(|core| self.core_debug_info.get(&core).cloned())
-            .or_else(|| self.debug_info.clone())
+        if let Some(core) = core_index {
+            if let Some(own) = self.core_debug_info.get(&core) {
+                return Some(own.clone());
+            }
+            if self.cores_without_session_debug_info.contains(&core) {
+                return None;
+            }
+        }
+        self.debug_info.clone()
     }
 
     pub fn store_core(
@@ -219,6 +229,24 @@ mod tests {
         state.replace_debug_info(test_debug_info());
         assert!(Arc::ptr_eq(&state.debug_info_for(Some(1)).unwrap(), &own));
         assert_eq!(state.per_core.get(&1).unwrap().stack_frames.len(), 1);
+    }
+
+    #[test]
+    fn a_core_of_another_architecture_does_not_use_the_session_debug_info() {
+        let mut state = state_with_debug_info();
+        let session = state.debug_info.clone().unwrap();
+        // The HSM of an AURIX (core 2) in a TriCore session.
+        state.cores_without_session_debug_info = HashSet::from([2]);
+        assert!(state.debug_info_for(Some(2)).is_none());
+        assert!(Arc::ptr_eq(
+            &state.debug_info_for(Some(0)).unwrap(),
+            &session
+        ));
+        assert!(Arc::ptr_eq(&state.debug_info_for(None).unwrap(), &session));
+        // Its own program binary is its DWARF.
+        state.replace_core_debug_info(2, test_debug_info());
+        let own = state.debug_info_for(Some(2)).unwrap();
+        assert!(!Arc::ptr_eq(&own, &session));
     }
 
     #[test]

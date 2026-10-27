@@ -1564,7 +1564,7 @@ fn build_core_data(
     Ok(CoreData {
         core_index: core_configuration.core_index,
         last_known_status: CoreStatus::Unknown,
-        target_name: format!("{}-{}", core_configuration.core_index, target_name),
+        target_name: thread_name(core_configuration.core_index, target_name, None),
         stack_frames: vec![],
         stack_frames_valid: false,
         breakpoints: vec![],
@@ -1618,12 +1618,31 @@ fn initialize_core_data(
             .any(|(target_core_index, _)| *target_core_index == core_config.core_index)
     });
 
+    let first = config.core_configs.first().map(|c| c.core_index);
     let mut core_data_vec = vec![];
     for core_configuration in valid_core_configs {
-        let core_data = build_core_data(core_configuration, &target_name)?;
+        let mut core_data = build_core_data(core_configuration, &target_name)?;
+        // A core of another architecture than the first (the HSM of an AURIX) is named, so
+        // that its thread tells it from the others: `2-TC36x_HSM (hsm)`.
+        let index = core_configuration.core_index;
+        if let Some(first) = first
+            && !backend.same_architecture(index, first)
+            && let Some(name) = backend.target_metadata.core_names.get(&index)
+        {
+            core_data.target_name = thread_name(index, &target_name, Some(name));
+        }
         core_data_vec.push(core_data);
     }
     Ok(core_data_vec)
+}
+
+/// The name of the thread of core `core_index`: `0-TC36x`, or `2-TC36x_HSM (hsm)` with the
+/// name of the core.
+fn thread_name(core_index: usize, target_name: &str, core_name: Option<&str>) -> String {
+    match core_name {
+        Some(name) => format!("{core_index}-{target_name} ({name})"),
+        None => format!("{core_index}-{target_name}"),
+    }
 }
 
 /// Whether two program paths name the same file (compared as given first, then
@@ -1637,8 +1656,17 @@ fn same_program(a: Option<&Path>, b: Option<&Path>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::same_program;
+    use super::{same_program, thread_name};
     use std::path::Path;
+
+    #[test]
+    fn a_thread_name_can_name_its_core() {
+        assert_eq!(thread_name(0, "TC36x", None), "0-TC36x");
+        assert_eq!(
+            thread_name(2, "TC36x_HSM", Some("hsm")),
+            "2-TC36x_HSM (hsm)"
+        );
+    }
 
     #[test]
     fn same_program_needs_both_paths() {

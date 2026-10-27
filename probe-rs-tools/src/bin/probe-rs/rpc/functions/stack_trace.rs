@@ -27,9 +27,26 @@ pub async fn load_debug_info(
     request: LoadDebugInfoRequest,
 ) -> LoadDebugInfoResponse {
     let debug_info = DebugInfo::from_file(&request.path).map_err(|e| e.to_string())?;
-    ctx.with_server_debug_state_mut(request.sessid, |state| match request.core {
-        Some(core) => state.replace_core_debug_info(core as usize, debug_info),
-        None => state.replace_debug_info(debug_info),
+    // The cores of another architecture than the target's (the HSM of an AURIX) do not use
+    // the session's DWARF.
+    let foreign = {
+        let session = ctx.session(request.sessid).await;
+        let target = session.target();
+        let architecture = target.architecture();
+        target
+            .cores
+            .iter()
+            .enumerate()
+            .filter(|(_, core)| core.core_type.architecture() != architecture)
+            .map(|(index, _)| index)
+            .collect()
+    };
+    ctx.with_server_debug_state_mut(request.sessid, |state| {
+        state.cores_without_session_debug_info = foreign;
+        match request.core {
+            Some(core) => state.replace_core_debug_info(core as usize, debug_info),
+            None => state.replace_debug_info(debug_info),
+        }
     })
     .await;
     Ok(())
@@ -139,9 +156,13 @@ pub async fn take_rich_stack_trace(
     request: TakeRichStackTraceRequest,
 ) -> TakeRichStackTraceResponse {
     // The DWARF of the session, and of the cores that run another program binary.
-    let (session_debug_info, core_debug_info) = ctx
+    let (session_debug_info, core_debug_info, foreign) = ctx
         .with_server_debug_state(request.sessid, |state| {
-            (state.debug_info.clone(), state.core_debug_info.clone())
+            (
+                state.debug_info.clone(),
+                state.core_debug_info.clone(),
+                state.cores_without_session_debug_info.clone(),
+            )
         })
         .await;
 
@@ -172,7 +193,11 @@ pub async fn take_rich_stack_trace(
             // Sessions attached without a program binary have no DWARF. Unwind anyway: the
             // fallback unwinder still walks the call stack, reporting each frame's program
             // counter without a name or source location.
-            let debug_info = match core_debug_info.get(&idx).or(session_debug_info.as_ref()) {
+            // A core of another architecture does not use the session's DWARF.
+            let session_dwarf = session_debug_info
+                .as_ref()
+                .filter(|_| !foreign.contains(&idx));
+            let debug_info = match core_debug_info.get(&idx).or(session_dwarf) {
                 Some(debug_info) => debug_info.clone(),
                 None => Arc::new(DebugInfo::empty(core.endianness()?)),
             };

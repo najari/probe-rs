@@ -125,6 +125,8 @@ pub struct SessionTargetMetadata {
     pub target_name: String,
     pub default_format: Option<String>,
     pub cores: Vec<(usize, CoreType)>,
+    /// The name of each core in the target description, by core index.
+    pub core_names: HashMap<usize, String>,
 }
 
 /// A DAP backend that drives a remote target over RPC.
@@ -1117,6 +1119,11 @@ impl From<WireSessionTargetMetadata> for SessionTargetMetadata {
         Self {
             target_name: wire.target_name,
             default_format: wire.default_format,
+            core_names: wire
+                .cores
+                .iter()
+                .map(|core| (core.index as usize, core.name.clone()))
+                .collect(),
             cores: wire
                 .cores
                 .into_iter()
@@ -1238,10 +1245,12 @@ mod test {
                 WireSessionCore {
                     index: 0,
                     core_type: probe_rs_rpc::core_ops::WireCoreType::Armv7em,
+                    name: "core0".to_string(),
                 },
                 WireSessionCore {
                     index: 1,
                     core_type: probe_rs_rpc::core_ops::WireCoreType::Armv7em,
+                    name: "core1".to_string(),
                 },
             ],
             memory_map: vec![],

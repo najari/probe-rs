@@ -29,6 +29,8 @@ pub struct WireSessionTargetMetadata {
 pub struct WireSessionCore {
     pub index: u32,
     pub core_type: WireCoreType,
+    /// The name of the core in the target description (`cpu0`, `hsm`).
+    pub name: String,
 }
 
 #[derive(Serialize, Deserialize, Schema)]
@@ -268,6 +270,7 @@ mod tests {
             cores: vec![WireSessionCore {
                 index: 0,
                 core_type: WireCoreType::Armv7em,
+                name: "core0".to_string(),
             }],
             memory_map: vec![],
             flash_sectors: vec![WireFlashSector {
