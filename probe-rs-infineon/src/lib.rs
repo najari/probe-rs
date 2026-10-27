@@ -2,7 +2,8 @@
 //!
 //! - [`tas`]: a debug probe that reaches the device through an Infineon TAS server.
 //! - `mcd` (feature `mcd`): a debug probe that loads an MCD API library.
-//! - [`hsm`]: the HSM (Cortex-M3) through its debug memory window, and its breakpoints.
+//! - [`hsm`]: the HSM (Cortex-M3) through its debug memory window: memory, run control,
+//!   registers and breakpoints.
 //! - The AURIX targets (`targets/*.yaml`) and their debug sequences.
 //!
 //! Call [`register_plugin`] once at startup.

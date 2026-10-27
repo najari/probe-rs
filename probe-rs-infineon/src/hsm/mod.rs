@@ -13,6 +13,9 @@
 //! of the Cortex-M3 only compares the address bits 28:2, but the HSM code runs from the PFLASH at
 //! `0x80000000`. [`HsmFpb`] writes the three missing address bits 31:29 there.
 //!
+//! [`HsmCore`] halts, runs and single steps the core, moves its registers and sets breakpoints,
+//! through the debug registers in the window.
+//!
 //! Sources: the Infineon HSM sample code, AP32391 `hsm_Interface.h` (host side bridge registers,
 //! `DBGMEM` `0xF0050000`-`0xF005FFFF`) and `bridge.h` (`HSM_DBGMEM_Type`, 32 bits), AP32349
 //! `debugextension_hsm.h` and `debugextension_hsm_internal.h` (`FP_COMPH0`-`7` at `0xE0002028`,
@@ -20,6 +23,12 @@
 //! that `FP_COMPn.COMP` lacks), not written there; no HSM with HSM debug enabled was tried yet.
 
 use probe_rs::{Error, MemoryInterface};
+
+mod cpu;
+#[cfg(test)]
+mod fake;
+
+pub use cpu::{HsmCore, HsmCoreStatus, HsmHaltReason, HsmRegister};
 
 /// `HSM_ID`, the module identifier of the bridge (host side).
 pub const HSM_ID: u64 = 0xF004_0008;
@@ -416,106 +425,7 @@ impl HsmFpb {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use super::*;
-
-    /// The host bus of a TriCore core with the HSM bridge: `DBGBASE` and the window over a
-    /// sparse HSM memory. Every host write is logged.
-    #[derive(Default)]
-    struct Host {
-        /// HSM words by HSM address.
-        hsm: HashMap<u32, u32>,
-        /// The value of `DBGBASE`.
-        dbgbase: u32,
-        /// HSM debug is not enabled: `DBGBASE` and the window fail.
-        closed: bool,
-        writes: Vec<(u64, u32)>,
-    }
-
-    impl Host {
-        fn bus_error(address: u64) -> Error {
-            other(format!("bus error at {address:#010x}"))
-        }
-
-        fn read(&mut self, address: u64) -> Result<u32, Error> {
-            match address {
-                HSM_ID => Ok(0x00BE_C002),
-                DBGBASE if !self.closed => Ok(self.dbgbase),
-                a if (DBGMEM..DBGMEM + u64::from(WINDOW_SIZE)).contains(&a) && !self.closed => {
-                    let hsm = (self.dbgbase & 0xFFFF_0000) | (a - DBGMEM) as u32;
-                    Ok(self.hsm.get(&hsm).copied().unwrap_or(0))
-                }
-                _ => Err(Self::bus_error(address)),
-            }
-        }
-
-        fn write(&mut self, address: u64, value: u32) -> Result<(), Error> {
-            self.writes.push((address, value));
-            match address {
-                DBGBASE if !self.closed => {
-                    self.dbgbase = value & 0xFFFF_0000;
-                    Ok(())
-                }
-                a if (DBGMEM..DBGMEM + u64::from(WINDOW_SIZE)).contains(&a) && !self.closed => {
-                    let hsm = (self.dbgbase & 0xFFFF_0000) | (a - DBGMEM) as u32;
-                    self.hsm.insert(hsm, value);
-                    Ok(())
-                }
-                _ => Err(Self::bus_error(address)),
-            }
-        }
-
-        fn dbgbase_writes(&self) -> Vec<u32> {
-            self.writes
-                .iter()
-                .filter(|(address, _)| *address == DBGBASE)
-                .map(|(_, value)| *value)
-                .collect()
-        }
-    }
-
-    impl MemoryInterface for Host {
-        fn supports_native_64bit_access(&mut self) -> bool {
-            false
-        }
-        fn read_64(&mut self, _: u64, _: &mut [u64]) -> Result<(), Error> {
-            unreachable!("the window reads 32 bits")
-        }
-        fn read_32(&mut self, address: u64, data: &mut [u32]) -> Result<(), Error> {
-            for (i, word) in data.iter_mut().enumerate() {
-                *word = self.read(address + 4 * i as u64)?;
-            }
-            Ok(())
-        }
-        fn read_16(&mut self, _: u64, _: &mut [u16]) -> Result<(), Error> {
-            unreachable!("the window reads 32 bits")
-        }
-        fn read_8(&mut self, _: u64, _: &mut [u8]) -> Result<(), Error> {
-            unreachable!("the window reads 32 bits")
-        }
-        fn write_64(&mut self, _: u64, _: &[u64]) -> Result<(), Error> {
-            unreachable!("the window writes 32 bits")
-        }
-        fn write_32(&mut self, address: u64, data: &[u32]) -> Result<(), Error> {
-            for (i, word) in data.iter().enumerate() {
-                self.write(address + 4 * i as u64, *word)?;
-            }
-            Ok(())
-        }
-        fn write_16(&mut self, _: u64, _: &[u16]) -> Result<(), Error> {
-            unreachable!("the window writes 32 bits")
-        }
-        fn write_8(&mut self, _: u64, _: &[u8]) -> Result<(), Error> {
-            unreachable!("the window writes 32 bits")
-        }
-        fn supports_8bit_transfers(&self) -> Result<bool, Error> {
-            Ok(false)
-        }
-        fn flush(&mut self) -> Result<(), Error> {
-            Ok(())
-        }
-    }
+    use super::{fake::Host, *};
 
     #[test]
     fn the_status_tells_a_closed_window_from_an_open_one() {
