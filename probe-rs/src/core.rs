@@ -3,7 +3,10 @@ use crate::{
     architecture::{
         arm::sequences::{ArmDebugSequence, DefaultArmSequence},
         riscv::sequences::{DefaultRiscvSequence, RiscvDebugSequence},
-        tricore::sequences::{DefaultTriCoreSequence, TriCoreDebugSequence},
+        tricore::{
+            hsm::debug_core::TriCoreHsmState,
+            sequences::{DefaultTriCoreSequence, TriCoreDebugSequence},
+        },
         xtensa::sequences::{DefaultXtensaSequence, XtensaDebugSequence},
     },
     config::DebugSequence,
@@ -13,7 +16,7 @@ use crate::{
 pub use probe_rs_target::{Architecture, CoreAccessOptions};
 use probe_rs_target::{
     ArmCoreAccessOptions, MemoryRegion, RiscvCoreAccessOptions, TriCoreCoreAccessOptions,
-    XtensaCoreAccessOptions,
+    TriCoreHsmCoreAccessOptions, XtensaCoreAccessOptions,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -285,10 +288,16 @@ impl<'probe> Core<'probe> {
         target: &Target,
         core_type: CoreType,
     ) -> CombinedCoreState {
+        // The HSM of an AURIX is a Cortex-M core with a state of its own.
+        let specific_state = if matches!(options, CoreAccessOptions::TriCoreHsm(_)) {
+            SpecificCoreState::TriCoreHsm(TriCoreHsmState::new())
+        } else {
+            SpecificCoreState::from_core_type(core_type)
+        };
         CombinedCoreState {
             id,
             core_state: CoreState::new(ResolvedCoreOptions::new(target, options)),
-            specific_state: SpecificCoreState::from_core_type(core_type),
+            specific_state,
         }
     }
 
@@ -786,6 +795,10 @@ pub enum ResolvedCoreOptions {
         sequence: Arc<dyn TriCoreDebugSequence>,
         options: TriCoreCoreAccessOptions,
     },
+    /// The HSM of an AURIX, on the TriCore bus.
+    TriCoreHsm {
+        options: TriCoreHsmCoreAccessOptions,
+    },
 }
 
 impl ResolvedCoreOptions {
@@ -822,6 +835,7 @@ impl ResolvedCoreOptions {
                 };
                 Self::TriCore { sequence, options }
             }
+            CoreAccessOptions::TriCoreHsm(options) => Self::TriCoreHsm { options },
         }
     }
 
@@ -831,7 +845,7 @@ impl ResolvedCoreOptions {
             Self::Riscv { options, .. } => options.jtag_tap.unwrap_or(0),
             Self::Xtensa { options, .. } => options.jtag_tap.unwrap_or(0),
             // TriCore cores are reached through memory-mapped registers, not per-core TAPs.
-            Self::TriCore { .. } => 0,
+            Self::TriCore { .. } | Self::TriCoreHsm { .. } => 0,
         }
     }
 }
@@ -857,6 +871,10 @@ impl std::fmt::Debug for ResolvedCoreOptions {
             Self::TriCore { options, .. } => f
                 .debug_struct("TriCore")
                 .field("sequence", &"<TriCoreDebugSequence>")
+                .field("options", options)
+                .finish(),
+            Self::TriCoreHsm { options } => f
+                .debug_struct("TriCoreHsm")
                 .field("options", options)
                 .finish(),
         }

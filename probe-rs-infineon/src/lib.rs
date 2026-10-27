@@ -19,7 +19,7 @@ use probe_rs::{
     probe::{DebugProbe, Probe},
     vendor::Vendor,
 };
-use probe_rs_target::{Chip, ChipFamily, CoreType};
+use probe_rs_target::{Chip, ChipFamily, CoreAccessOptions, CoreType};
 
 pub mod device_config;
 pub mod flash;
@@ -103,6 +103,16 @@ impl AurixSequence {
     }
 }
 
+/// Whether the target `chip` is the chip `found`: its name, or a variant of it such as
+/// `TC36x_HSM`.
+fn same_chip(found: &str, chip: &str) -> bool {
+    let (found, chip) = (found.to_ascii_uppercase(), chip.to_ascii_uppercase());
+    chip == found
+        || chip
+            .strip_prefix(&found)
+            .is_some_and(|rest| rest.starts_with('_'))
+}
+
 /// Whether `name` is a chip of the AURIX TC3xx family.
 fn is_tc3xx(name: &str) -> bool {
     name.to_ascii_uppercase().starts_with("TC3")
@@ -118,7 +128,7 @@ impl TriCoreDebugSequence for AurixSequence {
     ) -> Result<(), Error> {
         let jtag_id = bus.jtag_id()?;
         match target_by_jtag_id(jtag_id) {
-            Some(found) if !found.eq_ignore_ascii_case(&self.chip) => Err(Error::Other(format!(
+            Some(found) if !same_chip(found, &self.chip) => Err(Error::Other(format!(
                 "the target is {}, but the connected device (JTAG ID {jtag_id:#010x}) is a \
                  {found}: use the {found} configuration",
                 self.chip
@@ -142,11 +152,11 @@ struct InfineonAurix;
 
 impl Vendor for InfineonAurix {
     fn try_create_debug_sequence(&self, chip: &Chip) -> Option<DebugSequence> {
-        if chip
-            .cores
-            .iter()
-            .all(|core| core.core_type == CoreType::TriCore)
-        {
+        // The HSM core of a `_HSM` variant goes with the TriCore cores.
+        if chip.cores.iter().all(|core| {
+            core.core_type == CoreType::TriCore
+                || matches!(core.core_access_options, CoreAccessOptions::TriCoreHsm(_))
+        }) {
             Some(DebugSequence::TriCore(AurixSequence::create(&chip.name)))
         } else {
             None

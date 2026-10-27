@@ -15,7 +15,7 @@ variants:
     core_access_options: !TriCore
       core_index: 1
       csfr_base: 0xf8830000
-  memory_map:
+  memory_map: &tc36x_memory_map
   # Program flash: PF0 and PF1, 2 MiB each, at the 3 MiB bank stride of the TC3xx (the AURIX
   # Flasher device file `TC36x_A_step.json`). Code is usually linked at the cached addresses
   # (0x8...), the non-cached alias (0xA...) is the same memory. Logical sectors are 16 KiB.
@@ -100,6 +100,30 @@ variants:
     cores:
     - cpu0
     - cpu1
+  flash_algorithms:
+  - tc36x-pflash
+  - tc36x-pflash-uncached
+# The same chip with its HSM, a Cortex-M3, as a third core: probe-rs reaches it through the HSM
+# debug memory window on the TriCore bus (`probe_rs::architecture::tricore::hsm`). The window
+# opens only once the HSM firmware enabled HSM debug; until then the core is disabled
+# (`Error::CoreDisabled`) and the TriCore cores work as with `TC36x`. Not tried on an HSM with
+# HSM debug enabled yet.
+- name: TC36x_HSM
+  cores:
+  - name: cpu0
+    type: tricore
+    core_access_options: !TriCore
+      core_index: 0
+      csfr_base: 0xf8810000
+  - name: cpu1
+    type: tricore
+    core_access_options: !TriCore
+      core_index: 1
+      csfr_base: 0xf8830000
+  - name: hsm
+    type: armv7m
+    core_access_options: !TriCoreHsm {}
+  memory_map: *tc36x_memory_map
   flash_algorithms:
   - tc36x-pflash
   - tc36x-pflash-uncached

@@ -10,6 +10,7 @@ use crate::{
         tricore::{
             TriCore, TriCoreCoreState,
             bus::{TriCoreBusAccess, TriCoreError},
+            hsm::debug_core::{TriCoreHsm, TriCoreHsmState},
         },
         xtensa::{
             XtensaCoreState,
@@ -291,6 +292,7 @@ impl CombinedCoreState {
         bus: &mut dyn TriCoreBusAccess,
         join: bool,
     ) -> Result<(), Error> {
+        self.require_tricore()?;
         Ok(self.tricore(target, bus).set_halt_group(join)?)
     }
 
@@ -302,6 +304,7 @@ impl CombinedCoreState {
         bus: &mut dyn TriCoreBusAccess,
         window: Option<(u32, u32)>,
     ) -> Result<(), Error> {
+        self.require_tricore()?;
         Ok(self.tricore(target, bus).set_perf_window(window)?)
     }
 
@@ -393,6 +396,38 @@ impl CombinedCoreState {
     /// Whether this is a TriCore core that this session put in the halt group.
     pub(crate) fn tricore_in_halt_group(&self) -> bool {
         matches!(&self.specific_state, SpecificCoreState::TriCore(state) if state.in_halt_group())
+    }
+
+    /// Refuses a core that is not a TriCore core (the HSM of a TriCore target).
+    fn require_tricore(&self) -> Result<(), Error> {
+        match &self.specific_state {
+            SpecificCoreState::TriCore(_) => Ok(()),
+            _ => Err(TriCoreError::NoTriCoreTarget.into()),
+        }
+    }
+
+    /// Whether this is the HSM core of a TriCore target.
+    pub(crate) fn is_tricore_hsm(&self) -> bool {
+        matches!(&self.specific_state, SpecificCoreState::TriCoreHsm(_))
+    }
+
+    /// The HSM core on the TriCore bus; [`Error::CoreDisabled`] while its debug window is closed
+    /// (the HSM firmware did not enable HSM debug).
+    pub(crate) fn attach_tricore_hsm<'probe>(
+        &'probe mut self,
+        target: &'probe Target,
+        bus: &'probe mut dyn TriCoreBusAccess,
+    ) -> Result<Core<'probe>, Error> {
+        let id = self.id;
+        let name = &target.cores[id].name;
+        let SpecificCoreState::TriCoreHsm(state) = &mut self.specific_state else {
+            unreachable!(
+                "The stored core state is not the one of an HSM core. \
+                This should never happen. Please file a bug if it does."
+            );
+        };
+        let hsm = TriCoreHsm::attach(bus, state).ok_or(Error::CoreDisabled(id))?;
+        Ok(Core::new(id, name, target, hsm))
     }
 
     fn tricore<'probe>(
@@ -508,6 +543,8 @@ pub enum SpecificCoreState {
     Xtensa(XtensaCoreState),
     /// The state of a TriCore core (boxed: it holds the breakpoint slots and the trigger units).
     TriCore(Box<TriCoreCoreState>),
+    /// The state of the HSM of an AURIX, a Cortex-M core on the TriCore bus.
+    TriCoreHsm(TriCoreHsmState),
 }
 
 impl SpecificCoreState {
@@ -540,6 +577,7 @@ impl SpecificCoreState {
             SpecificCoreState::Riscv64(_) => CoreType::Riscv64,
             SpecificCoreState::Xtensa(_) => CoreType::Xtensa,
             SpecificCoreState::TriCore(_) => CoreType::TriCore,
+            SpecificCoreState::TriCoreHsm(_) => CoreType::Armv7m,
         }
     }
 }

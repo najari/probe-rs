@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use probe_rs::{Error, MemoryInterface};
+use crate::{Error, MemoryInterface};
 
 use super::{DBGBASE, DBGMEM, HSM_ID, HsmFpb, WINDOW_SIZE, other};
 

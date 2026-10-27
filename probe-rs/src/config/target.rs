@@ -154,13 +154,23 @@ impl Target {
     }
 
     /// Get the architecture of the target
+    ///
+    /// The HSM of an AURIX (a Cortex-M core reached through the TriCore bus) is part of a
+    /// TriCore target: it does not count.
     pub fn architecture(&self) -> Architecture {
-        let target_arch = self.cores[0].core_type.architecture();
+        let mut cores = self
+            .cores
+            .iter()
+            .filter(|core| !matches!(core.core_access_options, CoreAccessOptions::TriCoreHsm(_)));
+        let target_arch = cores
+            .next()
+            .unwrap_or(&self.cores[0])
+            .core_type
+            .architecture();
 
         // This should be ensured when a `ChipFamily` is loaded.
         assert!(
-            self.cores
-                .iter()
+            cores
                 .map(|core| core.core_type.architecture())
                 .all(|core_arch| core_arch == target_arch),
             "Not all cores of the target are of the same architecture. Probe-rs doesn't support this (yet). If you see this, it is a bug. Please file an issue."
@@ -199,7 +209,7 @@ impl Target {
                 CoreAccessOptions::Riscv(options) => options.jtag_tap,
                 CoreAccessOptions::Xtensa(options) => options.jtag_tap,
                 // Not reached over a JTAG scan chain of its own.
-                CoreAccessOptions::TriCore(_) => return true,
+                CoreAccessOptions::TriCore(_) | CoreAccessOptions::TriCoreHsm(_) => return true,
             };
             jtag_tap.unwrap_or(0) < scan_chain.len()
         })
@@ -371,7 +381,8 @@ impl MemoryApExt for Core {
                 .as_ref()
                 .map(|ap| fully_qualified_ap(None, ap)),
             probe_rs_target::CoreAccessOptions::Xtensa(_) => None,
-            probe_rs_target::CoreAccessOptions::TriCore(_) => None,
+            probe_rs_target::CoreAccessOptions::TriCore(_)
+            | probe_rs_target::CoreAccessOptions::TriCoreHsm(_) => None,
         }
     }
 }

@@ -22,13 +22,15 @@
 //! 3 writable bits). That `FP_COMPHn` holds the address bits 31:29 is inferred (the three bits
 //! that `FP_COMPn.COMP` lacks), not written there; no HSM with HSM debug enabled was tried yet.
 
-use probe_rs::{Error, MemoryInterface};
+use crate::{Error, MemoryInterface, memory::MemoryNotAlignedError};
 
 mod cpu;
+pub(crate) mod debug_core;
 #[cfg(test)]
 mod fake;
 
 pub use cpu::{HsmCore, HsmCoreStatus, HsmHaltReason, HsmRegister};
+pub use debug_core::TriCoreBusMemory;
 
 /// `HSM_ID`, the module identifier of the bridge (host side).
 pub const HSM_ID: u64 = 0xF004_0008;
@@ -76,15 +78,23 @@ impl HsmStatus {
 /// Every access is made of aligned 32-bit window accesses, the width of `DBGMEM`. 8 and 16 bit
 /// writes read, change and write back the word they are in: debug registers such as `DHCSR`
 /// must be written as whole words.
-pub struct HsmWindow<'a, H: MemoryInterface + ?Sized> {
-    host: &'a mut H,
+///
+/// The window owns `host`; [`HostRef`] lends one that is borrowed.
+pub struct HsmWindow<H: MemoryInterface> {
+    host: H,
     /// The page `DBGBASE` was last set to; `None` until it is set, or when it may have changed.
     page: Option<u32>,
 }
 
-impl<'a, H: MemoryInterface + ?Sized> HsmWindow<'a, H> {
-    pub fn new(host: &'a mut H) -> Self {
+impl<H: MemoryInterface> HsmWindow<H> {
+    /// The HSM address space through `host`.
+    pub fn new(host: H) -> Self {
         Self { host, page: None }
+    }
+
+    /// The host bus.
+    pub fn host(&mut self) -> &mut H {
+        &mut self.host
     }
 
     /// Forgets the page `DBGBASE` shows, so that the next access sets it again: after a reset
@@ -196,14 +206,11 @@ fn aligned(address: u64, alignment: usize) -> Result<(), Error> {
     if address.is_multiple_of(alignment as u64) {
         Ok(())
     } else {
-        // `MemoryNotAlignedError` is not public outside probe-rs.
-        Err(other(format!(
-            "memory access to address {address:#x} was not aligned to {alignment} bytes"
-        )))
+        Err(MemoryNotAlignedError { address, alignment }.into())
     }
 }
 
-impl<H: MemoryInterface + ?Sized> MemoryInterface for HsmWindow<'_, H> {
+impl<H: MemoryInterface> MemoryInterface for HsmWindow<H> {
     fn supports_native_64bit_access(&mut self) -> bool {
         false
     }
@@ -270,6 +277,46 @@ impl<H: MemoryInterface + ?Sized> MemoryInterface for HsmWindow<'_, H> {
 
     fn flush(&mut self) -> Result<(), Error> {
         self.host.flush()
+    }
+}
+
+/// Lends a borrowed memory interface to an [`HsmWindow`] or an [`HsmCore`], which own theirs:
+/// `HsmCore::new(HostRef(&mut core))` for a [`Core`](crate::Core) of the TriCore.
+pub struct HostRef<'a, T: MemoryInterface + ?Sized>(pub &'a mut T);
+
+impl<T: MemoryInterface + ?Sized> MemoryInterface for HostRef<'_, T> {
+    fn supports_native_64bit_access(&mut self) -> bool {
+        self.0.supports_native_64bit_access()
+    }
+    fn read_64(&mut self, address: u64, data: &mut [u64]) -> Result<(), Error> {
+        self.0.read_64(address, data)
+    }
+    fn read_32(&mut self, address: u64, data: &mut [u32]) -> Result<(), Error> {
+        self.0.read_32(address, data)
+    }
+    fn read_16(&mut self, address: u64, data: &mut [u16]) -> Result<(), Error> {
+        self.0.read_16(address, data)
+    }
+    fn read_8(&mut self, address: u64, data: &mut [u8]) -> Result<(), Error> {
+        self.0.read_8(address, data)
+    }
+    fn write_64(&mut self, address: u64, data: &[u64]) -> Result<(), Error> {
+        self.0.write_64(address, data)
+    }
+    fn write_32(&mut self, address: u64, data: &[u32]) -> Result<(), Error> {
+        self.0.write_32(address, data)
+    }
+    fn write_16(&mut self, address: u64, data: &[u16]) -> Result<(), Error> {
+        self.0.write_16(address, data)
+    }
+    fn write_8(&mut self, address: u64, data: &[u8]) -> Result<(), Error> {
+        self.0.write_8(address, data)
+    }
+    fn supports_8bit_transfers(&self) -> Result<bool, Error> {
+        self.0.supports_8bit_transfers()
+    }
+    fn flush(&mut self) -> Result<(), Error> {
+        self.0.flush()
     }
 }
 
@@ -427,6 +474,10 @@ impl HsmFpb {
 mod tests {
     use super::{fake::Host, *};
 
+    fn window(host: &mut Host) -> HsmWindow<HostRef<'_, Host>> {
+        HsmWindow::new(HostRef(host))
+    }
+
     #[test]
     fn the_status_tells_a_closed_window_from_an_open_one() {
         let mut host = Host {
@@ -447,7 +498,7 @@ mod tests {
     fn a_debug_register_is_read_through_its_page() {
         let mut host = Host::default();
         host.hsm.insert(0xE000_EDF0, 0x0003_0003);
-        let mut window = HsmWindow::new(&mut host);
+        let mut window = window(&mut host);
         // DHCSR: DBGBASE 0xE0000000, host 0xF005EDF0.
         assert_eq!(window.read_word_32(0xE000_EDF0).unwrap(), 0x0003_0003);
         assert_eq!(window.read_word_32(0xE000_EDFC).unwrap(), 0);
@@ -462,7 +513,7 @@ mod tests {
         let mut host = Host::default();
         host.hsm.insert(0x2000_FFFC, 0x1111_1111);
         host.hsm.insert(0x2001_0000, 0x2222_2222);
-        let mut window = HsmWindow::new(&mut host);
+        let mut window = window(&mut host);
         let mut words = [0u32; 2];
         window.read_32(0x2000_FFFC, &mut words).unwrap();
         assert_eq!(words, [0x1111_1111, 0x2222_2222]);
@@ -480,7 +531,7 @@ mod tests {
         let mut host = Host::default();
         host.hsm.insert(0x2000_0000, 0x4433_2211);
         host.hsm.insert(0x2000_0004, 0x8877_6655);
-        let mut window = HsmWindow::new(&mut host);
+        let mut window = window(&mut host);
         let mut bytes = [0u8; 4];
         window.read_8(0x2000_0002, &mut bytes).unwrap();
         assert_eq!(bytes, [0x33, 0x44, 0x55, 0x66]);
@@ -505,10 +556,10 @@ mod tests {
             closed: true,
             ..Host::default()
         };
-        let mut window = HsmWindow::new(&mut host);
+        let mut window = window(&mut host);
         assert!(window.read_word_32(0xE000_EDF0).is_err());
         assert_eq!(window.page, None, "a failed DBGBASE write leaves no page");
-        window.host.closed = false;
+        window.host.0.closed = false;
         window.read_word_32(0xE000_EDF0).unwrap();
         window.invalidate();
         window.read_word_32(0xE000_EDF0).unwrap();
@@ -521,7 +572,7 @@ mod tests {
     #[test]
     fn addresses_past_32_bits_are_refused() {
         let mut host = Host::default();
-        let mut window = HsmWindow::new(&mut host);
+        let mut window = window(&mut host);
         assert!(window.read_word_32(0x1_0000_0000).is_err());
         let mut words = [0u32; 2];
         assert!(window.read_32(0xFFFF_FFFC, &mut words).is_err());
@@ -581,7 +632,7 @@ mod tests {
     fn breakpoints_are_set_and_cleared_through_the_window() {
         let mut host = Host::default();
         host.hsm.insert(0xE000_2000, 0x0000_0260);
-        let mut window = HsmWindow::new(&mut host);
+        let mut window = window(&mut host);
         let fpb = HsmFpb::read(&mut window).unwrap();
         fpb.enable(&mut window).unwrap();
         fpb.set_breakpoint(&mut window, 5, 0x8000_4002).unwrap();

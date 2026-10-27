@@ -193,6 +193,9 @@ pub enum CoreAccessOptions {
     Xtensa(XtensaCoreAccessOptions),
     /// TriCore specific options
     TriCore(TriCoreCoreAccessOptions),
+    /// The HSM of an AURIX, a Cortex-M core (`type: armv7m`) reached through its debug memory
+    /// window on the TriCore bus, not through an ARM debug port.
+    TriCoreHsm(TriCoreHsmCoreAccessOptions),
 }
 
 /// An address for AP accesses
@@ -277,6 +280,14 @@ pub struct TriCoreCoreAccessOptions {
     #[serde(serialize_with = "hex_u_int")]
     pub csfr_base: u64,
 }
+
+/// The data required to access the HSM core of an AURIX
+///
+/// The HSM block on the SPB holds the debug memory window (`DBGBASE`, `DBGMEM`) through which
+/// the debugger reaches the Cortex-M debug registers of the HSM.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TriCoreHsmCoreAccessOptions {}
 
 /// Xtensa CPU properties from a target description
 #[derive(Debug, Clone, Serialize, Deserialize)]

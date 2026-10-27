@@ -181,7 +181,11 @@ impl ArchitectureInterface {
             }
             ArchitectureInterface::TriCore(probe) => {
                 let bus = probe.try_get_tricore_bus()?;
-                combined_state.attach_tricore(target, bus)
+                if combined_state.is_tricore_hsm() {
+                    combined_state.attach_tricore_hsm(target, bus)
+                } else {
+                    combined_state.attach_tricore(target, bus)
+                }
             }
         }
     }

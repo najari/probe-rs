@@ -3,7 +3,7 @@ use crate::serialize::hex_jep106_option;
 use crate::{CoreAccessOptions, chip_detection::ChipDetectionMethod};
 use crate::{MemoryRange, MemoryRegion};
 
-use super::chip::Chip;
+use super::chip::{Chip, Core};
 use super::flash_algorithm::RawFlashAlgorithm;
 use jep106::JEP106Code;
 
@@ -314,19 +314,28 @@ impl ChipFamily {
     // Check that there is at least one core.
     fn ensure_at_least_one_core(&self) -> Result<(), String> {
         for variant in &self.variants {
-            let Some(core) = variant.cores.first() else {
+            if variant.cores.is_empty() {
                 return Err(format!(
                     "variant `{}` does not contain any cores",
                     variant.name
                 ));
-            };
+            }
 
-            // Make sure that the core types (architectures) are not mixed.
-            let architecture = core.core_type.architecture();
-            if variant
-                .cores
-                .iter()
-                .any(|core| core.core_type.architecture() != architecture)
+            // Make sure that the core types (architectures) are not mixed. The HSM of an AURIX
+            // (a Cortex-M core reached through the TriCore bus) goes with TriCore cores only.
+            let is_hsm =
+                |core: &&Core| matches!(core.core_access_options, CoreAccessOptions::TriCoreHsm(_));
+            let mut main = variant.cores.iter().filter(|core| !is_hsm(core));
+            let Some(first) = main.next() else {
+                return Err(format!(
+                    "variant `{}` contains only HSM cores",
+                    variant.name
+                ));
+            };
+            let architecture = first.core_type.architecture();
+            let has_hsm = variant.cores.iter().any(|core| is_hsm(&core));
+            if main.any(|core| core.core_type.architecture() != architecture)
+                || (has_hsm && architecture != Architecture::TriCore)
             {
                 return Err(format!(
                     "variant `{}` contains mixed core architectures",
@@ -367,6 +376,12 @@ impl ChipFamily {
                     CoreAccessOptions::TriCore(_) if !core.core_type.is_tricore() => {
                         return Err(format!(
                             "TriCore options don't match core type {:?} on core {}",
+                            core.core_type, core.name
+                        ));
+                    }
+                    CoreAccessOptions::TriCoreHsm(_) if core.core_type != CoreType::Armv7m => {
+                        return Err(format!(
+                            "TriCoreHsm options need core type armv7m, not {:?}, on core {}",
                             core.core_type, core.name
                         ));
                     }
@@ -610,6 +625,75 @@ variants:
             .validate()
             .expect_err("memory port named like a core should be rejected");
         assert!(error.contains("memory port name core0 is not unique"));
+    }
+
+    fn family_with_cores(cores: &[String]) -> ChipFamily {
+        let cores = cores.concat();
+        let yaml = format!(
+            r#"
+name: Test Family
+variants:
+- name: TestChip
+  cores:
+{cores}  memory_map:
+  - !Ram
+    range:
+      start: 0x0
+      end: 0x1000
+    cores:
+    - cpu0
+"#
+        );
+        yaml_serde::from_str(&yaml).expect("test family YAML should parse")
+    }
+
+    fn tricore(name: &str) -> String {
+        format!(
+            "  - name: {name}\n    type: tricore\n    core_access_options: !TriCore\n      \
+             core_index: 0\n      csfr_base: 0xf8810000\n"
+        )
+    }
+
+    fn hsm(name: &str, core_type: &str) -> String {
+        format!(
+            "  - name: {name}\n    type: {core_type}\n    core_access_options: !TriCoreHsm {{}}\n"
+        )
+    }
+
+    fn arm(name: &str) -> String {
+        format!(
+            "  - name: {name}\n    type: armv7m\n    core_access_options: !Arm\n      ap: !v1 0\n"
+        )
+    }
+
+    #[test]
+    fn an_hsm_core_goes_with_tricore_cores() {
+        family_with_cores(&[tricore("cpu0"), hsm("hsm", "armv7m")])
+            .validate()
+            .expect("TriCore cores with an HSM core should be valid");
+    }
+
+    #[test]
+    fn an_hsm_core_must_be_armv7m() {
+        let error = family_with_cores(&[tricore("cpu0"), hsm("hsm", "armv8m")])
+            .validate()
+            .expect_err("an HSM core of another type should be rejected");
+        assert!(
+            error.contains("TriCoreHsm options need core type armv7m"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_hsm_core_does_not_go_with_arm_cores() {
+        let error = family_with_cores(&[arm("cpu0"), hsm("hsm", "armv7m")])
+            .validate()
+            .expect_err("an HSM core next to Arm cores should be rejected");
+        assert!(error.contains("mixed core architectures"), "{error}");
+        let error = family_with_cores(&[hsm("cpu0", "armv7m")])
+            .validate()
+            .expect_err("an HSM core alone should be rejected");
+        assert!(error.contains("only HSM cores"), "{error}");
     }
 
     #[test]

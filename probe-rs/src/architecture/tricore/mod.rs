@@ -27,6 +27,7 @@ use crate::{
 };
 
 pub mod bus;
+pub mod hsm;
 mod journal;
 pub mod registers;
 pub mod sequences;

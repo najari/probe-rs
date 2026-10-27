@@ -275,7 +275,7 @@ pub trait TriCoreBusAccess: Send + std::fmt::Debug {
 }
 
 /// Runs `transfers` in batches of at most `limits.max_transfers`.
-fn execute_all<B: TriCoreBusAccess + ?Sized>(
+pub(crate) fn execute_all<B: TriCoreBusAccess + ?Sized>(
     bus: &mut B,
     transfers: &mut [BusTransfer],
     limits: BusLimits,
