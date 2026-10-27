@@ -626,6 +626,160 @@ impl HsmProtection {
     }
 }
 
+/// `FLASH0_FPRO`, then `FLASH0_PROCONP0` (TC27x user's manual, 10-71 and 10-75): the protection
+/// state of the PFLASH.
+const FLASH0_FPRO: u64 = 0xF800_201C;
+/// `FLASH0_PROCONHSMCOTP` (TC27x user's manual, 10-83): the HSM protection of the PFLASH.
+const FLASH0_PROCONHSMCOTP: u64 = 0xF800_2034;
+/// The HSM code sectors of the TC27x: PF0 S6, S16 and S17 (TC27x user's manual 10.5.5.3,
+/// AP32284), with their `HSMxX` and `SxROM` bits of `PROCONHSMCOTP`.
+const TC27X_HSM_SECTORS: [(&str, Sector, u32, u32); 3] = [
+    (
+        "S6",
+        Sector {
+            base: 0xA001_8000,
+            size: 0x4000,
+        },
+        3,
+        6,
+    ),
+    (
+        "S16",
+        Sector {
+            base: 0xA006_0000,
+            size: 0x1_0000,
+        },
+        4,
+        16,
+    ),
+    (
+        "S17",
+        Sector {
+            base: 0xA007_0000,
+            size: 0x1_0000,
+        },
+        5,
+        17,
+    ),
+];
+
+/// The HSM and read protection of a TC27x PFLASH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Tc27xProtection {
+    /// `PROCONHSMCOTP`: `HSMBOOTEN` (bit 0), `SSWWAIT` (1), `HSM6X`/`HSM16X`/`HSM17X` (3-5),
+    /// `S6ROM` (6), `S16ROM` (16), `S17ROM` (17).
+    pub hsm_cotp: u32,
+    /// `PROCONP0.RPRO` (bit 31): the PFLASH is read and write protected.
+    pub read_protected: bool,
+    /// `FPRO.PRODISP` (bit 1): the protection is disabled with its password.
+    pub protection_disabled: bool,
+    /// `FPRO.DDFPX` (bit 18): masters other than CPU0, the debugger among them, cannot read
+    /// the PFLASH.
+    pub reads_disabled: bool,
+}
+
+impl Tc27xProtection {
+    /// From `FLASH0_FPRO`, `FLASH0_PROCONP0` and `FLASH0_PROCONHSMCOTP`.
+    pub fn from_words(fpro: u32, proconp0: u32, hsm_cotp: u32) -> Self {
+        Self {
+            hsm_cotp,
+            read_protected: proconp0 & (1 << 31) != 0,
+            protection_disabled: fpro & (1 << 1) != 0,
+            reads_disabled: fpro & (1 << 18) != 0,
+        }
+    }
+
+    /// `HSMBOOTEN`: the startup software boots the HSM.
+    pub fn boot(&self) -> bool {
+        self.hsm_cotp & 1 != 0
+    }
+
+    /// `SSWWAIT`: CPU0 starts the application only once the HSM lets it.
+    pub fn ssw_wait(&self) -> bool {
+        self.hsm_cotp & 2 != 0
+    }
+
+    /// Why `sector` must not be erased, if it must not. `allow_code` lets the HSM code sectors
+    /// of a booting HSM go ([`ALLOW_HSM_CODE_ERASE_ENV`]).
+    pub fn refusal(&self, sector: Sector, allow_code: bool) -> Option<String> {
+        if self.reads_disabled {
+            return Some(
+                "the debugger cannot read the PFLASH (FLASH0_FPRO.DDFPX): its content cannot be \
+                 read to back it up; remove the read protection with its password first"
+                    .into(),
+            );
+        }
+        if self.read_protected && !self.protection_disabled {
+            return Some(
+                "the PFLASH is read and write protected (FLASH0_PROCONP0.RPRO) and the \
+                 protection is not disabled with its password (FLASH0_FPRO.PRODISP): erase and \
+                 program fail with PROER"
+                    .into(),
+            );
+        }
+        let end = u64::from(sector.base) + u64::from(sector.size);
+        let (name, hsm, exclusive, rom) = TC27X_HSM_SECTORS.iter().find(|(_, hsm, _, _)| {
+            u64::from(hsm.base) < end
+                && u64::from(sector.base) < u64::from(hsm.base) + u64::from(hsm.size)
+        })?;
+        if self.hsm_cotp & (1 << rom) != 0 {
+            return Some(format!(
+                "sector {:#010x} (PF0 {name}) is locked forever (FLASH0_PROCONHSMCOTP.{name}ROM): \
+                 nobody can erase or program it",
+                hsm.base
+            ));
+        }
+        if self.hsm_cotp & (1 << exclusive) != 0 {
+            return Some(format!(
+                "sector {:#010x} (PF0 {name}) is HSM exclusive (FLASH0_PROCONHSMCOTP.HSM{}X): only \
+                 the HSM can erase or program it",
+                hsm.base,
+                &name[1..]
+            ));
+        }
+        if self.boot() && !allow_code {
+            return Some(format!(
+                "sector {:#010x} (PF0 {name}) is one of the HSM code sectors S6, S16 and S17, and \
+                 the HSM boots (FLASH0_PROCONHSMCOTP.HSMBOOTEN): without HSM code the startup \
+                 software stops and the device does not start any more. Set \
+                 {ALLOW_HSM_CODE_ERASE_ENV}=1 only if the image holds valid HSM code",
+                hsm.base
+            ));
+        }
+        None
+    }
+}
+
+/// The PFLASH protection of the connected device, read when the loader starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PflashProtection {
+    Tc36x(HsmProtection),
+    Tc27x(Tc27xProtection),
+}
+
+impl PflashProtection {
+    fn refusal(&self, sector: Sector, allow_code: bool) -> Option<String> {
+        match self {
+            Self::Tc36x(hsm) => hsm.refusal(sector, allow_code),
+            Self::Tc27x(protection) => protection.refusal(sector, allow_code),
+        }
+    }
+
+    fn boot(&self) -> bool {
+        match self {
+            Self::Tc36x(hsm) => hsm.boot,
+            Self::Tc27x(protection) => protection.boot(),
+        }
+    }
+
+    fn ssw_wait(&self) -> bool {
+        match self {
+            Self::Tc36x(hsm) => hsm.ssw_wait,
+            Self::Tc27x(protection) => protection.ssw_wait(),
+        }
+    }
+}
+
 /// The names of the error bits of a loader status: `DMU_HF_ERRSR` on the TC3xx, `FLASH0_FSR`
 /// (bits 11-13) on the TC27x.
 fn status_text(device: FlashDevice, status: u32) -> String {
@@ -840,8 +994,8 @@ pub struct AurixFlash {
     /// Whether this download restores the bytes the image does not set (`--restore-unwritten`:
     /// probe-rs read them through [`DebugFlashSequence::read_unwritten`]).
     restoring: std::sync::atomic::AtomicBool,
-    /// The HSM protection of the connected TC3xx, read when the loader starts.
-    hsm: Mutex<Option<HsmProtection>>,
+    /// The HSM and read protection of the connected device, read when the loader starts.
+    hsm: Mutex<Option<PflashProtection>>,
 }
 
 /// The JSON backup of a sector: its pages as read before the erase (`None`: erased).
@@ -964,25 +1118,45 @@ impl AurixFlash {
             map.dflash.len(),
             chip_id.map_or("?".into(), |c| format!("{c:#010x}"))
         );
-        let hsm = if map.device == FlashDevice::Tc36x {
-            let mut core = session.core(0)?;
-            let mut words = [0; 4];
-            core.read_32(DMU_SP_PROCONHSMCFG, &mut words)?;
-            let proconpf = core.read_word_32(DMU_HF_PROCONPF)?;
-            let hsm = HsmProtection::from_words(words[0], words[1], words[2], words[3], proconpf);
-            if hsm != HsmProtection::default() {
-                tracing::info!("HSM protection of the PFLASH: {hsm:?}");
+        let mut core = session.core(0)?;
+        let hsm = match map.device {
+            FlashDevice::Tc36x => {
+                let mut words = [0; 4];
+                core.read_32(DMU_SP_PROCONHSMCFG, &mut words)?;
+                let proconpf = core.read_word_32(DMU_HF_PROCONPF)?;
+                let hsm =
+                    HsmProtection::from_words(words[0], words[1], words[2], words[3], proconpf);
+                if hsm != HsmProtection::default() {
+                    tracing::info!("HSM protection of the PFLASH: {hsm:?}");
+                }
+                PflashProtection::Tc36x(hsm)
             }
-            Some(hsm)
-        } else {
-            None
+            FlashDevice::Tc27x => {
+                let mut words = [0; 2];
+                core.read_32(FLASH0_FPRO, &mut words)?;
+                let hsm_cotp = core.read_word_32(FLASH0_PROCONHSMCOTP)?;
+                let protection = Tc27xProtection::from_words(words[0], words[1], hsm_cotp);
+                if protection != Tc27xProtection::default() {
+                    tracing::info!("Protection of the PFLASH: {protection:?}");
+                }
+                if protection.boot() {
+                    // Erratum FLASH_TC.H009 (TC27x CA errata 4.76).
+                    tracing::warn!(
+                        "The HSM boots (FLASH0_PROCONHSMCOTP.HSMBOOTEN): while the PFLASH is \
+                         erased or programmed, the HSM cannot read its code sectors and stops \
+                         unless it runs from its RAM (erratum FLASH_TC.H009)"
+                    );
+                }
+                PflashProtection::Tc27x(protection)
+            }
         };
+        let hsm = Some(hsm);
         *self.hsm.lock().unwrap_or_else(|e| e.into_inner()) = hsm;
         *self.map.lock().unwrap_or_else(|e| e.into_inner()) = Some(map);
         Ok(())
     }
 
-    /// Refuses to erase `sector` where the HSM protection does not allow it (TC3xx).
+    /// Refuses to erase `sector` where the HSM or read protection does not allow it.
     fn check_hsm(&self, sector: Sector) -> Result<(), Error> {
         let hsm = *self.hsm.lock().unwrap_or_else(|e| e.into_inner());
         let allow = std::env::var_os(ALLOW_HSM_CODE_ERASE_ENV).is_some_and(|v| !v.is_empty());
@@ -1300,7 +1474,7 @@ impl AurixFlash {
             }
         }
         let hsm = *self.hsm.lock().unwrap_or_else(|e| e.into_inner());
-        if hsm.is_some_and(|hsm| hsm.boot && hsm.ssw_wait) {
+        if hsm.is_some_and(|hsm| hsm.boot() && hsm.ssw_wait()) {
             tracing::warn!(
                 "The HSM holds CPU0 at startup (SSWWAIT): a secure boot may not start the new \
                  image until its MAC is updated"
@@ -1672,6 +1846,48 @@ mod tests {
         // The read protection refuses every sector.
         let hsm = HsmProtection::from_words(0, 0, 0, 0, 1 << 31);
         assert!(hsm.refusal(above, false).unwrap().contains("RPRO"));
+    }
+
+    #[test]
+    fn tc27x_hsm_and_read_protection_refuse_sectors() {
+        let sectors = tc27x_sectors();
+        let s = |n: usize| sectors[n];
+        // This board (2026-10-27): FPRO 0x004000a0, PROCONP0 0, PROCONHSMCOTP 0.
+        let board = Tc27xProtection::from_words(0x0040_00A0, 0, 0);
+        assert_eq!(board, Tc27xProtection::default());
+        for n in [0, 6, 16, 17] {
+            assert!(board.refusal(s(n), false).is_none());
+        }
+
+        // The HSM boots: S6, S16 and S17 need the variable, the others do not.
+        let boot = Tc27xProtection::from_words(0, 0, 1);
+        assert_eq!(s(6).base, 0xA001_8000);
+        for n in [6, 16, 17] {
+            let why = boot.refusal(s(n), false).unwrap();
+            assert!(why.contains("HSMBOOTEN"), "{why}");
+            assert!(boot.refusal(s(n), true).is_none());
+        }
+        for n in [0, 5, 7, 15, 18, 27 + 6] {
+            assert!(boot.refusal(s(n), false).is_none(), "S{n}");
+        }
+
+        // Exclusive and locked sectors are refused even with the variable.
+        let exclusive = Tc27xProtection::from_words(0, 0, 1 << 4);
+        assert!(exclusive.refusal(s(16), true).unwrap().contains("HSM16X"));
+        assert!(exclusive.refusal(s(17), true).is_none());
+        let rom = Tc27xProtection::from_words(0, 0, 1 << 17);
+        assert!(rom.refusal(s(17), true).unwrap().contains("S17ROM"));
+
+        // The read protection refuses every sector, unless disabled with its password.
+        let rpro = Tc27xProtection::from_words(0, 1 << 31, 0);
+        assert!(rpro.refusal(s(30), false).unwrap().contains("RPRO"));
+        assert!(
+            Tc27xProtection::from_words(1 << 1, 1 << 31, 0)
+                .refusal(s(30), false)
+                .is_none()
+        );
+        let ddfpx = Tc27xProtection::from_words(1 << 18, 0, 0);
+        assert!(ddfpx.refusal(s(30), false).unwrap().contains("DDFPX"));
     }
 
     #[test]
