@@ -448,14 +448,52 @@ struct SavedState {
     ram: Vec<(u32, Vec<u8>)>,
     /// Whether each core ran; a core that ran was halted.
     running: Vec<bool>,
-    /// `WDTCPU0_CON1` and `WDTS_CON1` before the loader disabled the watchdogs.
-    watchdogs: Option<(u32, u32)>,
+    /// The watchdogs before the loader disabled them.
+    watchdogs: Option<Watchdogs>,
     /// Whether CPU0 was run with the loader.
     started: bool,
 }
 
 /// `CON1.DR` of a watchdog: the disable request.
 const WDT_DR: u32 = 1 << 3;
+/// `CON0.ENDINIT` of a watchdog: the ENDINIT-protected registers are locked.
+const WDT_ENDINIT: u32 = 1;
+
+/// `CON0` and `CON1` of the CPU0 watchdog and of the safety watchdog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Watchdogs {
+    cpu0: (u32, u32),
+    safety: (u32, u32),
+}
+
+impl Watchdogs {
+    /// Why the watchdogs after the loader are not as they were `before` it, if they are not.
+    /// ENDINIT must be set again where it was set; a device halted after a reset has it cleared
+    /// already, and a loader that did not run leaves it so.
+    fn changed(before: Option<Self>, after: Self) -> Option<String> {
+        let was_set = |con0: Option<u32>| con0.is_none_or(|con0| con0 & WDT_ENDINIT != 0);
+        let cleared = |con0: u32, before: Option<u32>| con0 & WDT_ENDINIT == 0 && was_set(before);
+        if cleared(after.cpu0.0, before.map(|b| b.cpu0.0))
+            || cleared(after.safety.0, before.map(|b| b.safety.0))
+        {
+            return Some(format!(
+                "ENDINIT is still cleared after flashing (WDTCPU0_CON0 {:#010x}, WDTS_CON0 \
+                 {:#010x}): reset the device",
+                after.cpu0.0, after.safety.0
+            ));
+        }
+        let before = before?;
+        let requests = (after.cpu0.1 ^ before.cpu0.1) | (after.safety.1 ^ before.safety.1);
+        if requests & WDT_DR == 0 {
+            return None;
+        }
+        Some(format!(
+            "the watchdogs are not enabled as before flashing (WDTCPU0_CON1 {:#010x}, was \
+             {:#010x}; WDTS_CON1 {:#010x}, was {:#010x}): reset the device",
+            after.cpu0.1, before.cpu0.1, after.safety.1, before.safety.1
+        ))
+    }
+}
 
 /// Keeps the first error of several steps that are all tried.
 fn keep_first(failed: &mut Option<Error>, result: Result<(), Error>) {
@@ -1305,10 +1343,16 @@ impl AurixFlash {
             ram.push((address, data));
         }
         let (wdtcpu0_con0, wdts_con0) = self.device.watchdogs();
-        let watchdogs = (
-            core.read_word_32(wdtcpu0_con0 + 4)?,
-            core.read_word_32(wdts_con0 + 4)?,
-        );
+        let watchdogs = Watchdogs {
+            cpu0: (
+                core.read_word_32(wdtcpu0_con0)?,
+                core.read_word_32(wdtcpu0_con0 + 4)?,
+            ),
+            safety: (
+                core.read_word_32(wdts_con0)?,
+                core.read_word_32(wdts_con0 + 4)?,
+            ),
+        };
         saved.registers = registers;
         saved.ram = ram;
         saved.watchdogs = Some(watchdogs);
@@ -1416,7 +1460,8 @@ impl AurixFlash {
             Ok(false) => {}
             Err(error) => keep_first(&mut failed, Err(error)),
         }
-        // The loader must have set ENDINIT again, and put back the disable requests.
+        // The loader must have set ENDINIT again where it was set, and put back the disable
+        // requests.
         let mut watchdogs = None;
         match session.core(0) {
             Ok(mut core) => {
@@ -1426,7 +1471,10 @@ impl AurixFlash {
                     .map(|address| core.read_word_32(address));
                 match words {
                     [Ok(con0), Ok(con1), Ok(s_con0), Ok(s_con1)] => {
-                        watchdogs = Some((con0, con1, s_con0, s_con1));
+                        watchdogs = Some(Watchdogs {
+                            cpu0: (con0, con1),
+                            safety: (s_con0, s_con1),
+                        });
                     }
                     words => {
                         for word in words {
@@ -1456,22 +1504,10 @@ impl AurixFlash {
         if let Some(error) = failed {
             return Err(error);
         }
-        if let Some((cpu0, cpu0_con1, safety, safety_con1)) = watchdogs {
-            if cpu0 & 1 == 0 || safety & 1 == 0 {
-                return Err(other(format!(
-                    "ENDINIT is still cleared after flashing (WDTCPU0_CON0 {cpu0:#010x}, \
-                     WDTS_CON0 {safety:#010x}): reset the device"
-                )));
-            }
-            if let Some((before, safety_before)) = saved.watchdogs
-                && ((cpu0_con1 ^ before) | (safety_con1 ^ safety_before)) & WDT_DR != 0
-            {
-                return Err(other(format!(
-                    "the watchdogs are not enabled as before flashing (WDTCPU0_CON1 \
-                     {cpu0_con1:#010x}, was {before:#010x}; WDTS_CON1 {safety_con1:#010x}, \
-                     was {safety_before:#010x}): reset the device"
-                )));
-            }
+        if let Some(after) = watchdogs
+            && let Some(message) = Watchdogs::changed(saved.watchdogs, after)
+        {
+            return Err(other(message));
         }
         let hsm = *self.hsm.lock().unwrap_or_else(|e| e.into_inner());
         if hsm.is_some_and(|hsm| hsm.boot() && hsm.ssw_wait()) {
@@ -1846,6 +1882,40 @@ mod tests {
         // The read protection refuses every sector.
         let hsm = HsmProtection::from_words(0, 0, 0, 0, 1 << 31);
         assert!(hsm.refusal(above, false).unwrap().contains("RPRO"));
+    }
+
+    #[test]
+    fn endinit_is_checked_only_where_it_was_set() {
+        // CON0: ENDINIT bit 0, LCK bit 1, password above. CON1: DR bit 3.
+        let watchdogs = |cpu0_con0, safety_con0, dr| Watchdogs {
+            cpu0: (cpu0_con0, dr),
+            safety: (safety_con0, dr),
+        };
+        let running = watchdogs(0xFFFC_0003, 0xFFFC_0003, 0);
+        // The loader ran and set ENDINIT again: as before.
+        assert_eq!(Watchdogs::changed(Some(running), running), None);
+        // ENDINIT left cleared where it was set.
+        let cleared = watchdogs(0xFFFC_0002, 0xFFFC_0003, 0);
+        let message = Watchdogs::changed(Some(running), cleared).unwrap();
+        assert!(message.starts_with("ENDINIT is still cleared"), "{message}");
+        let cleared = watchdogs(0xFFFC_0003, 0xFFFC_0002, 0);
+        assert!(Watchdogs::changed(Some(running), cleared).is_some());
+        // Halted after a reset ENDINIT is cleared already; a loader that did not run (a failed
+        // start) leaves it so, one that ran sets it.
+        let after_reset = watchdogs(0xFFFC_0002, 0xFFFC_0002, 0);
+        assert_eq!(Watchdogs::changed(Some(after_reset), after_reset), None);
+        assert_eq!(Watchdogs::changed(Some(after_reset), running), None);
+        // Nothing saved: ENDINIT must be set.
+        assert!(Watchdogs::changed(None, after_reset).is_some());
+        assert_eq!(Watchdogs::changed(None, running), None);
+        // A disable request that differs from before.
+        let disabled = watchdogs(0xFFFC_0003, 0xFFFC_0003, WDT_DR);
+        let message = Watchdogs::changed(Some(running), disabled).unwrap();
+        assert!(
+            message.starts_with("the watchdogs are not enabled"),
+            "{message}"
+        );
+        assert_eq!(Watchdogs::changed(Some(disabled), disabled), None);
     }
 
     #[test]
