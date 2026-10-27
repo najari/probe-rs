@@ -154,7 +154,15 @@ impl SessionData {
                 .any(|core_config| core_config.core_index == *core_index);
 
             per_core.push(if is_debugged {
-                CorePerAttachInfo::query(client, sessid, *core_index, architecture).await?
+                match CorePerAttachInfo::query(client, sessid, *core_index, architecture).await {
+                    // A core that cannot be reached now (the HSM of an AURIX while its debug
+                    // window is closed) gets the register file of its type without the live
+                    // properties; the session shows it unavailable.
+                    Err(probe_rs::Error::CoreDisabled(_)) => {
+                        CorePerAttachInfo::not_debugged(architecture)
+                    }
+                    result => result?,
+                }
             } else {
                 CorePerAttachInfo::not_debugged(architecture)
             });
@@ -164,9 +172,13 @@ impl SessionData {
 
         let core_data_vec = initialize_core_data(&mut backend, config)?;
         for core_config in config.core_configs.iter() {
-            backend
+            match backend
                 .apply_vector_catch(core_config.core_index, core_config)
-                .await?;
+                .await
+            {
+                Err(probe_rs::Error::CoreDisabled(_)) => {}
+                result => result?,
+            }
         }
 
         // Eagerly populate the authoritative server-side `DebugInfo` so
@@ -1002,6 +1014,66 @@ impl SessionData {
         Ok(status)
     }
 
+    /// Shows core `core_index` as unavailable: it cannot be reached now (`error`, for example the
+    /// HSM of an AURIX while its debug window is closed). The console says why and a
+    /// `probe-rs-core-status` event (`unavailable`) tells the client, once per change. Requests
+    /// for every core leave it out until it can be reached again.
+    pub(crate) fn mark_unavailable(
+        &mut self,
+        debug_adapter: &mut DebugAdapter,
+        core_index: usize,
+        error: &probe_rs::Error,
+    ) -> Result<(), DebuggerError> {
+        let why = format!("{error}");
+        if !debug_adapter
+            .routing()
+            .set_unavailable(core_index, Some(why.clone()))
+        {
+            return Ok(());
+        }
+        if let Some(core_data) = self
+            .core_data
+            .iter_mut()
+            .find(|cd| cd.core_index == core_index)
+        {
+            core_data.last_known_status = CoreStatus::Unknown;
+            core_data.invalidate_stack_frame_cache();
+        }
+        debug_adapter.log_to_console(format!(
+            "Core {core_index} is not available ({why}). The session goes on without it; \
+             for the HSM of an AURIX, its debug window opens once the HSM firmware enables HSM debug."
+        ));
+        debug_adapter.send_event(
+            "probe-rs-core-status",
+            Some(serde_json::json!({
+                "threadId": core_index,
+                "status": "unavailable",
+                "description": format!("The core is not available: {why}"),
+            })),
+        )?;
+        Ok(())
+    }
+
+    /// Notes that core `core_index` can be reached again (see [`Self::mark_unavailable`]).
+    fn mark_available(
+        &mut self,
+        debug_adapter: &mut DebugAdapter,
+        core_index: usize,
+    ) -> Result<(), DebuggerError> {
+        if debug_adapter.routing().set_unavailable(core_index, None) {
+            debug_adapter.log_to_console(format!("Core {core_index} is available again."));
+            debug_adapter.send_event(
+                "probe-rs-core-status",
+                Some(serde_json::json!({
+                    "threadId": core_index,
+                    "status": "available",
+                    "description": "The core is available again.",
+                })),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Attach to the target's server-owned RTT interface over RPC.
     async fn attach_to_rtt(
         &mut self,
@@ -1206,10 +1278,18 @@ impl SessionData {
 
             let batched = batch.as_mut().and_then(|b| b.remove(&core_index));
             let current_core_status = if let Some(status) = batched {
+                self.mark_available(debug_adapter, core_index)?;
                 status
             } else if debug_adapter.configuration_is_done() {
                 match self.backend.status(core_index).await {
+                    // A core that cannot be reached now (the HSM of an AURIX while its debug
+                    // window is closed) is shown unavailable, and asked again at the next poll.
+                    Err(error @ probe_rs::Error::CoreDisabled(_)) => {
+                        self.mark_unavailable(debug_adapter, core_index, &error)?;
+                        continue;
+                    }
                     Ok(status) => {
+                        self.mark_available(debug_adapter, core_index)?;
                         let mut statuses = HashMap::from([(core_index, status)]);
                         if self
                             .check_breakpoint_halts(session_config, debug_adapter, &mut statuses)
@@ -1390,11 +1470,15 @@ impl SessionData {
         // Ask the RPC server to unwind each newly halted core, then replace
         // the client metadata-only display cache with the returned frames.
         for &core_index in &needs_unwind {
-            let frames = self
-                .backend
-                .unwind_stack(core_index, 500)
-                .await
-                .map_err(DebuggerError::ProbeRs)?;
+            let frames = match self.backend.unwind_stack(core_index, 500).await {
+                Ok(frames) => frames,
+                // A core that became unreachable since its halt keeps no frames.
+                Err(error @ probe_rs::Error::CoreDisabled(_)) => {
+                    self.mark_unavailable(debug_adapter, core_index, &error)?;
+                    continue;
+                }
+                Err(error) => return Err(DebuggerError::ProbeRs(error)),
+            };
 
             if let Some(core_data) = self
                 .core_data

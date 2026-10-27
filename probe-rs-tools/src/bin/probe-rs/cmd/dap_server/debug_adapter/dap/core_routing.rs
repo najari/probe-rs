@@ -35,6 +35,18 @@ pub(crate) const FAN_OUT: [&str; 5] = [
     "disconnect",
 ];
 
+/// The requests about the session, not one core: a core that cannot be reached does not refuse
+/// them.
+pub(crate) const SESSION_REQUESTS: [&str; 7] = [
+    "threads",
+    "disconnect",
+    "terminate",
+    "loadedSources",
+    "source",
+    "modules",
+    "completions",
+];
+
 /// The routing state, shared between the [`RoutingAdapter`] (which sees every response and
 /// event) and the request loop (which picks the core of each request).
 #[derive(Debug, Default)]
@@ -54,6 +66,9 @@ pub(crate) struct CoreRouting {
     own_stops: HashMap<usize, serde_json::Map<String, Value>>,
     /// While a request goes to several cores: its command and the responses collected.
     captured: Option<(String, Vec<Response>)>,
+    /// The cores that cannot be reached now, and why (the HSM of an AURIX while its debug
+    /// window is closed). Requests that go to every core leave them out.
+    unavailable: HashMap<usize, String>,
 }
 
 /// `text` without its `@core` suffix, and the core.
@@ -79,6 +94,21 @@ impl CoreRouting {
         self.focus = None;
         self.halted.clear();
         self.own_stops.clear();
+        self.unavailable.clear();
+    }
+
+    /// Notes that `core` cannot be reached now (`Some(why)`), or can again (`None`). Returns
+    /// whether that changed.
+    pub(crate) fn set_unavailable(&mut self, core: usize, why: Option<String>) -> bool {
+        match why {
+            Some(why) => self.unavailable.insert(core, why).is_none(),
+            None => self.unavailable.remove(&core).is_some(),
+        }
+    }
+
+    /// Why `core` cannot be reached now, if it cannot.
+    pub(crate) fn unavailable(&self, core: usize) -> Option<&str> {
+        self.unavailable.get(&core).map(String::as_str)
     }
 
     /// Notes that `core` runs.
@@ -87,9 +117,13 @@ impl CoreRouting {
         self.own_stops.remove(&core);
     }
 
-    /// Whether every configured core reported a halt and has not run since.
+    /// Whether every configured core reported a halt and has not run since (a core that cannot
+    /// be reached is left out).
     fn all_halted(&self) -> bool {
-        self.cores.iter().all(|core| self.halted.contains(core))
+        self.cores
+            .iter()
+            .filter(|core| !self.unavailable.contains_key(core))
+            .all(|core| self.halted.contains(core))
     }
 
     pub(crate) fn cores(&self) -> &[usize] {
@@ -471,7 +505,7 @@ pub(crate) fn merge_instruction_breakpoints(
             if entries.is_empty() {
                 serde_json::json!({
                     "verified": false,
-                    "message": "The instruction reference names no core of this session",
+                    "message": "The instruction reference names no core of this session that can be reached",
                 })
             } else {
                 merge_breakpoint(entries)
@@ -670,6 +704,24 @@ mod tests {
         assert_eq!(split_core("0x7000a004/4@2"), ("0x7000a004/4", Some(2)));
         assert_eq!(split_core("0x7000a004"), ("0x7000a004", None));
         assert_eq!(with_core("0x7000a004@1", 2), "0x7000a004@2");
+    }
+
+    #[test]
+    fn an_unavailable_core_is_left_out_of_all_halted() {
+        let mut routing = routing(&[0, 1, 2]);
+        routing.halted.extend([0, 1]);
+        assert!(!routing.all_halted(), "core 2 has not halted");
+        assert!(routing.set_unavailable(2, Some("Core 2 is not enabled.".into())));
+        assert!(
+            !routing.set_unavailable(2, Some("again".into())),
+            "no change"
+        );
+        assert_eq!(routing.unavailable(2), Some("again"), "the latest reason");
+        assert!(routing.all_halted(), "the unavailable core is left out");
+        assert!(routing.set_unavailable(2, None));
+        assert!(!routing.set_unavailable(2, None));
+        assert_eq!(routing.unavailable(2), None);
+        assert!(!routing.all_halted());
     }
 
     #[test]

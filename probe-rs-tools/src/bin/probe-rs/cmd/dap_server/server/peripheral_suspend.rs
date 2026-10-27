@@ -120,8 +120,16 @@ pub(crate) async fn apply(
     cores: &[usize],
 ) -> Result<String, String> {
     let timers = system_timers(chip)?;
+    // The system timers and trigger lines are the TriCore cores' (not the HSM's of an AURIX),
+    // and the words are written through a TriCore core.
+    let cores = cores
+        .iter()
+        .copied()
+        .filter(|&core| session_data.backend.is_tricore(core))
+        .collect::<Vec<_>>();
+    let cores = cores.as_slice();
     let Some(&bus) = cores.first() else {
-        return Err("the session has no core".into());
+        return Err("the session has no TriCore core".into());
     };
     // A core in boot halt is left out: its halt state would hold the line.
     let mut routed_cores = Vec::new();
@@ -220,7 +228,12 @@ pub(crate) async fn apply(
 /// Puts back every word [`apply`] changed, the routing first.
 pub(crate) async fn restore(session_data: &mut SessionData) -> Result<(), String> {
     let restore = std::mem::take(&mut session_data.peripheral_suspend);
-    let Some(bus) = session_data.core_data.first().map(|c| c.core_index) else {
+    let Some(bus) = session_data
+        .core_data
+        .iter()
+        .map(|c| c.core_index)
+        .find(|&core| session_data.backend.is_tricore(core))
+    else {
         return Ok(());
     };
     if restore.is_empty() {
@@ -231,6 +244,7 @@ pub(crate) async fn restore(session_data: &mut SessionData) -> Result<(), String
         .core_data
         .iter()
         .map(|c| c.core_index)
+        .filter(|&core| session_data.backend.is_tricore(core))
         .collect::<Vec<_>>();
     for core in cores {
         if let Err(error) = session_data

@@ -63,7 +63,18 @@ pub(crate) fn rpc_err(err: impl Into<anyhow::Error>) -> Error {
     if text.contains("has not yet been implemented") {
         return Error::NotImplemented("remote operation");
     }
+    if let Some(core) = disabled_core(&text) {
+        return Error::CoreDisabled(core);
+    }
     Error::Other(format!("{err:?}"))
+}
+
+/// The core of an `Error::CoreDisabled` text ("Core 2 is not enabled."): a core that cannot be
+/// reached now, such as the HSM of an AURIX while its debug window is closed.
+fn disabled_core(text: &str) -> Option<usize> {
+    let end = text.find(" is not enabled")?;
+    let start = text[..end].rfind("Core ")? + "Core ".len();
+    text[start..end].parse().ok()
 }
 
 /// The address of a DAP memory reference (`0x...`).
@@ -700,6 +711,27 @@ impl RpcBackend {
         })
     }
 
+    /// Whether cores `a` and `b` of the target have the same architecture (the HSM of an AURIX is
+    /// a Cortex-M core in a TriCore session).
+    pub(crate) fn same_architecture(&self, a: usize, b: usize) -> bool {
+        let architecture = |core: usize| {
+            self.target_metadata
+                .cores
+                .iter()
+                .find(|(index, _)| *index == core)
+                .map(|(_, core_type)| core_type.architecture())
+        };
+        architecture(a) == architecture(b)
+    }
+
+    /// Whether core `core_index` is a TriCore core.
+    pub(crate) fn is_tricore(&self, core_index: usize) -> bool {
+        self.target_metadata
+            .cores
+            .iter()
+            .any(|(index, core_type)| *index == core_index && *core_type == CoreType::TriCore)
+    }
+
     pub(crate) async fn enable_vector_catch(
         &mut self,
         core_index: usize,
@@ -1128,10 +1160,22 @@ impl From<WireDisassembledInstruction> for DisassembledInstruction {
 
 #[cfg(test)]
 mod test {
-    use probe_rs::{Architecture, CoreRegisters, CoreType, RegisterRole};
+    use probe_rs::{Architecture, CoreRegisters, CoreType, Error, RegisterRole};
 
-    use super::CorePerAttachInfo;
+    use super::{CorePerAttachInfo, rpc_err};
     use probe_rs_rpc::core_ops::WireCoreMetadata;
+
+    #[test]
+    fn a_disabled_core_keeps_its_error_across_the_rpc() {
+        let error = rpc_err(anyhow::anyhow!("{}", Error::CoreDisabled(2)));
+        assert!(matches!(error, Error::CoreDisabled(2)), "{error:?}");
+        let error = rpc_err(anyhow::anyhow!("Core 12 is not enabled.").context("core status"));
+        assert!(matches!(error, Error::CoreDisabled(12)), "{error:?}");
+        assert!(matches!(
+            rpc_err(anyhow::anyhow!("bus error at 0xf0041010")),
+            Error::Other(_)
+        ));
+    }
 
     #[test]
     fn live_fpu_metadata_selects_floating_point_registers() {

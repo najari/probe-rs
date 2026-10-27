@@ -11,7 +11,7 @@ use crate::cmd::dap_server::{
     debug_adapter::dap::{
         adapter::{DebugAdapter, get_arguments},
         core_routing::{
-            FAN_OUT, data_breakpoints_of_core, instruction_breakpoints_of_core,
+            FAN_OUT, SESSION_REQUESTS, data_breakpoints_of_core, instruction_breakpoints_of_core,
             merge_data_breakpoints, merge_instruction_breakpoints, merge_responses,
         },
         dap_types::{
@@ -282,6 +282,13 @@ impl Debugger {
                 "No core configuration found"
             ))));
         };
+        if !SESSION_REQUESTS.contains(&request.command.as_str())
+            && let Some(why) = debug_adapter.routing().unavailable(core_index)
+        {
+            return Err(RequestFailure::Request(DebuggerError::Other(anyhow!(
+                "Core {core_index} is not available: {why}"
+            ))));
+        }
         debug_adapter.routing().set_current(Some(core_index));
         self.dispatch(session_data, debug_adapter, core_index, &routed)
             .await
@@ -303,7 +310,13 @@ impl Debugger {
         let mut responses = Vec::new();
         // The data or instruction breakpoints of each core, and where they stand in the request.
         let mut breakpoint_slots = HashMap::new();
+        let mut dispatched = 0;
         for core in cores {
+            // A core that cannot be reached now is left out; its breakpoints stay unverified.
+            if debug_adapter.routing().unavailable(core).is_some() {
+                continue;
+            }
+            dispatched += 1;
             let core_request = match request.command.as_str() {
                 "setDataBreakpoints" => {
                     let (core_request, slots) = data_breakpoints_of_core(request, core, focus);
@@ -345,6 +358,10 @@ impl Debugger {
             debug_adapter
                 .send_merged_response(response)
                 .map_err(|error| RequestFailure::Session(DebuggerError::Other(error)))?;
+        } else if dispatched == 0 {
+            return Err(RequestFailure::Request(DebuggerError::Other(anyhow!(
+                "No core of the session can be reached"
+            ))));
         }
         Ok(status)
     }
@@ -932,11 +949,26 @@ impl Debugger {
                 // Each program binary of the session is written once, the first one last
                 // (it is the one the session restarts).
                 let mut others = Vec::new();
-                for path in core_configs
-                    .iter()
-                    .skip(1)
-                    .filter_map(|c| c.program_binary.clone())
-                {
+                for core_config in core_configs.iter().skip(1) {
+                    let Some(path) = core_config.program_binary.clone() else {
+                        continue;
+                    };
+                    // The program of a core of another architecture (the HSM of an AURIX) is
+                    // not written: the flash loader is the main cores', and HSM code sectors
+                    // need their own care (a wrong one can lock the device).
+                    if !session_data
+                        .backend
+                        .same_architecture(core_config.core_index, target_core_config.core_index)
+                    {
+                        if path != path_to_elf {
+                            debug_adapter.log_to_console(format!(
+                                "The program binary of core {} is not written: it is a core of \
+                                 another architecture. Write it with its own tool.",
+                                core_config.core_index
+                            ));
+                        }
+                        continue;
+                    }
                     if path != path_to_elf && !others.contains(&path) {
                         others.push(path);
                     }
@@ -976,11 +1008,19 @@ impl Debugger {
         // Each core of the session is prepared the same way, with its own settings.
         for core_config in &core_configs {
             let core_index = core_config.core_index;
-            session_data
+            match session_data
                 .backend
                 .halt(core_index, Duration::from_millis(100))
                 .await
-                .map_err(DebuggerError::from)?;
+            {
+                // A core that cannot be reached now (the HSM of an AURIX while its debug window
+                // is closed) is shown unavailable; the session goes on with the others.
+                Err(error @ probe_rs::Error::CoreDisabled(_)) => {
+                    session_data.mark_unavailable(debug_adapter, core_index, &error)?;
+                    continue;
+                }
+                result => result.map_err(DebuggerError::from)?,
+            };
 
             if self.config.all_stop {
                 let message = match session_data.backend.set_halt_group(core_index, true).await {
@@ -1064,6 +1104,16 @@ impl Debugger {
             // Synchronize the optional SVD configuration before exposing scopes.
             // This is non-fatal: a failed load leaves the server cache cleared.
             let svd_timestamp = core_config.svd_file.as_deref().and_then(get_file_timestamp);
+            // The chip SVD (chosen by the chip name for every core) is not the one of a core of
+            // another architecture, such as the HSM of an AURIX.
+            if core_index != target_core_config.core_index
+                && core_config.svd_file == target_core_config.svd_file
+                && !session_data
+                    .backend
+                    .same_architecture(core_index, target_core_config.core_index)
+            {
+                continue;
+            }
             match session_data
                 .backend
                 .load_svd(core_index, core_config.svd_file.clone())

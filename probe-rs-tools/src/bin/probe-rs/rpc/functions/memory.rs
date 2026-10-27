@@ -83,7 +83,7 @@ pub async fn write_memory<W: Word>(
     request: WriteMemoryRequest<W>,
 ) -> NoResponse {
     let mut session = ctx.session(request.sessid).await;
-    let mut core = session.core(request.core as usize).unwrap();
+    let mut core = lift(session.core(request.core as usize))?;
     lift(W::write(&mut core, request.address, &request.data))?;
     Ok(())
 }
