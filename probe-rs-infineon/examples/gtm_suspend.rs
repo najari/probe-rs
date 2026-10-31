@@ -32,6 +32,14 @@
 //! board without effect on the GTM: CPU0's halt state on each of lines 1-6, the OCDS control bits
 //! `CBS_OSTATE.OC0`-`OC2` (set through `CBS_OCNTRL`), and `M0`-`M2`, `DMA`, `DMA1` as targets of
 //! line 1.
+//!
+//! For more attempts in case 3, `EXTRA="addr=value;..."` writes words for the case and puts them
+//! back after it, and `OCNTRL=<hex>` sets `CBS_OCNTRL` control bits and clears them after it.
+//! Tried on the TC36x (2026-10-28, bit fields from the TC36x SFR headers) without effect on the
+//! GTM, with STM0 stopping each time: line 1 capture and hold (`CBS_TLCHE.TL1`, it then holds the
+//! line and CPU0 does not run until it is cleared), the OCDS control bits `OC0`-`OC5` together and
+//! `OC3`-`OC5` (they show as `CBS_OSTATE` bits 4-6), and every line 1 signal processing
+//! `CBS_TLC.TLSP1` = 1-15. `CBS_TL1ST` has no GTM target (CPU0-5, M0-M2, HSSL, DMA, HSM).
 
 use std::time::Duration;
 
@@ -50,6 +58,31 @@ const CPU0_DBGSR: u64 = 0xF881_FD00;
 const G_TICKS: u64 = 0x7000_A00C;
 /// The trigger switch routing of CPU0 (TC27x and TC3xx).
 const CBS_TRC0: u64 = 0xF000_0420;
+/// The OCDS control bits (write only: `OCx_P` in the even bits enables the write of `OCx`).
+const CBS_OCNTRL: u64 = 0xF000_047C;
+
+/// The words of `EXTRA` (`addr=value;addr=value`, hexadecimal or decimal).
+fn extra_writes() -> Result<Vec<(u64, u32)>> {
+    let Ok(text) = std::env::var("EXTRA") else {
+        return Ok(Vec::new());
+    };
+    let number = |s: &str| -> Result<u64> {
+        let s = s.trim();
+        Ok(
+            match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                Some(hex) => u64::from_str_radix(&hex.replace('_', ""), 16)?,
+                None => s.parse()?,
+            },
+        )
+    };
+    text.split(';')
+        .filter(|w| !w.trim().is_empty())
+        .map(|w| {
+            let (address, value) = w.split_once('=').ok_or("EXTRA: addr=value")?;
+            Ok((number(address)?, number(value)? as u32))
+        })
+        .collect()
+}
 
 /// Where a chip has what the experiment reads and writes.
 struct Chip {
@@ -140,10 +173,32 @@ fn experiment(chip: &Chip, core: &mut Core) -> Result<()> {
         .and_then(|v| v.parse::<u32>().ok())
     {
         let trc = core.read_word_32(CBS_TRC0)?;
+        // EXTRA: words written for the case and put back after it; OCNTRL: OCDS control bits
+        // set for the case and cleared after it.
+        let extra = extra_writes()?;
+        let mut saved = Vec::new();
+        for &(address, _) in &extra {
+            saved.push((address, core.read_word_32(address)?));
+        }
+        let ocntrl = std::env::var("OCNTRL")
+            .ok()
+            .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok());
         let outcome = (|| -> Result<()> {
             core.write_word_32(CBS_TRC0, (trc & !0xF) | (value & 0xF))?;
             let now = core.read_word_32(CBS_TRC0)?;
             println!("CBS_TRC0 {trc:#010x} -> {now:#010x} (HALT = {value})");
+            for (&(address, value), &(_, old)) in extra.iter().zip(&saved) {
+                core.write_word_32(address, value)?;
+                let now = core.read_word_32(address)?;
+                println!("{address:#010x} {old:#010x} -> {now:#010x} (wrote {value:#010x})");
+            }
+            if let Some(value) = ocntrl {
+                core.write_word_32(CBS_OCNTRL, value)?;
+                println!(
+                    "CBS_OCNTRL <- {value:#010x}, CBS_OSTATE {:#010x}",
+                    core.read_word_32(0xF000_0480)?
+                );
+            }
             // STM0 too: is any peripheral suspended?
             core.write_word_32(chip.stm0_ocs, OCS_SUS_P | OCS_SOFT_SUSPEND)?;
             report(chip, core, "3. HALT routed, CPU0 running")?;
@@ -159,10 +214,17 @@ fn experiment(chip: &Chip, core: &mut Core) -> Result<()> {
             others(chip, core)?;
             Ok(())
         })();
-        // Put the routing and STM0 back whatever happened.
-        let restored = core
+        // Put the routing, STM0 and the EXTRA words back whatever happened, and clear the
+        // OCNTRL bits (the same write enables, the bits 0).
+        let mut restored = core
             .write_word_32(CBS_TRC0, trc)
             .and_then(|()| core.write_word_32(chip.stm0_ocs, OCS_SUS_P));
+        for &(address, old) in saved.iter().rev() {
+            restored = restored.and(core.write_word_32(address, old));
+        }
+        if let Some(value) = ocntrl {
+            restored = restored.and(core.write_word_32(CBS_OCNTRL, value & 0x5555_5555));
+        }
         println!("CBS_TRC0 put back: {:#010x}", core.read_word_32(CBS_TRC0)?);
         outcome?;
         restored?;
