@@ -15,7 +15,7 @@
 //!
 //! `PROBE_RS_PROBE` selects another probe (an MCD probe with `--features mcd`),
 //! `PROBE_RS_SPEED` the interface speed in kHz (the TAS probe sets the adapter clock),
-//! `PROBE_RS_CHIP` names the chip.
+//! `PROBE_RS_CHIP` names the chip, `PROBE_RS_PFLASH` the PFLASH address read (hex).
 
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,17 @@ use probe_rs::{
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// The PFLASH address read: `PROBE_RS_PFLASH` (hex), else 8003 0000H. An erased PFLASH word
+/// reads with an ECC error, so it has to be one the board has written.
+fn pflash_address() -> u32 {
+    std::env::var("PROBE_RS_PFLASH")
+        .ok()
+        .and_then(|a| {
+            u32::from_str_radix(a.trim_start_matches("0x").replace('_', "").as_str(), 16).ok()
+        })
+        .unwrap_or(0x8003_0000)
+}
 
 /// The rounds of each item.
 const ROUNDS: usize = 20;
@@ -196,11 +207,18 @@ fn main() -> Result<()> {
     read_item(&mut core, "read DSPR0, 256 B", 0x7000_0000, 256)?;
     read_item(&mut core, "read DSPR0, 4 KiB", 0x7000_0000, 4 * 1024)?;
     read_item(&mut core, "read DSPR0, 32 KiB", 0x7000_0000, 32 * 1024)?;
+    // 32 KiB of the TC275 board's PFLASH; 16 KiB at another address (what a board has written
+    // may be less).
+    let kib = if std::env::var("PROBE_RS_PFLASH").is_ok() {
+        16
+    } else {
+        32
+    };
     read_item(
         &mut core,
-        "read PFLASH (cached), 32 KiB",
-        0x8003_0000,
-        32 * 1024,
+        &format!("read PFLASH, {kib} KiB"),
+        pflash_address().into(),
+        kib * 1024,
     )?;
     write_items(&mut core, 0x7010_0000, &[256, 4 * 1024, 16 * 1024])?;
 

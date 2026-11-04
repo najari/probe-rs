@@ -15,7 +15,7 @@
 //! themselves (an MCD library on the same TAS server); `tas_clock set 400000` puts the
 //! adapter's start clock back.
 //!
-//! `PROBE_RS_PROBE` selects another probe.
+//! `PROBE_RS_PROBE` selects another probe, `PROBE_RS_PFLASH` the PFLASH address (hex).
 
 use std::time::{Duration, Instant};
 
@@ -30,9 +30,23 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// The access hardware clock in Hz, address map 15.
 const ACC_HW_FREQUENCY: u32 = 0x000C_0100;
 
-/// What is read: PFLASH (cached alias) and DSPR0, which changes while the cores run.
-const PFLASH: (u32, usize) = (0x8003_0000, 16 * 1024);
+/// What is read: 16 KiB of PFLASH and DSPR0, which changes while the cores run.
 const DSPR0: (u32, usize) = (0x7000_0000, 4 * 1024);
+
+/// The PFLASH address read: `PROBE_RS_PFLASH` (hex), else 8003 0000H. An erased PFLASH word
+/// reads with an ECC error, so it has to be one the board has written.
+fn pflash_address() -> u32 {
+    std::env::var("PROBE_RS_PFLASH")
+        .ok()
+        .and_then(|a| {
+            u32::from_str_radix(a.trim_start_matches("0x").replace('_', "").as_str(), 16).ok()
+        })
+        .unwrap_or(0x8003_0000)
+}
+
+fn pflash() -> (u32, usize) {
+    (pflash_address(), 16 * 1024)
+}
 
 /// Reads `length` bytes at `address` `rounds` times; returns the last bytes and the median
 /// time of one read.
@@ -66,7 +80,7 @@ fn set_clock(bus: &mut dyn TriCoreBusAccess, hz: u32) -> Result<u32> {
 fn try_clocks(bus: &mut dyn TriCoreBusAccess, frequencies: &[u32], reference: &[u8]) -> Result<()> {
     for &hz in frequencies {
         let now = set_clock(bus, hz)?;
-        let (data, flash_time) = timed_reads(bus, PFLASH, 5)?;
+        let (data, flash_time) = timed_reads(bus, pflash(), 5)?;
         if data != reference {
             let first = data
                 .iter()
@@ -82,7 +96,7 @@ fn try_clocks(bus: &mut dyn TriCoreBusAccess, frequencies: &[u32], reference: &[
         println!(
             "{hz:>9} Hz (reads back {now:>9}): PFLASH 16 KiB {:>7.1} ms {:>7.1} KiB/s, DSPR0 4 KiB {:>6.1} ms {:>7.1} KiB/s, PFLASH same as at the start",
             flash_time.as_secs_f64() * 1000.0,
-            kib_per_s(PFLASH.1, flash_time),
+            kib_per_s(pflash().1, flash_time),
             dspr_time.as_secs_f64() * 1000.0,
             kib_per_s(DSPR0.1, dspr_time),
         );
@@ -115,12 +129,12 @@ fn main() -> Result<()> {
         println!("access hardware clock {original} Hz -> {now} Hz (left so)");
         return Ok(());
     }
-    let (reference, flash_time) = timed_reads(bus, PFLASH, 5)?;
+    let (reference, flash_time) = timed_reads(bus, pflash(), 5)?;
     let (_, dspr_time) = timed_reads(bus, DSPR0, 10)?;
     println!(
         "{original:>9} Hz (at the start)       : PFLASH 16 KiB {:>7.1} ms {:>7.1} KiB/s, DSPR0 4 KiB {:>6.1} ms {:>7.1} KiB/s",
         flash_time.as_secs_f64() * 1000.0,
-        kib_per_s(PFLASH.1, flash_time),
+        kib_per_s(pflash().1, flash_time),
         dspr_time.as_secs_f64() * 1000.0,
         kib_per_s(DSPR0.1, dspr_time),
     );
@@ -132,7 +146,7 @@ fn main() -> Result<()> {
         println!("stopped: {error}");
     }
     let restored = restored?;
-    let (again, _) = timed_reads(bus, PFLASH, 1)?;
+    let (again, _) = timed_reads(bus, pflash(), 1)?;
     println!(
         "clock put back: {restored} Hz, PFLASH {}",
         if again == reference {
