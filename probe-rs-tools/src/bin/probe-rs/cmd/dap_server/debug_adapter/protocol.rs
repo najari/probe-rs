@@ -57,6 +57,11 @@ const SLOW_CLIENT_WARNING: Duration = Duration::from_millis(500);
 /// the target again, and keeps the part that arrived.
 const PARTIAL_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the rest of a message is looked for without sleeping. A client that writes its
+/// header and body apart (or with `TCP_NODELAY`, in pieces) sends the rest within microseconds;
+/// a sleep takes 1-2 ms on Windows, more than the request.
+const PARTIAL_MESSAGE_SPIN: Duration = Duration::from_millis(2);
+
 /// Give the client time to read from the connection, and report a client that
 /// keeps the connection full.
 fn wait_for_output(blocked_since: Instant, warned: &mut bool) {
@@ -525,6 +530,9 @@ impl<R: Read, W: Write> DapAdapter<R, W> {
                     // hold the poll of the target. Keep the part that arrived.
                     ErrorKind::WouldBlock if idle_since.elapsed() > PARTIAL_MESSAGE_TIMEOUT => {
                         return Ok(None);
+                    }
+                    ErrorKind::WouldBlock if idle_since.elapsed() < PARTIAL_MESSAGE_SPIN => {
+                        std::thread::yield_now()
                     }
                     ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(1)),
                     _ => return Err(error.into()),

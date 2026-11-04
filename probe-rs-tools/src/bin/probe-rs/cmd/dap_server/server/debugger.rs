@@ -26,12 +26,53 @@ use anyhow::{Context, anyhow};
 use probe_rs::CoreStatus;
 use probe_rs_rpc::flash::{Operation, ProgressEvent as WireProgressEvent};
 use probe_rs_rpc_client::{ResolvedUpload, RpcClient};
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    time::{Duration, Instant},
+};
 use time::UtcOffset;
 
 /// The longest wait for the next request before a session starts. Input ends it at once, so it
 /// delays no request; it only spares the CPU while the client has not attached yet.
 const START_WAIT: Duration = Duration::from_millis(100);
+
+/// How often the cores are polled while all of them are halted.
+const HALTED_POLL: Duration = Duration::from_millis(100);
+
+/// The requests that need no poll of the cores first while all of them are halted and the last
+/// poll is younger than [`HALTED_POLL`]: they neither run nor halt a core. A poll costs a status
+/// and a notice round trip per core, more than such a request itself (TC36x through TAS at
+/// 6 MHz: a register read 1.8 ms through the DAP server with the polls, 0.15 ms on the bus).
+const NEEDS_NO_POLL: [&str; 10] = [
+    "readMemory",
+    "readRanges",
+    "writeMemory",
+    "setVariable",
+    "scopes",
+    "variables",
+    "stackTrace",
+    "threads",
+    "disassemble",
+    "dataBreakpointInfo",
+];
+
+/// How long the wait after a request looks for the next one without sleeping.
+const REQUEST_SPIN: Duration = Duration::from_millis(2);
+
+/// Of [`NEEDS_NO_POLL`], the requests that only read: the last poll stays valid after them.
+/// After any other request the next poll is not skipped (a write may reset the device, for
+/// example).
+const READS_ONLY: [&str; 8] = [
+    "readMemory",
+    "readRanges",
+    "scopes",
+    "variables",
+    "stackTrace",
+    "threads",
+    "disassemble",
+    "dataBreakpointInfo",
+];
 
 fn dap_capabilities() -> Capabilities {
     Capabilities {
@@ -148,6 +189,10 @@ pub struct Debugger {
     /// `cli::flash`). When set, [`SessionData::new_rpc_backed`] reuses it
     /// instead of calling `probe/attach` again.
     pub(crate) preattached_session: Option<probe_rs_rpc_client::SessionInterface>,
+
+    /// When the last poll found all cores halted; `None` when it did not, or when a request
+    /// since may have changed that.
+    halted_poll: Option<Instant>,
 }
 
 impl Debugger {
@@ -165,6 +210,7 @@ impl Debugger {
             debug_logger: DebugLogger::new(log_file)?,
             uploaded_files: None,
             preattached_session: None,
+            halted_poll: None,
         };
 
         debugger
@@ -189,8 +235,14 @@ impl Debugger {
         self.debug_logger.flush_to_dap(debug_adapter)?;
 
         if let Some(request) = debug_adapter.listen_for_request()? {
-            self.handle_request(session_data, debug_adapter, request)
-                .await
+            let reads_only = READS_ONLY.contains(&request.command.as_str());
+            let status = self
+                .handle_request(session_data, debug_adapter, request)
+                .await;
+            if !reads_only {
+                self.halted_poll = None;
+            }
+            status
         } else {
             self.no_request_poll(session_data, debug_adapter).await
         }
@@ -238,10 +290,17 @@ impl Debugger {
             tracing::info_span!("Handling request", request = ?RequestSummary(request)).entered();
 
         // Poll ALL target cores for status, which includes synching status with the DAP client, and handling RTT data.
-        session_data
-            .poll_cores(&self.config, debug_adapter)
-            .await
-            .map_err(RequestFailure::Session)?;
+        // Not for a request that neither runs nor halts a core while a recent poll found all
+        // of them halted: they stay so.
+        if !(NEEDS_NO_POLL.contains(&request.command.as_str())
+            && self.halted_poll_left(debug_adapter).is_some())
+        {
+            session_data
+                .poll_cores(&self.config, debug_adapter)
+                .await
+                .map_err(RequestFailure::Session)?;
+            self.polled(debug_adapter);
+        }
 
         // Check if we have configured cores
         if session_data.core_data.is_empty() {
@@ -560,6 +619,23 @@ impl Debugger {
         Ok(debug_session)
     }
 
+    /// The time left until the next poll, if the last one found all cores halted, is younger
+    /// than [`HALTED_POLL`], and no request since may have changed that.
+    fn halted_poll_left(&self, debug_adapter: &DebugAdapter) -> Option<Duration> {
+        let polled = self.halted_poll?;
+        (debug_adapter.configuration_is_done() && debug_adapter.all_cores_halted)
+            .then(|| HALTED_POLL.checked_sub(polled.elapsed()))
+            .flatten()
+            .filter(|left| !left.is_zero())
+    }
+
+    /// Notes a poll of the cores.
+    fn polled(&mut self, debug_adapter: &DebugAdapter) {
+        self.halted_poll = (debug_adapter.configuration_is_done()
+            && debug_adapter.all_cores_halted)
+            .then(Instant::now);
+    }
+
     async fn no_request_poll(
         &mut self,
         session_data: &mut SessionData,
@@ -568,13 +644,23 @@ impl Debugger {
         let _poll_span = tracing::trace_span!("Polling for core status").entered();
         let delay;
 
+        // All cores halted at a poll less than HALTED_POLL ago (the one before the last
+        // request, say): wait for the rest of that time, or the next request.
+        if let Some(left) = self.halted_poll_left(debug_adapter) {
+            debug_adapter
+                .wait_for_input_spinning(REQUEST_SPIN, left)
+                .await;
+            return Ok(DebugSessionStatus::Continue(Duration::ZERO));
+        }
+
         // Poll ALL target cores for status, which includes synching status with the DAP client, and handling RTT data.
         // We do this even if the cores may be halted, as we need to handle RTT data from cores the debugger does not control.
         let suggest_delay_required = session_data.poll_cores(&self.config, debug_adapter).await?;
+        self.polled(debug_adapter);
 
         if debug_adapter.all_cores_halted {
             // Medium delay to reduce fast looping costs.
-            delay = Duration::from_millis(100);
+            delay = HALTED_POLL;
 
             // Once all cores are halted, then we can skip polling the core for status, and just wait for the next DAP Client request.
             tracing::trace!(
@@ -2436,5 +2522,28 @@ mod test {
         disconnect_protocol_adapter(&mut protocol_adapter);
 
         execute_test(protocol_adapter, true).await.unwrap();
+    }
+
+    /// A request that keeps the last poll valid needs no poll of its own, and neither list
+    /// holds a request that runs, steps or halts a core.
+    #[test]
+    fn requests_that_skip_the_poll() {
+        use super::{NEEDS_NO_POLL, READS_ONLY};
+        for request in READS_ONLY {
+            assert!(NEEDS_NO_POLL.contains(&request), "{request}");
+        }
+        for request in [
+            "continue",
+            "next",
+            "stepIn",
+            "stepOut",
+            "pause",
+            "restart",
+            "evaluate",
+            "disconnect",
+            "setBreakpoints",
+        ] {
+            assert!(!NEEDS_NO_POLL.contains(&request), "{request}");
+        }
     }
 }

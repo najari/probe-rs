@@ -2012,6 +2012,25 @@ impl DebugAdapter {
             .await
     }
 
+    /// As [`Self::wait_for_input`], but for the first `spin` without sleeping: right after a
+    /// response a client sends its next request within a fraction of a millisecond, and one
+    /// sleep of the wait takes 1-2 ms on Windows.
+    pub(crate) async fn wait_for_input_spinning(
+        &mut self,
+        spin: std::time::Duration,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < spin.min(timeout) {
+            if self.adapter.input_ready() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        self.wait_for_input(timeout.saturating_sub(start.elapsed()))
+            .await
+    }
+
     /// Sends either the success response or an error response if passed a
     /// DebuggerError. For the DAP Client, it forwards the response, while for
     /// the CLI, it will print the body for success, or the message for
