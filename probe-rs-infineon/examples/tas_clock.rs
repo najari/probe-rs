@@ -9,7 +9,15 @@
 //!
 //! ```text
 //! cargo run --release -p probe-rs-infineon --example tas_clock -- 1000000 2000000 5000000
+//! cargo run --release -p probe-rs-infineon --example tas_clock -- each 3000000 4000000 6000000
 //! ```
+//!
+//! `each` does not stop: at each frequency it reads three regions of different access times one
+//! by one, DSPR0 (local RAM on the SRI), the SCU's CHIPID (on the SPB) and PFLASH (wait
+//! states), each in a try of its own with the clock set again before it (after a failed access
+//! the server is back at its start clock), and prints a line per frequency: which ones failed
+//! with what. So it tells a clock the link cannot carry (every region fails) from accesses that
+//! take too long for the clock (only the slow ones fail).
 //!
 //! `tas_clock set <Hz>` only sets the clock and leaves it, for clients that do not set it
 //! themselves (an MCD library on the same TAS server); `tas_clock set 400000` puts the
@@ -32,6 +40,9 @@ const ACC_HW_FREQUENCY: u32 = 0x000C_0100;
 
 /// What is read: 16 KiB of PFLASH and DSPR0, which changes while the cores run.
 const DSPR0: (u32, usize) = (0x7000_0000, 4 * 1024);
+
+/// The SCU's CHIPID register, on the SPB (some of the SCU's other words refuse a debugger read).
+const SCU: (u32, usize) = (0xF003_6140, 4);
 
 /// The PFLASH address read: `PROBE_RS_PFLASH` (hex), else 8003 0000H. An erased PFLASH word
 /// reads with an ECC error, so it has to be one the board has written.
@@ -104,10 +115,48 @@ fn try_clocks(bus: &mut dyn TriCoreBusAccess, frequencies: &[u32], reference: &[
     Ok(())
 }
 
+/// One region read at `hz`, the clock set just before: the time, or what failed.
+fn region_at(
+    bus: &mut dyn TriCoreBusAccess,
+    hz: u32,
+    region: (u32, usize),
+    rounds: usize,
+) -> std::result::Result<Duration, String> {
+    set_clock(bus, hz).map_err(|e| format!("setting the clock: {e}"))?;
+    timed_reads(bus, region, rounds)
+        .map(|(_, time)| time)
+        .map_err(|e| e.to_string())
+}
+
+/// At each frequency every region, whatever failed before; a line per frequency.
+fn each_region(bus: &mut dyn TriCoreBusAccess, frequencies: &[u32]) {
+    for &hz in frequencies {
+        let mut line = format!("{hz:>9} Hz:");
+        for (name, region, rounds) in [
+            ("DSPR0 4 KiB", DSPR0, 10),
+            ("SCU CHIPID", SCU, 50),
+            ("PFLASH 16 KiB", pflash(), 5),
+        ] {
+            match region_at(bus, hz, region, rounds) {
+                Ok(time) => line.push_str(&format!(
+                    "  {name} {:>7.1} KiB/s",
+                    kib_per_s(region.1, time)
+                )),
+                Err(error) => line.push_str(&format!("  {name} FAILED ({error})")),
+            }
+        }
+        let now = bus
+            .read_u32(AddressMap::Server, ACC_HW_FREQUENCY)
+            .map_or("?".to_string(), |v| v.to_string());
+        println!("{line}  (clock now {now} Hz)");
+    }
+}
+
 fn main() -> Result<()> {
     probe_rs_infineon::register_plugin();
     let mut args = std::env::args().skip(1).peekable();
     let set_only = args.next_if(|a| a == "set").is_some();
+    let each = !set_only && args.next_if(|a| a == "each").is_some();
     let frequencies = args
         .map(|a| a.parse::<u32>())
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -139,7 +188,12 @@ fn main() -> Result<()> {
         kib_per_s(DSPR0.1, dspr_time),
     );
 
-    let outcome = try_clocks(bus, &frequencies, &reference);
+    let outcome = if each {
+        each_region(bus, &frequencies);
+        Ok(())
+    } else {
+        try_clocks(bus, &frequencies, &reference)
+    };
     // Put the clock back whatever happened, then check that reads are as at the start.
     let restored = set_clock(bus, original);
     if let Err(error) = &outcome {

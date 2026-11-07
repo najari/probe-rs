@@ -9,13 +9,19 @@
 //!
 //! ```text
 //! cargo run -p probe-rs-infineon --example hsm_status -- [TC36x_HSM]
+//! cargo run -p probe-rs-infineon --example hsm_status -- --read-only [TC36x]
 //! ```
+//!
+//! `--read-only` is for a board that must not be written (an ECU): it reads `HSM_ID` and
+//! `DBGBASE` through the bus and takes no core, so neither `DBGBASE` nor anything a core's
+//! status check could put back is written.
 
 use probe_rs::{
     Error, Permissions,
+    architecture::tricore::bus::AddressMap,
     probe::{DebugProbeSelector, list::Lister},
 };
-use probe_rs_infineon::hsm::HsmStatus;
+use probe_rs_infineon::hsm::{self, HsmStatus};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -27,13 +33,26 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    let read_only = std::env::args().any(|a| a == "--read-only");
     let chip = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "TC36x_HSM".to_string());
+        .skip(1)
+        .find(|a| a != "--read-only")
+        .unwrap_or_else(|| if read_only { "TC36x" } else { "TC36x_HSM" }.to_string());
     probe_rs_infineon::register_plugin();
     let selector = std::env::var("PROBE_RS_PROBE").unwrap_or_else(|_| "058b:0000".to_string());
     let probe = Lister::new().open(selector.parse::<DebugProbeSelector>()?)?;
     let mut session = probe.attach(chip.as_str(), Permissions::default())?;
+
+    if read_only {
+        let bus = session.get_tricore_bus()?;
+        let mut read = |address: u64| bus.read_u32(AddressMap::Target, address as u32).ok();
+        let (id, dbgbase) = (read(hsm::HSM_ID), read(hsm::DBGBASE));
+        let chipid = read(0xF003_6140);
+        println!("CHIPID  {}", word(chipid));
+        println!("HSM_ID  {}", word(id));
+        println!("DBGBASE {}", word(dbgbase));
+        return Ok(());
+    }
 
     let status = HsmStatus::read(&mut session.core(0)?);
     println!("HSM_ID  {}", word(status.id));

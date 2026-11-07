@@ -11,7 +11,12 @@
 //!
 //! ```text
 //! cargo run --release -p probe-rs-infineon --example perf_measure
+//! cargo run --release -p probe-rs-infineon --example perf_measure -- --read-only
 //! ```
+//!
+//! `--read-only` is for a board that must not be halted or written (an ECU): it does not take
+//! a core at all, only the bus, and measures a status check (CPU0's `DBGSR` read while the
+//! application runs), an SFR read (`CHIPID`) and the memory reads.
 //!
 //! `PROBE_RS_PROBE` selects another probe (an MCD probe with `--features mcd`),
 //! `PROBE_RS_SPEED` the interface speed in kHz (the TAS probe sets the adapter clock),
@@ -21,7 +26,10 @@ use std::time::{Duration, Instant};
 
 use probe_rs::{
     Core, CoreStatus, MemoryInterface, Permissions, RegisterId,
-    architecture::tricore::{bus::AddressMap, registers::CSFR_PC},
+    architecture::tricore::{
+        bus::{AddressMap, TriCoreBusAccess},
+        registers::CSFR_PC,
+    },
     probe::{DebugProbeSelector, list::Lister},
 };
 
@@ -142,8 +150,65 @@ fn write_items(core: &mut Core, area: u64, lengths: &[usize]) -> Result<()> {
     Ok(())
 }
 
+/// CPU0's `DBGSR` (debug status) and `SCU_CHIPID`.
+const CPU0_DBGSR: u32 = 0xF881_FD00;
+const CHIPID: u32 = 0xF003_6140;
+
+/// Reads 4 bytes at `address` 100 times through the bus.
+fn read_word_bus(bus: &mut dyn TriCoreBusAccess, what: &str, address: u32) -> Result<u32> {
+    let mut samples = Vec::new();
+    let mut value = 0;
+    for _ in 0..100 {
+        value = time(&mut samples, || bus.read_u32(AddressMap::Target, address))?;
+    }
+    report(what, &mut samples);
+    Ok(value)
+}
+
+/// Reads `length` bytes at `address` [`ROUNDS`] times through the bus.
+fn read_item_bus(
+    bus: &mut dyn TriCoreBusAccess,
+    what: &str,
+    address: u32,
+    length: usize,
+) -> Result<()> {
+    let mut buffer = vec![0; length];
+    bus.read_block(AddressMap::Target, address, &mut buffer)?;
+    let mut samples = Vec::new();
+    for _ in 0..ROUNDS {
+        time(&mut samples, || {
+            bus.read_block(AddressMap::Target, address, &mut buffer)
+        })?;
+    }
+    report_transfer(what, length, &mut samples);
+    Ok(())
+}
+
+/// `--read-only`: no core, no halt, no write; the bus reads only.
+fn read_only(bus: &mut dyn TriCoreBusAccess) -> Result<()> {
+    let chipid = read_word_bus(bus, "read one SFR (CHIPID)", CHIPID)?;
+    let dbgsr = read_word_bus(bus, "status (CPU0 DBGSR), running", CPU0_DBGSR)?;
+    for (what, length) in [
+        ("read DSPR0, 4 B", 4),
+        ("read DSPR0, 256 B", 256),
+        ("read DSPR0, 4 KiB", 4 * 1024),
+        ("read DSPR0, 32 KiB", 32 * 1024),
+    ] {
+        read_item_bus(bus, what, 0x7000_0000, length)?;
+    }
+    read_item_bus(bus, "read PFLASH, 16 KiB", pflash_address(), 16 * 1024)?;
+    // DBGSR.HALT (bits 2:1) 01b: halted.
+    let halted = bus.read_u32(AddressMap::Target, CPU0_DBGSR)? >> 1 & 0b11 == 0b01;
+    println!(
+        "CHIPID {chipid:#010x}, CPU0 DBGSR {dbgsr:#010x}, CPU0 {} at the end",
+        if halted { "HALTED" } else { "not halted" }
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     probe_rs_infineon::register_plugin();
+    let read_only_mode = std::env::args().any(|a| a == "--read-only");
     let selector: DebugProbeSelector = std::env::var("PROBE_RS_PROBE")
         .unwrap_or_else(|_| "058b:0000".to_string())
         .parse()?;
@@ -166,6 +231,9 @@ fn main() -> Result<()> {
         "{} through {name}, access hardware clock {clock}",
         session.target().name
     );
+    if read_only_mode {
+        return read_only(session.get_tricore_bus()?);
+    }
     let mut core = session.core(0)?;
 
     // Halt and run.
